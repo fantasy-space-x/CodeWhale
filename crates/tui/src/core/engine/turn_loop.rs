@@ -296,7 +296,7 @@ impl Engine {
                 } else {
                     None
                 },
-                metadata: None,
+                metadata: Some(json!({"session_id": self.session.id, "kind": "turn_loop", "turn_number": self.turn_counter})),
                 thinking: None,
                 reasoning_effort: effective_reasoning_effort,
                 stream: Some(true),

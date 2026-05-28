@@ -201,7 +201,7 @@ impl AcpServer {
             )),
             tools: None,
             tool_choice: None,
-            metadata: None,
+            metadata: Some(serde_json::json!({"kind": "acp_server"})),
             thinking: None,
             reasoning_effort,
             stream: Some(false),

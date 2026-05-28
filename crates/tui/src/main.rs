@@ -38,6 +38,7 @@ mod features;
 mod handoff;
 mod hooks;
 mod llm_client;
+mod api_hook;
 mod localization;
 mod logging;
 mod lsp;
@@ -3394,7 +3395,7 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
         system: None,
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "doctor"})),
         thinking: None,
         reasoning_effort: None,
         stream: Some(false),
@@ -3714,7 +3715,7 @@ Provide findings ordered by severity with file references, then open questions, 
         system: Some(system),
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "review"})),
         thinking: None,
         reasoning_effort,
         stream: Some(false),
@@ -4962,7 +4963,7 @@ async fn run_one_shot(config: &Config, model: &str, prompt: &str) -> Result<()> 
         system: None,
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "one_shot"})),
         thinking: None,
         reasoning_effort,
         stream: Some(false),
@@ -5006,7 +5007,7 @@ async fn run_one_shot_json(config: &Config, model: &str, prompt: &str) -> Result
         )),
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "one_shot_json"})),
         thinking: None,
         reasoning_effort,
         stream: Some(false),

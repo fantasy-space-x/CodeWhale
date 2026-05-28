@@ -806,14 +806,34 @@ impl LlmClient for DeepSeekClient {
     }
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
-        self.create_message_chat(&request).await
+        let start = std::time::Instant::now();
+        let result = self.create_message_chat(&request).await;
+        crate::api_hook::log_non_streaming(
+            self.provider_name(),
+            self.model(),
+            request,
+            &result,
+            start,
+        )
+        .await;
+        result
     }
 
     async fn create_message_stream(
         &self,
         request: MessageRequest,
     ) -> Result<crate::llm_client::StreamEventBox> {
-        self.handle_chat_completion_stream(request).await
+        let provider = self.provider_name();
+        let model = request.model.clone();
+        let start = std::time::Instant::now();
+        let stream = self.handle_chat_completion_stream(request.clone()).await;
+        match stream {
+            Ok(s) => Ok(crate::api_hook::wrap_stream(provider, model, request, s)),
+            Err(err) => {
+                crate::api_hook::log_stream_error(provider, &model, request, &err, start).await;
+                Err(err)
+            }
+        }
     }
 }
 

@@ -1173,7 +1173,7 @@ async fn auto_route_flash_recommendation(
         system: Some(SystemPrompt::Text(router_system)),
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "config_test"})),
         thinking: None,
         reasoning_effort: Some("off".to_string()),
         stream: Some(false),

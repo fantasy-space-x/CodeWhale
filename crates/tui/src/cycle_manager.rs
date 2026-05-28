@@ -374,7 +374,7 @@ pub async fn produce_briefing(
         }])),
         tools: None,
         tool_choice: None,
-        metadata: None,
+        metadata: Some(serde_json::json!({"kind": "cycle_briefing"})),
         thinking: None,
         reasoning_effort: None,
         stream: Some(false),

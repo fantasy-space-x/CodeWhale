@@ -1,10 +1,13 @@
 //! LLM request/response JSONL logger.
 //!
 //! Every call to `LlmClient::create_message` / `create_message_stream`
-//! appends one JSONL record to `.codewhale/{session_id}.jsonl` under the
-//! current working directory.  Always enabled.
+//! appends one JSONL record to `{workspace}/.codewhale/{thread_id}.jsonl`.
+//! The workspace is taken from the request's `metadata.workspace` (set by
+//! the engine turn loop), so in serve mode each thread logs into its own
+//! workspace. Falls back to the process CWD when metadata is absent.
+//! Always enabled.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -25,7 +28,7 @@ use crate::models::{
 struct LlmLogRecord {
     timestamp: String,
     request_id: String,
-    session_id: Option<String>,
+    thread_id: Option<String>,
     kind: Option<String>,
     turn_number: Option<u64>,
     provider: &'static str,
@@ -57,17 +60,25 @@ fn extract_meta_u64(request: &MessageRequest, key: &str) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
-/// Build the JSONL file path from the session_id: `{cwd}/.codewhale/{session_id}.jsonl`.
-/// Falls back to `_no_session.jsonl` when no session_id is present.
-fn log_path_for(session_id: Option<&str>) -> PathBuf {
-    let name = match session_id {
+/// Build the JSONL file path: `{workspace}/.codewhale/{thread_id}.jsonl`.
+/// Uses the workspace from request metadata when present, otherwise the
+/// current process working directory (mainly the single-workspace TUI case).
+/// Falls back to `_no_thread.jsonl` when no thread_id is present.
+fn log_path_for(thread_id: Option<&str>, workspace: Option<&Path>) -> PathBuf {
+    let name = match thread_id {
         Some(id) if !id.is_empty() => format!("{id}.jsonl"),
-        _ => "_no_session.jsonl".to_string(),
+        _ => "_no_thread.jsonl".to_string(),
     };
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".codewhale")
-        .join(name)
+    let base = workspace
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(".codewhale").join(name)
+}
+
+/// Extract the workspace path stored under metadata key `workspace`.
+fn extract_meta_workspace(request: &MessageRequest) -> Option<PathBuf> {
+    extract_meta_str(request, "workspace").map(PathBuf::from)
 }
 
 // === File I/O ===
@@ -104,12 +115,13 @@ pub async fn log_non_streaming(
     result: &anyhow::Result<MessageResponse>,
     start: Instant,
 ) {
-    let session_id = extract_meta_str(&request, "session_id");
-    let path = log_path_for(session_id.as_deref());
+    let thread_id = extract_meta_str(&request, "thread_id");
+    let workspace = extract_meta_workspace(&request);
+    let path = log_path_for(thread_id.as_deref(), workspace.as_deref());
     let record = LlmLogRecord {
         timestamp: Utc::now().to_rfc3339(),
         request_id: Uuid::new_v4().to_string(),
-        session_id,
+        thread_id,
         kind: extract_meta_str(&request, "kind"),
         turn_number: extract_meta_u64(&request, "turn_number"),
         provider,
@@ -132,12 +144,13 @@ pub async fn log_stream_error(
     error: &anyhow::Error,
     start: Instant,
 ) {
-    let session_id = extract_meta_str(&request, "session_id");
-    let path = log_path_for(session_id.as_deref());
+    let thread_id = extract_meta_str(&request, "thread_id");
+    let workspace = extract_meta_workspace(&request);
+    let path = log_path_for(thread_id.as_deref(), workspace.as_deref());
     let record = LlmLogRecord {
         timestamp: Utc::now().to_rfc3339(),
         request_id: Uuid::new_v4().to_string(),
-        session_id,
+        thread_id,
         kind: extract_meta_str(&request, "kind"),
         turn_number: extract_meta_u64(&request, "turn_number"),
         provider,
@@ -332,8 +345,9 @@ impl Drop for StreamLogGuard {
         if self.completed.load(Ordering::SeqCst) {
             return;
         }
-        let session_id = extract_meta_str(&self.request, "session_id");
-        let path = log_path_for(session_id.as_deref());
+        let thread_id = extract_meta_str(&self.request, "thread_id");
+        let workspace = extract_meta_workspace(&self.request);
+        let path = log_path_for(thread_id.as_deref(), workspace.as_deref());
         let acc = std::mem::replace(
             &mut *self
                 .accumulator
@@ -347,7 +361,7 @@ impl Drop for StreamLogGuard {
         let record = LlmLogRecord {
             timestamp: self.timestamp.clone(),
             request_id: self.request_id.clone(),
-            session_id,
+            thread_id,
             kind: extract_meta_str(&self.request, "kind"),
             turn_number: extract_meta_u64(&self.request, "turn_number"),
             provider: self.provider,
@@ -367,7 +381,7 @@ impl Drop for StreamLogGuard {
 
 /// Wrap a `StreamEventBox` so that every event is accumulated for logging.
 /// When `MessageStop` is observed the complete record is written to
-/// `.codewhale/{session_id}.jsonl` under the current working directory.
+/// `.codewhale/{thread_id}.jsonl` under the current working directory.
 /// If the stream is dropped early, `StreamLogGuard` writes a partial record.
 ///
 /// When logging is disabled, returns the original stream unchanged.
@@ -409,12 +423,13 @@ pub fn wrap_stream(
                 let stop_reason = response.stop_reason.clone();
                 drop(acc);
 
-                let session_id = extract_meta_str(&request, "session_id");
-                let path = log_path_for(session_id.as_deref());
+                let thread_id = extract_meta_str(&request, "thread_id");
+                let workspace = extract_meta_workspace(&request);
+                let path = log_path_for(thread_id.as_deref(), workspace.as_deref());
                 let record = LlmLogRecord {
                     timestamp: timestamp.clone(),
                     request_id: request_id.clone(),
-                    session_id,
+                    thread_id,
                     kind: extract_meta_str(&request, "kind"),
                     turn_number: extract_meta_u64(&request, "turn_number"),
                     provider,

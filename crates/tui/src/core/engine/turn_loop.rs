@@ -296,7 +296,16 @@ impl Engine {
                 } else {
                     None
                 },
-                metadata: Some(json!({"session_id": self.session.id, "kind": "turn_loop", "turn_number": self.turn_counter})),
+                metadata: Some(json!({
+                    "thread_id": self
+                        .config
+                        .runtime_services
+                        .active_thread_id
+                        .clone()
+                        .unwrap_or_else(|| self.session.id.clone()),
+                    "kind": "turn_loop",
+                    "turn_number": self.turn_counter,
+                })),
                 thinking: None,
                 reasoning_effort: effective_reasoning_effort,
                 stream: Some(true),

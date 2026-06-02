@@ -418,6 +418,19 @@ impl Engine {
 
     /// Create a new engine with the given configuration
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
+        let mut config = config;
+        // Ensure every engine has a `thr_xxxxxxxx`-style thread id. In serve
+        // mode `runtime_threads` injects the real thread id; in TUI/exec mode
+        // we mint a fresh one here so api_hook writes to a stable filename
+        // (`{workspace}/.codewhale/thr_xxxxxxxx.jsonl`) instead of falling
+        // back to the session UUID.
+        if config.runtime_services.active_thread_id.is_none() {
+            config.runtime_services.active_thread_id = Some(format!(
+                "thr_{}",
+                &uuid::Uuid::new_v4().to_string()[..8]
+            ));
+        }
+
         if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
             sync_goal_state_from_host(&config.goal_state, Some(&objective), None, false);
         }

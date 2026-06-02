@@ -303,6 +303,7 @@ impl Engine {
                         .active_thread_id
                         .clone()
                         .unwrap_or_else(|| self.session.id.clone()),
+                    "workspace": self.session.workspace.display().to_string(),
                     "kind": "turn_loop",
                     "turn_number": self.turn_counter,
                 })),

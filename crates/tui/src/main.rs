@@ -598,6 +598,15 @@ struct ServeArgs {
     /// Disable runtime API auth when no token is configured. Only use on a trusted loopback.
     #[arg(long = "insecure")]
     insecure_no_auth: bool,
+    /// Override API key (highest priority, above config/env).
+    #[arg(long = "api-key", value_name = "KEY")]
+    api_key: Option<String>,
+    /// Override base URL (highest priority, above config/env).
+    #[arg(long = "base-url", value_name = "URL")]
+    base_url: Option<String>,
+    /// Override model name (highest priority, above config/env).
+    #[arg(long = "model", value_name = "MODEL")]
+    model: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -937,7 +946,16 @@ async fn main() -> Result<()> {
                 if args.mcp {
                     mcp_server::run_mcp_server(workspace)
                 } else if args.http {
-                    let config = load_config_from_cli(&cli)?;
+                    let mut config = load_config_from_cli(&cli)?;
+                    if let Some(key) = args.api_key {
+                        config.api_key = Some(key);
+                    }
+                    if let Some(url) = args.base_url {
+                        config.base_url = Some(url);
+                    }
+                    if let Some(model) = args.model {
+                        config.default_text_model = Some(model);
+                    }
                     let cors_origins = resolve_cors_origins(&config, &args.cors_origin);
                     runtime_api::run_http_server(
                         config,

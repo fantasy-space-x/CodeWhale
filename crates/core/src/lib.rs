@@ -15,22 +15,28 @@ use codewhale_mcp::{
 };
 use codewhale_protocol::{
     AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadListParams, ThreadReadParams,
-    ThreadRequest, ThreadResponse, ThreadResumeParams, ThreadSetNameParams, ThreadStatus,
-    ToolPayload,
+    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams,
+    ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus,
+    ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams,
+    ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
 };
 use codewhale_state::{
-    JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadListFilters, ThreadMetadata,
+    JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
+    ThreadGoalStatus as PersistedThreadGoalStatus, ThreadListFilters, ThreadMetadata,
     ThreadStatus as PersistedThreadStatus,
 };
 use codewhale_tools::{ToolCall, ToolRegistry};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+/// How a new thread's conversation history is initialized.
 #[derive(Debug, Clone)]
 pub enum InitialHistory {
+    /// Start with an empty conversation.
     New,
+    /// Forked from an existing thread with the given history items.
     Forked(Vec<Value>),
+    /// Resumed from a persisted thread with its full history.
     Resumed {
         conversation_id: String,
         history: Vec<Value>,
@@ -38,23 +44,37 @@ pub enum InitialHistory {
     },
 }
 
+/// Result of spawning or resuming a thread.
 #[derive(Debug, Clone)]
 pub struct NewThread {
+    /// The thread metadata.
     pub thread: Thread,
+    /// Resolved model identifier.
     pub model: String,
+    /// Provider that serves the model.
     pub model_provider: String,
+    /// Working directory for the thread.
     pub cwd: PathBuf,
+    /// Approval policy override, if any.
     pub approval_policy: Option<String>,
+    /// Sandbox mode override, if any.
     pub sandbox: Option<String>,
 }
 
+/// Status of a background job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
+    /// Waiting to be picked up.
     Queued,
+    /// Currently executing.
     Running,
+    /// Temporarily paused.
     Paused,
+    /// Finished successfully.
     Completed,
+    /// Finished with an error.
     Failed,
+    /// Cancelled by the user.
     Cancelled,
 }
 
@@ -63,12 +83,18 @@ const DEFAULT_JOB_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_JOB_BACKOFF_BASE_MS: u64 = 500;
 const MAX_JOB_HISTORY_ENTRIES: usize = 64;
 
+/// Retry state for a job that failed and may be retried.
 #[derive(Debug, Clone)]
 pub struct JobRetryMetadata {
+    /// Current attempt number (0 = not yet retried).
     pub attempt: u32,
+    /// Maximum number of retry attempts before giving up.
     pub max_attempts: u32,
+    /// Base delay in milliseconds for exponential backoff.
     pub backoff_base_ms: u64,
+    /// Computed delay in milliseconds until the next retry.
     pub next_backoff_ms: u64,
+    /// Timestamp when the next retry should be attempted.
     pub next_retry_at: Option<i64>,
 }
 
@@ -84,13 +110,20 @@ impl Default for JobRetryMetadata {
     }
 }
 
+/// A single entry in a job's history log.
 #[derive(Debug, Clone)]
 pub struct JobHistoryEntry {
+    /// Timestamp when this entry was recorded.
     pub at: i64,
+    /// Phase name (e.g., "created", "running", "failed").
     pub phase: String,
+    /// Job status at this point in time.
     pub status: JobStatus,
+    /// Progress percentage at this point, if available.
     pub progress: Option<u8>,
+    /// Human-readable detail message.
     pub detail: Option<String>,
+    /// Retry state snapshot at this point.
     pub retry: JobRetryMetadata,
 }
 
@@ -102,19 +135,30 @@ struct PersistedJobDetail {
     pub history: Vec<JobHistoryEntry>,
 }
 
+/// A complete job record with all metadata and history.
 #[derive(Debug, Clone)]
 pub struct JobRecord {
+    /// Unique job identifier.
     pub id: String,
+    /// Human-readable job name.
     pub name: String,
+    /// Current job status.
     pub status: JobStatus,
+    /// Current progress percentage (0-100).
     pub progress: Option<u8>,
+    /// Human-readable detail about the current state.
     pub detail: Option<String>,
+    /// Retry state for failed jobs.
     pub retry: JobRetryMetadata,
+    /// Chronological history of state transitions.
     pub history: Vec<JobHistoryEntry>,
+    /// Timestamp when the job was created.
     pub created_at: i64,
+    /// Timestamp of the last state change.
     pub updated_at: i64,
 }
 
+/// Manages background jobs with retry logic and persistence.
 #[derive(Debug, Default)]
 pub struct JobManager {
     jobs: HashMap<String, JobRecord>,
@@ -193,6 +237,7 @@ impl JobManager {
         Ok(Some(encoded))
     }
 
+    /// Enqueues a new job and returns its record.
     pub fn enqueue(&mut self, name: impl Into<String>) -> JobRecord {
         let now = Self::now_ts();
         let id = format!("job-{}", Uuid::new_v4());
@@ -212,6 +257,7 @@ impl JobManager {
         job
     }
 
+    /// Transitions a job to running and clears its retry schedule.
     pub fn set_running(&mut self, id: &str) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = JobStatus::Running;
@@ -221,6 +267,7 @@ impl JobManager {
         }
     }
 
+    /// Updates a job's progress (clamped to 100) and optional detail message.
     pub fn update_progress(&mut self, id: &str, progress: u8, detail: Option<String>) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.progress = Some(progress.min(100));
@@ -230,6 +277,7 @@ impl JobManager {
         }
     }
 
+    /// Marks a job as completed with 100% progress and clears its retry schedule.
     pub fn complete(&mut self, id: &str) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = JobStatus::Completed;
@@ -240,6 +288,7 @@ impl JobManager {
         }
     }
 
+    /// Marks a job as failed and schedules a retry if attempts remain.
     pub fn fail(&mut self, id: &str, detail: impl Into<String>) {
         if let Some(job) = self.jobs.get_mut(id) {
             let now = Self::now_ts();
@@ -259,6 +308,7 @@ impl JobManager {
         }
     }
 
+    /// Cancels a job and clears any pending retry schedule.
     pub fn cancel(&mut self, id: &str) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = JobStatus::Cancelled;
@@ -268,6 +318,7 @@ impl JobManager {
         }
     }
 
+    /// Pauses a job, optionally updating its detail message.
     pub fn pause(&mut self, id: &str, detail: Option<String>) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = JobStatus::Paused;
@@ -279,6 +330,7 @@ impl JobManager {
         }
     }
 
+    /// Resumes a paused or failed job back to running status.
     pub fn resume(&mut self, id: &str, detail: Option<String>) {
         if let Some(job) = self.jobs.get_mut(id) {
             job.status = JobStatus::Running;
@@ -291,12 +343,14 @@ impl JobManager {
         }
     }
 
+    /// Returns all jobs sorted by most recently updated first.
     pub fn list(&self) -> Vec<JobRecord> {
         let mut out = self.jobs.values().cloned().collect::<Vec<_>>();
         out.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
         out
     }
 
+    /// Returns the history entries for a job, or an empty vec if not found.
     pub fn history(&self, id: &str) -> Vec<JobHistoryEntry> {
         self.jobs
             .get(id)
@@ -304,6 +358,7 @@ impl JobManager {
             .unwrap_or_default()
     }
 
+    /// Resets queued or running jobs back to queued on application resume.
     pub fn resume_pending(&mut self) -> Vec<JobRecord> {
         let mut resumed = Vec::new();
         for job in self.jobs.values_mut() {
@@ -317,6 +372,7 @@ impl JobManager {
         resumed
     }
 
+    /// Loads jobs from the state store, deserializing extended detail when available.
     pub fn load_from_store(&mut self, store: &StateStore) -> Result<()> {
         let persisted = store.list_jobs(Some(500))?;
         for job in persisted {
@@ -355,6 +411,7 @@ impl JobManager {
         Ok(())
     }
 
+    /// Persists a single job's current state to the state store.
     pub fn persist_job(&self, store: &StateStore, id: &str) -> Result<()> {
         let Some(job) = self.jobs.get(id) else {
             return Ok(());
@@ -371,6 +428,7 @@ impl JobManager {
         })
     }
 
+    /// Persists all in-memory jobs to the state store.
     pub fn persist_all(&self, store: &StateStore) -> Result<()> {
         for id in self.jobs.keys() {
             self.persist_job(store, id)?;
@@ -379,6 +437,7 @@ impl JobManager {
     }
 }
 
+/// Manages thread lifecycle: spawn, resume, fork, archive, and persistence.
 pub struct ThreadManager {
     store: StateStore,
     running_threads: HashMap<String, Thread>,
@@ -386,6 +445,7 @@ pub struct ThreadManager {
 }
 
 impl ThreadManager {
+    /// Creates a new `ThreadManager` backed by the given state store.
     pub fn new(store: StateStore) -> Self {
         Self {
             store,
@@ -394,10 +454,12 @@ impl ThreadManager {
         }
     }
 
+    /// Returns a reference to the underlying state store.
     pub fn state_store(&self) -> &StateStore {
         &self.store
     }
 
+    /// Spawns a new thread with the given initial history and persists it.
     pub fn spawn_thread_with_history(
         &mut self,
         model_provider: String,
@@ -469,6 +531,7 @@ impl ThreadManager {
         })
     }
 
+    /// Resumes an existing thread, returning `None` if not found.
     pub fn resume_thread_with_history(
         &mut self,
         params: &ThreadResumeParams,
@@ -523,6 +586,7 @@ impl ThreadManager {
         }))
     }
 
+    /// Forks an existing thread into a new one, inheriting the parent's provider.
     pub fn fork_thread(
         &mut self,
         params: &ThreadForkParams,
@@ -551,6 +615,7 @@ impl ThreadManager {
         Ok(Some(new))
     }
 
+    /// Lists threads matching the given filter parameters.
     pub fn list_threads(&self, params: &ThreadListParams) -> Result<Vec<Thread>> {
         let list = self.store.list_threads(ThreadListFilters {
             include_archived: params.include_archived,
@@ -559,6 +624,7 @@ impl ThreadManager {
         Ok(list.into_iter().map(to_protocol_thread).collect())
     }
 
+    /// Reads a single thread by id, or `None` if not found.
     pub fn read_thread(&self, params: &ThreadReadParams) -> Result<Option<Thread>> {
         Ok(self
             .store
@@ -566,6 +632,7 @@ impl ThreadManager {
             .map(to_protocol_thread))
     }
 
+    /// Sets the display name for a thread, returning the updated thread or `None`.
     pub fn set_thread_name(&mut self, params: &ThreadSetNameParams) -> Result<Option<Thread>> {
         let Some(mut metadata) = self.store.get_thread(&params.thread_id)? else {
             return Ok(None);
@@ -579,6 +646,72 @@ impl ThreadManager {
         Ok(Some(updated))
     }
 
+    /// Sets or replaces the persisted goal for a thread.
+    pub fn set_thread_goal(&mut self, params: &ThreadGoalSetParams) -> Result<Option<ThreadGoal>> {
+        if self.store.get_thread(&params.thread_id)?.is_none() {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let goal = ThreadGoalRecord {
+            thread_id: params.thread_id.clone(),
+            goal_id: format!("goal-{}", Uuid::new_v4()),
+            objective: params.objective.clone(),
+            status: PersistedThreadGoalStatus::Active,
+            token_budget: params.token_budget,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            continuation_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.upsert_thread_goal(&goal)?;
+        Ok(Some(to_protocol_goal(goal)))
+    }
+
+    /// Reads the persisted goal for a thread.
+    pub fn get_thread_goal(&self, params: &ThreadGoalGetParams) -> Result<Option<ThreadGoal>> {
+        Ok(self
+            .store
+            .get_thread_goal(&params.thread_id)?
+            .map(to_protocol_goal))
+    }
+
+    /// Accrues durable per-goal usage and/or a continuation pass for a thread.
+    pub fn record_thread_goal_progress(
+        &mut self,
+        params: &ThreadGoalProgressParams,
+    ) -> Result<Option<ThreadGoal>> {
+        if self.store.get_thread(&params.thread_id)?.is_none() {
+            return Ok(None);
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let mut goal = if params.token_delta != 0 || params.time_delta_seconds != 0 {
+            self.store.record_thread_goal_usage(
+                &params.thread_id,
+                params.token_delta,
+                params.time_delta_seconds,
+                now,
+            )?
+        } else {
+            self.store.get_thread_goal(&params.thread_id)?
+        };
+
+        if params.record_continuation {
+            goal = self
+                .store
+                .record_thread_goal_continuation(&params.thread_id, now)?;
+        }
+
+        Ok(goal.map(to_protocol_goal))
+    }
+
+    /// Clears the persisted goal for a thread, returning whether one existed.
+    pub fn clear_thread_goal(&mut self, params: &ThreadGoalClearParams) -> Result<bool> {
+        self.store.delete_thread_goal(&params.thread_id)
+    }
+
+    /// Archives a thread so it no longer appears in default listings.
     pub fn archive_thread(&mut self, thread_id: &str) -> Result<()> {
         self.store.mark_archived(thread_id)?;
         if let Some(thread) = self.running_threads.get_mut(thread_id) {
@@ -587,11 +720,13 @@ impl ThreadManager {
         Ok(())
     }
 
+    /// Restores an archived thread to active status.
     pub fn unarchive_thread(&mut self, thread_id: &str) -> Result<()> {
         self.store.mark_unarchived(thread_id)?;
         Ok(())
     }
 
+    /// Records a user message in a thread and updates its preview and timestamp.
     pub fn touch_message(&mut self, thread_id: &str, input: &str) -> Result<()> {
         let Some(mut metadata) = self.store.get_thread(thread_id)? else {
             return Ok(());
@@ -643,22 +778,33 @@ impl ThreadManager {
             git_branch: None,
             git_origin_url: None,
             memory_mode: None,
+            current_leaf_id: None,
         })
     }
 }
 
+/// Top-level runtime combining config, model registry, threads, tools, MCP, and hooks.
 pub struct Runtime {
+    /// Resolved application configuration.
     pub config: ConfigToml,
+    /// Registry of available model providers.
     pub model_registry: ModelRegistry,
+    /// Manages conversation thread lifecycle.
     pub thread_manager: ThreadManager,
+    /// Registry of callable tools.
     pub tool_registry: Arc<ToolRegistry>,
+    /// Manager for MCP server connections.
     pub mcp_manager: Arc<McpManager>,
+    /// Engine for evaluating execution policy decisions.
     pub exec_policy: ExecPolicyEngine,
+    /// Dispatcher for lifecycle hooks.
     pub hooks: HookDispatcher,
+    /// Manager for background job lifecycle.
     pub jobs: JobManager,
 }
 
 impl Runtime {
+    /// Constructs a new `Runtime`, loading existing jobs from the state store.
     pub fn new(
         config: ConfigToml,
         model_registry: ModelRegistry,
@@ -669,7 +815,9 @@ impl Runtime {
         hooks: HookDispatcher,
     ) -> Self {
         let mut jobs = JobManager::default();
-        let _ = jobs.load_from_store(&state);
+        if let Err(e) = jobs.load_from_store(&state) {
+            tracing::warn!("Failed to load job store, starting with empty job list: {e}");
+        }
         Self {
             config,
             model_registry,
@@ -680,6 +828,46 @@ impl Runtime {
             hooks,
             jobs,
         }
+    }
+
+    /// Update the live configuration in-place so the next turn picks up
+    /// changes without a restart.  Called by the app-server after
+    /// `ConfigSet` or `ConfigUnset`.
+    ///
+    /// Only `config.toml` is touched by those operations, so the sibling
+    /// `permissions.toml` (and therefore `exec_policy`) is left unchanged.
+    ///
+    /// Fields that the TUI caches on its `App` struct (`api_provider`,
+    /// `reasoning_effort`, `mcp_config_path`, `skills_dir`, …) are read
+    /// live from `self.config` here via `resolve_runtime_options`, so they
+    /// take effect on the next prompt turn without any extra plumbing.
+    pub fn update_config(&mut self, config: ConfigToml) {
+        self.config = config;
+    }
+
+    /// Reload the live configuration **and** the exec policy from a
+    /// freshly-loaded `ConfigStore`.  Used by the app-server's
+    /// `ConfigReload` request, which re-reads both `config.toml` and the
+    /// sibling `permissions.toml` from disk.
+    ///
+    /// Unlike `update_config`, this also refreshes `self.exec_policy` so
+    /// externally edited permission rules take effect without a restart.
+    ///
+    /// Mirrors the TUI `reload_runtime_config` codepath for everything
+    /// that is reachable from the headless `Runtime`. The TUI-only caches
+    /// (`last_effective_reasoning_effort`, `model_compaction_budget`,
+    /// `ui_locale`, …) do not exist on `Runtime` and need no work here.
+    ///
+    /// **Not** refreshed by this call:
+    /// * `mcp_manager` — MCP server connections are loaded once at
+    ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
+    ///   referenced `mcp.json` still requires a restart, exactly as the
+    ///   TUI flags via `mcp_restart_required`.
+    /// * `tool_registry` — built once at startup.
+    /// * `model_registry` — static catalog.
+    pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
+        self.config = config;
+        self.exec_policy = exec_policy;
     }
 
     fn persisted_thread_data(&self, thread_id: &str) -> Result<Value> {
@@ -711,9 +899,16 @@ impl Runtime {
                 })
             });
 
+        let goal = self
+            .thread_manager
+            .state_store()
+            .get_thread_goal(thread_id)?
+            .map(to_protocol_goal);
+
         Ok(json!({
             "history": history,
-            "checkpoint": checkpoint
+            "checkpoint": checkpoint,
+            "goal": goal
         }))
     }
 
@@ -729,6 +924,7 @@ impl Runtime {
         )
     }
 
+    /// Dispatches a thread request (create, start, resume, fork, list, read, etc.).
     pub async fn handle_thread(&mut self, req: ThreadRequest) -> Result<ThreadResponse> {
         match req {
             ThreadRequest::Create { .. } => {
@@ -776,6 +972,7 @@ impl Runtime {
                         status: "missing".to_string(),
                         thread: None,
                         threads: Vec::new(),
+                        goal: None,
                         model: None,
                         model_provider: None,
                         cwd: None,
@@ -798,6 +995,7 @@ impl Runtime {
                         status: "missing".to_string(),
                         thread: None,
                         threads: Vec::new(),
+                        goal: None,
                         model: None,
                         model_provider: None,
                         cwd: None,
@@ -813,6 +1011,7 @@ impl Runtime {
                 status: "ok".to_string(),
                 thread: None,
                 threads: self.thread_manager.list_threads(&params)?,
+                goal: None,
                 model: None,
                 model_provider: None,
                 cwd: None,
@@ -829,6 +1028,9 @@ impl Runtime {
                     status: "ok".to_string(),
                     thread: self.thread_manager.read_thread(&params)?,
                     threads: Vec::new(),
+                    goal: self.thread_manager.get_thread_goal(&ThreadGoalGetParams {
+                        thread_id: params.thread_id,
+                    })?,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -843,6 +1045,7 @@ impl Runtime {
                 status: "ok".to_string(),
                 thread: self.thread_manager.set_thread_name(&params)?,
                 threads: Vec::new(),
+                goal: None,
                 model: None,
                 model_provider: None,
                 cwd: None,
@@ -851,6 +1054,113 @@ impl Runtime {
                 events: Vec::new(),
                 data: json!({}),
             }),
+            ThreadRequest::GoalSet(params) => {
+                let thread_id = params.thread_id.clone();
+                if let Some(goal) = self.thread_manager.set_thread_goal(&params)? {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "ok".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: Some(goal.clone()),
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: vec![EventFrame::ThreadGoalUpdated { goal: goal.clone() }],
+                        data: json!({ "goal": goal }),
+                    })
+                } else {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "missing".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: None,
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: Vec::new(),
+                        data: json!({"error":"thread not found"}),
+                    })
+                }
+            }
+            ThreadRequest::GoalGet(params) => {
+                let goal = self.thread_manager.get_thread_goal(&params)?;
+                Ok(ThreadResponse {
+                    thread_id: params.thread_id,
+                    status: "ok".to_string(),
+                    thread: None,
+                    threads: Vec::new(),
+                    goal: goal.clone(),
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    events: Vec::new(),
+                    data: json!({ "goal": goal }),
+                })
+            }
+            ThreadRequest::GoalClear(params) => {
+                let thread_id = params.thread_id.clone();
+                let cleared = self.thread_manager.clear_thread_goal(&params)?;
+                Ok(ThreadResponse {
+                    thread_id: thread_id.clone(),
+                    status: if cleared { "cleared" } else { "empty" }.to_string(),
+                    thread: None,
+                    threads: Vec::new(),
+                    goal: None,
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    events: if cleared {
+                        vec![EventFrame::ThreadGoalCleared { thread_id }]
+                    } else {
+                        Vec::new()
+                    },
+                    data: json!({ "cleared": cleared }),
+                })
+            }
+            ThreadRequest::GoalRecordProgress(params) => {
+                let thread_id = params.thread_id.clone();
+                if let Some(goal) = self.thread_manager.record_thread_goal_progress(&params)? {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "ok".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: Some(goal.clone()),
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: vec![EventFrame::ThreadGoalUpdated { goal: goal.clone() }],
+                        data: json!({ "goal": goal }),
+                    })
+                } else {
+                    Ok(ThreadResponse {
+                        thread_id,
+                        status: "missing".to_string(),
+                        thread: None,
+                        threads: Vec::new(),
+                        goal: None,
+                        model: None,
+                        model_provider: None,
+                        cwd: None,
+                        approval_policy: None,
+                        sandbox: None,
+                        events: Vec::new(),
+                        data: json!({"error":"thread or goal not found"}),
+                    })
+                }
+            }
             ThreadRequest::Archive { thread_id } => {
                 self.thread_manager.archive_thread(&thread_id)?;
                 Ok(ThreadResponse {
@@ -858,6 +1168,7 @@ impl Runtime {
                     status: "archived".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -874,6 +1185,7 @@ impl Runtime {
                     status: "unarchived".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -902,6 +1214,7 @@ impl Runtime {
                     status: "accepted".to_string(),
                     thread: None,
                     threads: Vec::new(),
+                    goal: None,
                     model: None,
                     model_provider: None,
                     cwd: None,
@@ -924,6 +1237,7 @@ impl Runtime {
         }
     }
 
+    /// Resolves the model for a prompt, records the message, and returns the response.
     pub async fn handle_prompt(
         &mut self,
         req: PromptRequest,
@@ -1001,6 +1315,7 @@ impl Runtime {
         })
     }
 
+    /// Evaluates execution policy and dispatches a tool call.
     pub async fn invoke_tool(
         &self,
         call: ToolCall,
@@ -1009,9 +1324,16 @@ impl Runtime {
     ) -> Result<Value> {
         let fallback_cwd = cwd.display().to_string();
         let (command, policy_cwd, execution_kind) = call.execution_subject(&fallback_cwd);
+        let policy_tool = match &call.payload {
+            ToolPayload::LocalShell { .. } => "exec_shell",
+            _ => call.name.as_str(),
+        };
+        let policy_path = permission_path_for_call(&call);
         let decision = self.exec_policy.check(ExecPolicyContext {
             command: &command,
             cwd: &policy_cwd,
+            tool: Some(policy_tool),
+            path: policy_path.as_deref(),
             ask_for_approval: approval_mode,
             sandbox_mode: None,
         })?;
@@ -1046,7 +1368,7 @@ impl Runtime {
                 .await;
             self.hooks
                 .emit(HookEvent::GenericEventFrame {
-                    frame: error_frame.clone(),
+                    frame: Box::new(error_frame.clone()),
                 })
                 .await;
             return Ok(json!({
@@ -1065,6 +1387,7 @@ impl Runtime {
             let reason = decision.reason().to_string();
             let maybe_approval_frame = approval_request_frame(
                 &decision.requirement,
+                decision.matched_rule.as_deref(),
                 call_id,
                 approval_id.clone(),
                 response_id.clone(),
@@ -1082,7 +1405,7 @@ impl Runtime {
             if let Some(frame) = maybe_approval_frame {
                 self.hooks
                     .emit(HookEvent::GenericEventFrame {
-                        frame: frame.clone(),
+                        frame: Box::new(frame.clone()),
                     })
                     .await;
                 events.push(event_frame_payload(&frame));
@@ -1099,6 +1422,48 @@ impl Runtime {
             }));
         }
 
+        // Headless `request_user_input`: mirror the approval fire-and-return
+        // branch (issue #3102). The TUI intercepts this tool by name before
+        // dispatch and blocks on a reply channel; the headless runtime instead
+        // emits a typed `UserInputRequest` frame and returns a
+        // `user_input_required` status so the client can render the question
+        // and POST answers back via `AppRequest::SubmitUserInput`. It does NOT
+        // block — consistent with the headless approval model, which has no
+        // resume channel either.
+        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
+            let request_id = format!("user-input-{}", Uuid::new_v4());
+            let arguments = match &call.payload {
+                ToolPayload::Function { arguments } => arguments.as_str(),
+                // Custom/Mcp/LocalShell can't carry a user_input payload; fall
+                // through to the generic dispatch error below.
+                _ => "",
+            };
+            let maybe_frame = user_input_request_frame(
+                call_id.clone(),
+                response_id.clone(),
+                request_id.clone(),
+                arguments,
+            );
+            let mut events = Vec::new();
+            if let Some(frame) = maybe_frame {
+                self.hooks
+                    .emit(HookEvent::GenericEventFrame {
+                        frame: Box::new(frame.clone()),
+                    })
+                    .await;
+                events.push(event_frame_payload(&frame));
+            }
+            return Ok(json!({
+                "ok": false,
+                "status": "user_input_required",
+                "execution_kind": execution_kind,
+                "response_id": response_id,
+                "request_id": request_id,
+                "precheck": precheck,
+                "events": events,
+            }));
+        }
+
         let start_frame = EventFrame::ToolCallStart {
             response_id: response_id.clone(),
             tool_name: call.name.clone(),
@@ -1106,7 +1471,7 @@ impl Runtime {
         };
         self.hooks
             .emit(HookEvent::GenericEventFrame {
-                frame: start_frame.clone(),
+                frame: Box::new(start_frame.clone()),
             })
             .await;
         self.hooks
@@ -1130,7 +1495,7 @@ impl Runtime {
                 };
                 self.hooks
                     .emit(HookEvent::GenericEventFrame {
-                        frame: result_frame.clone(),
+                        frame: Box::new(result_frame.clone()),
                     })
                     .await;
                 self.hooks
@@ -1162,7 +1527,7 @@ impl Runtime {
                 };
                 self.hooks
                     .emit(HookEvent::GenericEventFrame {
-                        frame: error_frame.clone(),
+                        frame: Box::new(error_frame.clone()),
                     })
                     .await;
                 self.hooks
@@ -1189,6 +1554,7 @@ impl Runtime {
         }
     }
 
+    /// Starts all configured MCP servers and emits startup events via hooks.
     pub async fn mcp_startup(&self) -> McpStartupCompleteEvent {
         let mut updates = Vec::new();
         let summary = self.mcp_manager.start_all(|update| {
@@ -1207,18 +1573,18 @@ impl Runtime {
             };
             self.hooks
                 .emit(HookEvent::GenericEventFrame {
-                    frame: EventFrame::McpStartupUpdate {
+                    frame: Box::new(EventFrame::McpStartupUpdate {
                         update: codewhale_protocol::McpStartupUpdateEvent {
                             server_name: update.server_name,
                             status,
                         },
-                    },
+                    }),
                 })
                 .await;
         }
         self.hooks
             .emit(HookEvent::GenericEventFrame {
-                frame: EventFrame::McpStartupComplete {
+                frame: Box::new(EventFrame::McpStartupComplete {
                     summary: codewhale_protocol::McpStartupCompleteEvent {
                         ready: summary.ready.clone(),
                         failed: summary
@@ -1231,12 +1597,13 @@ impl Runtime {
                             .collect(),
                         cancelled: summary.cancelled.clone(),
                     },
-                },
+                }),
             })
             .await;
         summary
     }
 
+    /// Returns the current application status including all jobs and their history.
     pub fn app_status(&self) -> AppResponse {
         let jobs = self.jobs.list();
         let events = jobs
@@ -1278,10 +1645,12 @@ impl Runtime {
         }
     }
 
+    /// Returns the default model provider from the resolved configuration.
     pub fn provider_default(&self) -> ProviderKind {
         self.config.provider
     }
 
+    /// Saves a named checkpoint for a thread.
     pub fn save_thread_checkpoint(
         &self,
         thread_id: &str,
@@ -1293,6 +1662,7 @@ impl Runtime {
             .save_checkpoint(thread_id, checkpoint_id, state)
     }
 
+    /// Loads a checkpoint for a thread. Pass `None` for the latest.
     pub fn load_thread_checkpoint(
         &self,
         thread_id: &str,
@@ -1305,6 +1675,7 @@ impl Runtime {
             .map(|checkpoint| checkpoint.state))
     }
 
+    /// Enqueues a new background job and persists it immediately.
     pub fn enqueue_job(&mut self, name: impl Into<String>) -> Result<JobRecord> {
         let job = self.jobs.enqueue(name);
         self.jobs
@@ -1312,12 +1683,14 @@ impl Runtime {
         Ok(job)
     }
 
+    /// Transitions a job to running and persists the change.
     pub fn set_job_running(&mut self, job_id: &str) -> Result<()> {
         self.jobs.set_running(job_id);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Updates a job's progress and persists the change.
     pub fn update_job_progress(
         &mut self,
         job_id: &str,
@@ -1329,36 +1702,42 @@ impl Runtime {
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Marks a job as completed and persists the change.
     pub fn complete_job(&mut self, job_id: &str) -> Result<()> {
         self.jobs.complete(job_id);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Marks a job as failed and persists the change.
     pub fn fail_job(&mut self, job_id: &str, detail: impl Into<String>) -> Result<()> {
         self.jobs.fail(job_id, detail);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Cancels a job and persists the change.
     pub fn cancel_job(&mut self, job_id: &str) -> Result<()> {
         self.jobs.cancel(job_id);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Pauses a job and persists the change.
     pub fn pause_job(&mut self, job_id: &str, detail: Option<String>) -> Result<()> {
         self.jobs.pause(job_id, detail);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Resumes a paused job and persists the change.
     pub fn resume_job(&mut self, job_id: &str, detail: Option<String>) -> Result<()> {
         self.jobs.resume(job_id, detail);
         self.jobs
             .persist_job(self.thread_manager.state_store(), job_id)
     }
 
+    /// Returns the state-transition history for a job.
     pub fn job_history(&self, job_id: &str) -> Vec<JobHistoryEntry> {
         self.jobs.history(job_id)
     }
@@ -1370,6 +1749,7 @@ fn thread_response_from_new(status: &str, new: NewThread) -> ThreadResponse {
         status: status.to_string(),
         thread: Some(new.thread),
         threads: Vec::new(),
+        goal: None,
         model: Some(new.model),
         model_provider: Some(new.model_provider),
         cwd: Some(new.cwd),
@@ -1395,6 +1775,24 @@ fn preview_from_initial_history(initial_history: &InitialHistory) -> String {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "Resumed conversation".to_string()),
         ),
+    }
+}
+
+fn permission_path_for_call(call: &ToolCall) -> Option<String> {
+    match &call.payload {
+        ToolPayload::Function { arguments } => serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+        ToolPayload::Mcp { raw_arguments, .. } => raw_arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ToolPayload::Custom { .. } | ToolPayload::LocalShell { .. } => None,
     }
 }
 
@@ -1432,6 +1830,32 @@ fn to_protocol_thread(thread: ThreadMetadata) -> Thread {
     }
 }
 
+fn to_protocol_goal(goal: ThreadGoalRecord) -> ThreadGoal {
+    ThreadGoal {
+        thread_id: goal.thread_id,
+        goal_id: goal.goal_id,
+        objective: goal.objective,
+        status: to_protocol_goal_status(goal.status),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        continuation_count: goal.continuation_count,
+        created_at: goal.created_at,
+        updated_at: goal.updated_at,
+    }
+}
+
+fn to_protocol_goal_status(status: PersistedThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        PersistedThreadGoalStatus::Active => ThreadGoalStatus::Active,
+        PersistedThreadGoalStatus::Paused => ThreadGoalStatus::Paused,
+        PersistedThreadGoalStatus::Blocked => ThreadGoalStatus::Blocked,
+        PersistedThreadGoalStatus::UsageLimited => ThreadGoalStatus::UsageLimited,
+        PersistedThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
+        PersistedThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+    }
+}
+
 fn to_persisted_status(status: &ThreadStatus) -> PersistedThreadStatus {
     match status {
         ThreadStatus::Running => PersistedThreadStatus::Running,
@@ -1455,6 +1879,7 @@ fn to_persisted_source(source: &codewhale_protocol::SessionSource) -> SessionSou
 
 fn approval_request_frame(
     requirement: &ExecApprovalRequirement,
+    matched_rule: Option<&str>,
     call_id: String,
     approval_id: String,
     turn_id: String,
@@ -1497,6 +1922,7 @@ fn approval_request_frame(
             command,
             cwd,
             reason: reason.clone(),
+            matched_rule: matched_rule.map(|rule| rule.to_string().into_boxed_str()),
             network_approval_context: None,
             proposed_execpolicy_amendment: proposed_execpolicy_amendment
                 .as_ref()
@@ -1507,6 +1933,33 @@ fn approval_request_frame(
             available_decisions,
         },
     })
+}
+
+/// Build an [`EventFrame::UserInputRequest`] for a headless
+/// `request_user_input` tool call, mirroring [`approval_request_frame`].
+///
+/// `arguments` is the raw JSON arguments string the model supplied to the
+/// `request_user_input` tool (a `ToolPayload::Function` body). On parse
+/// failure we return `None` so the caller falls through to the generic tool
+/// error path rather than silently dropping the request.
+fn user_input_request_frame(
+    call_id: String,
+    turn_id: String,
+    request_id: String,
+    arguments: &str,
+) -> Option<EventFrame> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    // Extract the `questions` array and lift it into the headless event
+    // shape. We tolerate missing `allow_free_text`/`multi_select` (default
+    // false) and extra fields, matching the lenient TUI `from_value` path.
+    let questions = parsed.get("questions").cloned().filter(Value::is_array)?;
+    let request = UserInputRequestEvent {
+        call_id,
+        turn_id,
+        request_id,
+        questions: serde_json::from_value(questions).ok()?,
+    };
+    Some(EventFrame::UserInputRequest { request })
 }
 
 fn approval_requirement_payload(requirement: &ExecApprovalRequirement) -> Value {
@@ -1578,6 +2031,13 @@ fn event_frame_payload(frame: &EventFrame) -> Value {
     serde_json::to_value(frame)
         .unwrap_or_else(|_| json!({"event":"error","message":"failed to encode event frame"}))
 }
+
+/// Tool name that triggers the headless clarification-question flow.
+///
+/// Mirrors the TUI's `REQUEST_USER_INPUT_NAME`
+/// (`crates/tui/src/core/engine/tool_catalog.rs`); duplicated here rather than
+/// depended on across crates so `core` stays free of `tui` imports.
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 
 fn json_optional_string(value: &Value) -> Option<String> {
     if value.is_null() {
@@ -1698,5 +2158,650 @@ fn job_state_status_to_runtime(status: JobStateStatus) -> JobStatus {
         JobStateStatus::Completed => JobStatus::Completed,
         JobStateStatus::Failed => JobStatus::Failed,
         JobStateStatus::Cancelled => JobStatus::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codewhale_tools::ToolCallSource;
+
+    fn temp_core_state(name: &str) -> StateStore {
+        let dir =
+            std::env::temp_dir().join(format!("codewhale-core-{name}-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("create temp state dir");
+        StateStore::open(Some(dir.join("state.db"))).expect("open state store")
+    }
+
+    fn test_thread_metadata(id: &str) -> ThreadMetadata {
+        ThreadMetadata {
+            id: id.to_string(),
+            rollout_path: None,
+            preview: "test thread".to_string(),
+            ephemeral: false,
+            model_provider: "deepseek".to_string(),
+            created_at: 10,
+            updated_at: 10,
+            status: PersistedThreadStatus::Running,
+            path: None,
+            cwd: PathBuf::from("/tmp/codewhale"),
+            cli_version: "0.0.0-test".to_string(),
+            source: SessionSource::Interactive,
+            name: None,
+            sandbox_policy: None,
+            approval_mode: None,
+            archived: false,
+            archived_at: None,
+            git_sha: None,
+            git_branch: None,
+            git_origin_url: None,
+            memory_mode: None,
+            current_leaf_id: None,
+        }
+    }
+
+    // ── JobManager: lifecycle ──────────────────────────────────────────
+
+    #[test]
+    fn permission_path_for_call_extracts_function_path_argument() {
+        let call = ToolCall {
+            name: "read_file".to_string(),
+            payload: ToolPayload::Function {
+                arguments: json!({ "path": "README.md" }).to_string(),
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(
+            permission_path_for_call(&call).as_deref(),
+            Some("README.md")
+        );
+    }
+
+    #[test]
+    fn permission_path_for_call_extracts_mcp_path_argument() {
+        let call = ToolCall {
+            name: "mcp_fs_read".to_string(),
+            payload: ToolPayload::Mcp {
+                server: "fs".to_string(),
+                tool: "read".to_string(),
+                raw_arguments: json!({ "path": "secrets/token.txt" }),
+                raw_tool_call_id: None,
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(
+            permission_path_for_call(&call).as_deref(),
+            Some("secrets/token.txt")
+        );
+    }
+
+    #[test]
+    fn permission_path_for_call_ignores_shell_payload() {
+        let call = ToolCall {
+            name: "exec_shell".to_string(),
+            payload: ToolPayload::LocalShell {
+                params: codewhale_protocol::LocalShellParams {
+                    command: "cargo test".to_string(),
+                    cwd: None,
+                    timeout_ms: None,
+                },
+            },
+            source: ToolCallSource::Direct,
+            raw_tool_call_id: None,
+        };
+
+        assert_eq!(permission_path_for_call(&call), None);
+    }
+
+    #[test]
+    fn thread_goal_progress_accumulates_durable_accounting() {
+        let store = temp_core_state("thread-goal-progress");
+        store
+            .upsert_thread(&test_thread_metadata("thread-1"))
+            .expect("upsert thread");
+        let mut manager = ThreadManager::new(store);
+        manager
+            .set_thread_goal(&ThreadGoalSetParams {
+                thread_id: "thread-1".to_string(),
+                objective: "Carry the goal across turns".to_string(),
+                token_budget: Some(2_000),
+            })
+            .expect("set goal")
+            .expect("goal exists");
+
+        let updated = manager
+            .record_thread_goal_progress(&ThreadGoalProgressParams {
+                thread_id: "thread-1".to_string(),
+                token_delta: 750,
+                time_delta_seconds: 12,
+                record_continuation: true,
+            })
+            .expect("record progress")
+            .expect("goal exists");
+
+        assert_eq!(updated.tokens_used, 750);
+        assert_eq!(updated.time_used_seconds, 12);
+        assert_eq!(updated.continuation_count, 1);
+
+        let persisted = manager
+            .get_thread_goal(&ThreadGoalGetParams {
+                thread_id: "thread-1".to_string(),
+            })
+            .expect("read goal")
+            .expect("goal exists");
+        assert_eq!(persisted.tokens_used, 750);
+        assert_eq!(persisted.time_used_seconds, 12);
+        assert_eq!(persisted.continuation_count, 1);
+    }
+
+    #[test]
+    fn approval_request_frame_includes_matched_rule() {
+        let requirement = ExecApprovalRequirement::NeedsApproval {
+            reason: "Typed ask rule 'tool=exec_shell command=cargo test' requires approval."
+                .to_string(),
+            proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: Vec::new(),
+        };
+
+        let frame = approval_request_frame(
+            &requirement,
+            Some("tool=exec_shell command=cargo test"),
+            "call-1".to_string(),
+            "approval-1".to_string(),
+            "turn-1".to_string(),
+            "cargo test --workspace".to_string(),
+            "/repo".to_string(),
+        )
+        .expect("approval frame");
+
+        let EventFrame::ExecApprovalRequest { request } = frame else {
+            panic!("expected exec approval request frame");
+        };
+        assert_eq!(
+            request.matched_rule.as_deref(),
+            Some("tool=exec_shell command=cargo test")
+        );
+        assert_eq!(request.reason, requirement.reason());
+    }
+
+    #[test]
+    fn user_input_request_frame_lifts_questions_from_arguments() {
+        // issue #3102: the headless frame constructor must parse the model's
+        // `request_user_input` arguments and lift the questions into the
+        // UserInputRequestEvent, defaulting the boolean flags when omitted.
+        let arguments = r#"{"questions":[{"header":"Scope","id":"scope","question":"Which?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"allow_free_text":true}]}"#;
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            arguments,
+        )
+        .expect("user input frame");
+
+        let EventFrame::UserInputRequest { request } = frame else {
+            panic!("expected user_input_request frame");
+        };
+        assert_eq!(request.call_id, "call-1");
+        assert_eq!(request.turn_id, "turn-1");
+        assert_eq!(request.request_id, "ui-1");
+        assert_eq!(request.questions.len(), 1);
+        assert_eq!(request.questions[0].id, "scope");
+        assert!(request.questions[0].allow_free_text);
+        // multi_select omitted in the payload → defaults to false.
+        assert!(!request.questions[0].multi_select);
+        assert_eq!(request.questions[0].options.len(), 2);
+    }
+
+    #[test]
+    fn user_input_request_frame_returns_none_on_invalid_arguments() {
+        // On parse failure the constructor returns None so invoke_tool falls
+        // through to the generic tool error path instead of silently dropping.
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            "not json",
+        );
+        assert!(frame.is_none());
+
+        // Valid JSON but missing the questions array is also rejected.
+        let frame = user_input_request_frame(
+            "call-1".to_string(),
+            "turn-1".to_string(),
+            "ui-1".to_string(),
+            r#"{"foo":"bar"}"#,
+        );
+        assert!(frame.is_none());
+    }
+
+    #[test]
+    fn enqueue_creates_queued_job_with_zero_progress() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("build");
+        assert_eq!(job.name, "build");
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(job.progress, Some(0));
+        assert!(job.detail.is_none());
+        assert_eq!(job.history.len(), 1);
+        assert_eq!(job.history[0].phase, "created");
+    }
+
+    #[test]
+    fn set_running_transitions_from_queued() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("deploy");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.status, JobStatus::Running);
+        assert_eq!(updated.history.last().unwrap().phase, "running");
+    }
+
+    #[test]
+    fn update_progress_clamps_to_100() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.update_progress(&id, 150, Some("over".to_string()));
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.progress, Some(100));
+    }
+
+    #[test]
+    fn complete_sets_progress_to_100() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.complete(&id);
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.status, JobStatus::Completed);
+        assert_eq!(updated.progress, Some(100));
+    }
+
+    #[test]
+    fn fail_increments_attempt_and_sets_backoff() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("fragile");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.fail(&id, "crashed");
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.status, JobStatus::Failed);
+        assert_eq!(updated.retry.attempt, 1);
+        assert!(updated.retry.next_backoff_ms > 0);
+        assert!(updated.retry.next_retry_at.is_some());
+        assert_eq!(updated.detail.as_deref(), Some("crashed"));
+    }
+
+    #[test]
+    fn fail_clears_retry_after_max_attempts() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("fragile");
+        let id = job.id.clone();
+        for _ in 0..=DEFAULT_JOB_MAX_ATTEMPTS {
+            jm.set_running(&id);
+            jm.fail(&id, "boom");
+        }
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.retry.attempt, DEFAULT_JOB_MAX_ATTEMPTS);
+        assert_eq!(updated.retry.next_backoff_ms, 0);
+        assert!(updated.retry.next_retry_at.is_none());
+    }
+
+    #[test]
+    fn cancel_sets_status_and_clears_retry() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.cancel(&id);
+        let jobs = jm.list();
+        let updated = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(updated.status, JobStatus::Cancelled);
+        assert_eq!(updated.retry.next_backoff_ms, 0);
+    }
+
+    #[test]
+    fn pause_and_resume_round_trip() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.pause(&id, Some("waiting".to_string()));
+        let jobs = jm.list();
+        let paused = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(paused.status, JobStatus::Paused);
+        assert_eq!(paused.detail.as_deref(), Some("waiting"));
+
+        jm.resume(&id, None);
+        let jobs = jm.list();
+        let resumed = jobs.iter().find(|j| j.id == id).unwrap();
+        assert_eq!(resumed.status, JobStatus::Running);
+        assert_eq!(resumed.history.last().unwrap().phase, "resumed");
+    }
+
+    #[test]
+    fn list_returns_jobs_sorted_by_updated_at_desc() {
+        let mut jm = JobManager::default();
+        jm.enqueue("first");
+        jm.enqueue("second");
+        jm.enqueue("third");
+        let jobs = jm.list();
+        assert_eq!(jobs.len(), 3);
+        for window in jobs.windows(2) {
+            assert!(window[0].updated_at >= window[1].updated_at);
+        }
+    }
+
+    #[test]
+    fn history_returns_entries_for_existing_job() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.complete(&id);
+        let history = jm.history(&id);
+        assert_eq!(history.len(), 3); // created, running, completed
+        assert_eq!(history[0].phase, "created");
+        assert_eq!(history[1].phase, "running");
+        assert_eq!(history[2].phase, "completed");
+    }
+
+    #[test]
+    fn history_returns_empty_for_unknown_job() {
+        let jm = JobManager::default();
+        assert!(jm.history("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn resume_pending_requeues_running_and_queued() {
+        let mut jm = JobManager::default();
+        let _j1 = jm.enqueue("queued_task");
+        let j2 = jm.enqueue("running_task");
+        let j3 = jm.enqueue("completed_task");
+        let id2 = j2.id.clone();
+        let id3 = j3.id.clone();
+        jm.set_running(&id2);
+        jm.set_running(&id3);
+        jm.complete(&id3);
+
+        let resumed = jm.resume_pending();
+        assert_eq!(resumed.len(), 2);
+        for job in &resumed {
+            assert_eq!(job.status, JobStatus::Queued);
+        }
+    }
+
+    // ── JobManager: backoff ────────────────────────────────────────────
+
+    #[test]
+    fn deterministic_backoff_zero_on_first_attempt() {
+        let retry = JobRetryMetadata {
+            attempt: 0,
+            ..Default::default()
+        };
+        assert_eq!(JobManager::deterministic_backoff_ms(&retry), 0);
+    }
+
+    #[test]
+    fn deterministic_backoff_exponential_growth() {
+        let base = DEFAULT_JOB_BACKOFF_BASE_MS;
+        for attempt in 1..=5 {
+            let retry = JobRetryMetadata {
+                attempt,
+                backoff_base_ms: base,
+                ..Default::default()
+            };
+            let expected = base * 2u64.pow(attempt.saturating_sub(1).min(20));
+            assert_eq!(
+                JobManager::deterministic_backoff_ms(&retry),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_backoff_saturates_at_high_exponent() {
+        let retry = JobRetryMetadata {
+            attempt: 63,
+            backoff_base_ms: 1000,
+            ..Default::default()
+        };
+        // Should not panic; result saturates
+        let _ = JobManager::deterministic_backoff_ms(&retry);
+    }
+
+    // ── JobManager: history truncation ─────────────────────────────────
+
+    #[test]
+    fn push_history_truncates_beyond_max() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        // Generate more history entries than the limit
+        for i in 0..(MAX_JOB_HISTORY_ENTRIES + 20) {
+            jm.update_progress(&id, (i % 100) as u8, Some(format!("step {i}")));
+        }
+        let history = jm.history(&id);
+        assert_eq!(history.len(), MAX_JOB_HISTORY_ENTRIES);
+    }
+
+    // ── JobManager: persistence encoding/parsing ───────────────────────
+
+    #[test]
+    fn encode_and_parse_persisted_detail_round_trip() {
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.fail(&id, "oops");
+        let job = jm.list().into_iter().find(|j| j.id == id).unwrap();
+
+        let encoded = JobManager::encode_persisted_detail(&job).unwrap().unwrap();
+        let parsed = JobManager::parse_persisted_detail(Some(&encoded)).unwrap();
+
+        assert_eq!(parsed.status, job.status);
+        assert_eq!(parsed.detail, job.detail);
+        assert_eq!(parsed.retry.attempt, job.retry.attempt);
+        assert_eq!(parsed.history.len(), job.history.len());
+    }
+
+    #[test]
+    fn parse_persisted_detail_returns_none_for_none_input() {
+        assert!(JobManager::parse_persisted_detail(None).is_none());
+    }
+
+    #[test]
+    fn parse_persisted_detail_returns_none_for_invalid_json() {
+        assert!(JobManager::parse_persisted_detail(Some("not json")).is_none());
+    }
+
+    // ── Helper functions ───────────────────────────────────────────────
+
+    #[test]
+    fn job_status_round_trip_str() {
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::Running,
+            JobStatus::Paused,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ];
+        for status in &statuses {
+            let s = job_status_to_str(*status);
+            let parsed = job_status_from_str(s);
+            assert_eq!(parsed, Some(*status), "round-trip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn job_status_from_str_returns_none_for_unknown() {
+        assert_eq!(job_status_from_str("unknown"), None);
+        assert_eq!(job_status_from_str(""), None);
+    }
+
+    #[test]
+    fn truncate_preview_limits_to_120_chars() {
+        let long = "a".repeat(200);
+        let truncated = truncate_preview(&long);
+        assert_eq!(truncated.len(), 120);
+    }
+
+    #[test]
+    fn truncate_preview_preserves_short_strings() {
+        let short = "hello";
+        assert_eq!(truncate_preview(short), "hello");
+    }
+
+    #[test]
+    fn runtime_status_to_job_state_maps_correctly() {
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Queued),
+            JobStateStatus::Queued
+        );
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Running),
+            JobStateStatus::Running
+        );
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Paused),
+            JobStateStatus::Running
+        );
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Completed),
+            JobStateStatus::Completed
+        );
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Failed),
+            JobStateStatus::Failed
+        );
+        assert_eq!(
+            runtime_status_to_job_state(JobStatus::Cancelled),
+            JobStateStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn job_state_status_to_runtime_maps_correctly() {
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Queued),
+            JobStatus::Queued
+        );
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Running),
+            JobStatus::Running
+        );
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Completed),
+            JobStatus::Completed
+        );
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Failed),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Cancelled),
+            JobStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn preview_from_initial_history_new() {
+        let preview = preview_from_initial_history(&InitialHistory::New);
+        assert_eq!(preview, "New conversation");
+    }
+
+    #[test]
+    fn preview_from_initial_history_forked() {
+        let preview = preview_from_initial_history(&InitialHistory::Forked(vec![json!("hello")]));
+        assert!(preview.contains("hello"));
+    }
+
+    #[test]
+    fn preview_from_initial_history_resumed() {
+        let preview = preview_from_initial_history(&InitialHistory::Resumed {
+            conversation_id: "test".to_string(),
+            history: vec![json!("world")],
+            rollout_path: PathBuf::from("/tmp/test"),
+        });
+        assert!(preview.contains("world"));
+    }
+
+    #[test]
+    fn json_optional_string_handles_null() {
+        assert!(json_optional_string(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn json_optional_string_handles_string() {
+        assert_eq!(
+            json_optional_string(&Value::String("hello".to_string())),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn json_optional_string_handles_non_string() {
+        assert!(json_optional_string(&json!(42)).is_none());
+    }
+
+    #[test]
+    fn parse_retry_metadata_returns_default_for_none() {
+        let retry = parse_retry_metadata(None);
+        assert_eq!(retry.attempt, 0);
+        assert_eq!(retry.max_attempts, DEFAULT_JOB_MAX_ATTEMPTS);
+        assert_eq!(retry.backoff_base_ms, DEFAULT_JOB_BACKOFF_BASE_MS);
+    }
+
+    #[test]
+    fn parse_retry_metadata_parses_fields() {
+        let value = json!({
+            "attempt": 2,
+            "max_attempts": 5,
+            "backoff_base_ms": 1000,
+            "next_backoff_ms": 2000,
+            "next_retry_at": 1234567890i64
+        });
+        let retry = parse_retry_metadata(Some(&value));
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.max_attempts, 5);
+        assert_eq!(retry.backoff_base_ms, 1000);
+        assert_eq!(retry.next_backoff_ms, 2000);
+        assert_eq!(retry.next_retry_at, Some(1234567890));
+    }
+
+    #[test]
+    fn parse_history_entry_returns_none_without_status() {
+        let value = json!({"at": 1, "phase": "test"});
+        assert!(parse_history_entry(&value).is_none());
+    }
+
+    #[test]
+    fn parse_history_entry_parses_valid_entry() {
+        let value = json!({
+            "at": 100,
+            "phase": "running",
+            "status": "running",
+            "progress": 50,
+            "detail": "working",
+            "retry": {"attempt": 0, "max_attempts": 3, "backoff_base_ms": 500}
+        });
+        let entry = parse_history_entry(&value).unwrap();
+        assert_eq!(entry.at, 100);
+        assert_eq!(entry.phase, "running");
+        assert_eq!(entry.status, JobStatus::Running);
+        assert_eq!(entry.progress, Some(50));
+        assert_eq!(entry.detail.as_deref(), Some("working"));
     }
 }

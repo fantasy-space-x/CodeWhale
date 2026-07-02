@@ -5,9 +5,13 @@
 //! engine module from accumulating unrelated context-policy details.
 
 use crate::compaction::estimate_tokens;
+use crate::config::ApiProvider;
+use crate::context_budget::ContextBudget;
 use crate::error_taxonomy::ErrorCategory;
 use crate::models::{Message, SystemPrompt, context_window_for_model};
 use crate::tools::spec::ToolResult;
+use codewhale_config::route::RouteLimits;
+use serde_json::Value;
 
 /// Max output tokens requested for normal agent turns. Generous on purpose:
 /// V4 thinking models can produce tens of thousands of reasoning tokens on
@@ -54,12 +58,29 @@ pub(super) fn effective_max_output_tokens(model: &str) -> u32 {
         capped.min(API_MAX_OUTPUT_TOKENS)
     }
 }
+
+pub(super) fn effective_max_output_tokens_for_route(
+    model: &str,
+    route_limits: Option<RouteLimits>,
+) -> u32 {
+    let cap = effective_max_output_tokens(model);
+    let cap = crate::route_budget::route_output_limit_tokens(route_limits)
+        .map_or(cap, |route_cap| cap.min(route_cap));
+    let Some(window) = route_limits
+        .and_then(|limits| limits.context_tokens)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+    else {
+        return cap;
+    };
+    u32::try_from(ContextBudget::new(u64::from(window), 0, u64::from(cap)).output_cap_tokens)
+        .unwrap_or(cap)
+        .max(1)
+}
 /// Keep this many most recent messages when emergency trimming is required.
 pub(super) const MIN_RECENT_MESSAGES_TO_KEEP: usize = 4;
 /// Allow a few emergency recovery attempts before failing the turn.
 pub(super) const MAX_CONTEXT_RECOVERY_ATTEMPTS: u8 = 2;
-/// Reserve additional headroom to avoid hitting provider hard limits.
-const CONTEXT_HEADROOM_TOKENS: usize = 1024;
 /// Hard cap for any tool output inserted into model context.
 const TOOL_RESULT_CONTEXT_HARD_LIMIT_CHARS: usize = 12_000;
 /// Soft cap for known noisy tools inserted into model context.
@@ -67,11 +88,11 @@ const TOOL_RESULT_CONTEXT_SOFT_LIMIT_CHARS: usize = 2_000;
 /// Snippet length kept when compacting tool output for model context.
 const TOOL_RESULT_CONTEXT_SNIPPET_CHARS: usize = 900;
 /// Hard cap for tool output inserted into a large-context model.
-const LARGE_CONTEXT_TOOL_RESULT_HARD_LIMIT_CHARS: usize = 180_000;
+const LARGE_CONTEXT_TOOL_RESULT_HARD_LIMIT_CHARS: usize = 48_000;
 /// Soft cap for known noisy tools inserted into a large-context model.
-const LARGE_CONTEXT_TOOL_RESULT_SOFT_LIMIT_CHARS: usize = 60_000;
-/// Snippet length kept when compacting large-context tool output.
-const LARGE_CONTEXT_TOOL_RESULT_SNIPPET_CHARS: usize = 40_000;
+const LARGE_CONTEXT_TOOL_RESULT_SOFT_LIMIT_CHARS: usize = 8_000;
+/// Snippet length kept when compacting large-context noisy output.
+const LARGE_CONTEXT_TOOL_RESULT_SNIPPET_CHARS: usize = 4_000;
 /// Context window size at which tool output limits can be relaxed.
 const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 /// Max chars to keep from metadata-provided output summaries.
@@ -126,6 +147,12 @@ fn tool_result_is_noisy(tool_name: &str) -> bool {
         "exec_shell"
             | "exec_shell_wait"
             | "exec_shell_interact"
+            | "exec_shell_cancel"
+            | "task_shell_start"
+            | "task_shell_wait"
+            | "run_tests"
+            | "run_verifiers"
+            | "task_gate_run"
             | "multi_tool_use.parallel"
             | "web_search"
     )
@@ -220,16 +247,7 @@ fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> St
 }
 
 fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
-    if !matches!(
-        tool_name,
-        "agent_open"
-            | "agent_eval"
-            | "agent_close"
-            | "agent_result"
-            | "agent_wait"
-            | "tool_agent"
-            | "wait"
-    ) {
+    if tool_name != "agent" {
         return None;
     }
 
@@ -244,7 +262,7 @@ fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Optio
     out.push_str(
         "Child results are self-reports; verify side effects with tools like read_file or list_dir before claiming success.\n",
     );
-    out.push_str("Use `agent_eval` for a fresh projection or `handle_read` on `transcript_handle` for bounded transcript slices.\n");
+    out.push_str("Use `handle_read` on `transcript_handle` for bounded transcript slices when the returned summary is not enough.\n");
     for (idx, snapshot) in snapshots.iter().enumerate() {
         if idx >= 8 {
             out.push_str(&format!(
@@ -257,6 +275,179 @@ fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Optio
         out.push('\n');
     }
     Some(out.trim_end().to_string())
+}
+
+fn json_text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn json_number_text(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+        })
+        .or_else(|| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+fn compact_run_tests_result_for_context(raw: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let success = parsed.get("success")?.as_bool()?;
+    let exit_code = json_number_text(&parsed, "exit_code").unwrap_or_else(|| "?".to_string());
+    let command = json_text(&parsed, "command").unwrap_or("(unknown command)");
+    let stdout = json_text(&parsed, "stdout");
+    let stderr = json_text(&parsed, "stderr");
+    let stream_limit = if success { 500 } else { 1_000 };
+
+    let mut lines = vec![
+        "[run_tests result summarized for context]".to_string(),
+        format!(
+            "status: {}, exit_code: {exit_code}",
+            if success { "passed" } else { "failed" }
+        ),
+        format!("command: {}", summarize_text(command, 300)),
+    ];
+    if let Some(stderr) = stderr {
+        lines.push(format!(
+            "stderr: {}",
+            summarize_text_head_tail(stderr, stream_limit)
+        ));
+    }
+    if let Some(stdout) = stdout {
+        lines.push(format!(
+            "stdout: {}",
+            summarize_text_head_tail(stdout, stream_limit)
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn run_verifier_status_rank(status: Option<&str>) -> u8 {
+    match status.unwrap_or_default() {
+        "failed" | "timeout" => 0,
+        "skipped" => 1,
+        "passed" => 2,
+        _ => 3,
+    }
+}
+
+fn compact_run_verifiers_result_for_context(raw: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let gates = parsed.get("gates")?.as_array()?;
+    let summary = json_text(&parsed, "summary")
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            let passed = json_number_text(&parsed, "passed").unwrap_or_else(|| "?".to_string());
+            let failed = json_number_text(&parsed, "failed").unwrap_or_else(|| "?".to_string());
+            let skipped = json_number_text(&parsed, "skipped").unwrap_or_else(|| "?".to_string());
+            format!("{passed} passed, {failed} failed, {skipped} skipped")
+        });
+
+    let mut ordered: Vec<&Value> = gates.iter().collect();
+    ordered.sort_by(|a, b| {
+        run_verifier_status_rank(json_text(a, "status"))
+            .cmp(&run_verifier_status_rank(json_text(b, "status")))
+            .then_with(|| json_text(a, "name").cmp(&json_text(b, "name")))
+    });
+
+    let mut lines = vec![
+        "[run_verifiers result summarized for context]".to_string(),
+        format!("summary: {summary}"),
+    ];
+    let profile = json_text(&parsed, "profile");
+    let level = json_text(&parsed, "level");
+    if profile.is_some() || level.is_some() {
+        lines.push(format!(
+            "selection: profile={}, level={}",
+            profile.unwrap_or("?"),
+            level.unwrap_or("?")
+        ));
+    }
+
+    for (idx, gate) in ordered.iter().enumerate() {
+        if idx >= 12 {
+            lines.push(format!(
+                "- ... {} more gate(s) omitted from context summary",
+                ordered.len().saturating_sub(idx)
+            ));
+            break;
+        }
+
+        let name = json_text(gate, "name").unwrap_or("gate");
+        let ecosystem = json_text(gate, "ecosystem").unwrap_or("unknown");
+        let status = json_text(gate, "status").unwrap_or("unknown");
+        let exit = json_number_text(gate, "exit_code")
+            .map(|code| format!(" exit={code}"))
+            .unwrap_or_default();
+        lines.push(format!("- {name} ({ecosystem}): {status}{exit}"));
+
+        if status != "passed" {
+            if let Some(command) = json_text(gate, "command") {
+                lines.push(format!("  command: {}", summarize_text(command, 240)));
+            }
+            if let Some(detail) = json_text(gate, "skipped_reason")
+                .or_else(|| json_text(gate, "stderr"))
+                .or_else(|| json_text(gate, "stdout"))
+            {
+                lines.push(format!(
+                    "  detail: {}",
+                    summarize_text_head_tail(detail, 600)
+                ));
+            }
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn compact_task_gate_run_result_for_context(raw: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let gate = parsed.get("gate")?;
+    let gate_name = json_text(gate, "gate").unwrap_or("gate");
+    let status = json_text(gate, "status").unwrap_or("unknown");
+    let command = json_text(gate, "command").unwrap_or("(unknown command)");
+    let summary = json_text(gate, "summary")
+        .or_else(|| json_text(&parsed, "stderr_summary"))
+        .or_else(|| json_text(&parsed, "stdout_summary"));
+    let exit = json_number_text(gate, "exit_code")
+        .map(|code| format!(", exit_code: {code}"))
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        "[task_gate_run result summarized for context]".to_string(),
+        format!("gate: {gate_name}, status: {status}{exit}"),
+        format!("command: {}", summarize_text(command, 300)),
+    ];
+    if let Some(summary) = summary {
+        lines.push(format!("summary: {}", summarize_text(summary, 800)));
+    }
+    if let Some(log_path) = json_text(gate, "log_path") {
+        lines.push(format!("log_path: {log_path}"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn compact_structured_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
+    match tool_name {
+        "run_tests" => compact_run_tests_result_for_context(raw),
+        "run_verifiers" => compact_run_verifiers_result_for_context(raw),
+        "task_gate_run" => compact_task_gate_run_result_for_context(raw),
+        _ => None,
+    }
 }
 
 fn tool_result_context_limits_for_model(model: &str) -> ToolResultContextLimits {
@@ -289,6 +480,10 @@ pub(crate) fn compact_tool_result_for_context(
     }
 
     if let Some(summary) = compact_subagent_tool_result_for_context(tool_name, raw) {
+        return summary;
+    }
+
+    if let Some(summary) = compact_structured_tool_result_for_context(tool_name, raw) {
         return summary;
     }
 
@@ -341,10 +536,12 @@ pub(super) fn extract_compaction_summary_prompt(
     }
 }
 
+#[allow(dead_code)] // exposed for future engine-side callers; current call path goes through compaction::estimate_input_tokens_conservative via token_estimate_cache.
 fn estimate_text_tokens_conservative(text: &str) -> usize {
     text.chars().count().div_ceil(3)
 }
 
+#[allow(dead_code)] // see estimate_text_tokens_conservative above
 fn estimate_system_tokens_conservative(system: Option<&SystemPrompt>) -> usize {
     match system {
         Some(SystemPrompt::Text(text)) => estimate_text_tokens_conservative(text),
@@ -356,6 +553,7 @@ fn estimate_system_tokens_conservative(system: Option<&SystemPrompt>) -> usize {
     }
 }
 
+#[allow(dead_code)] // see estimate_text_tokens_conservative above
 pub(super) fn estimate_input_tokens_conservative(
     messages: &[Message],
     system: Option<&SystemPrompt>,
@@ -375,9 +573,12 @@ pub(super) fn estimate_input_tokens_conservative(
 /// window does not underflow to a negative budget.
 const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
 
-/// Internal input-side token budget for a model: `window - reserved_output -
-/// headroom`. Used by the preflight check, emergency recovery, and capacity
-/// trimming to decide when to compact.
+/// Internal input-side token budget for a provider/model route:
+/// `window - reserved_output - headroom`. Used by the preflight check,
+/// emergency recovery, and capacity trimming to decide when to compact.
+/// Unknown model ids fall back to the provider's conservative default instead
+/// of disabling preflight; custom long-context deployments can still advertise
+/// their window with a `-256k`/`-1024k` model suffix.
 ///
 /// The reserved-output term is window-dependent:
 ///   * `window >= 500K` (V4-class large-context) -> [`TURN_MAX_OUTPUT_TOKENS`]
@@ -388,22 +589,63 @@ const INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD: u32 = 500_000;
 ///     `256K - 262K - 1K`, which underflows `checked_sub` to `None` and
 ///     *silently disables every preflight and emergency recovery path* — the
 ///     session then runs until the provider hard-rejects on context length.
-pub(super) fn context_input_budget(model: &str) -> Option<usize> {
-    let window_tokens = context_window_for_model(model)?;
-    let window = usize::try_from(window_tokens).ok()?;
-    let reserved_output = if window_tokens >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
+#[cfg(test)]
+pub(super) fn context_input_budget_for_provider(
+    provider: ApiProvider,
+    model: &str,
+) -> Option<usize> {
+    context_input_budget_for_route(provider, model, None, 0)
+}
+
+pub(super) fn context_input_budget_for_route(
+    provider: ApiProvider,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+    input_tokens: usize,
+) -> Option<usize> {
+    route_context_budget_for_route(provider, model, route_limits, input_tokens)
+        .and_then(|budget| usize::try_from(budget.available_input_tokens).ok())
+}
+
+#[cfg(test)]
+pub(super) fn route_context_budget_for_provider(
+    provider: ApiProvider,
+    model: &str,
+    input_tokens: usize,
+) -> Option<ContextBudget> {
+    route_context_budget_for_route(provider, model, None, input_tokens)
+}
+
+pub(super) fn route_context_budget_for_route(
+    provider: ApiProvider,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+    input_tokens: usize,
+) -> Option<ContextBudget> {
+    let window = crate::route_budget::route_context_window_tokens(provider, model, route_limits);
+    let output_cap = route_output_reservation_for_window(model, window, route_limits);
+    crate::route_budget::route_context_budget(
+        provider,
+        model,
+        route_limits,
+        input_tokens,
+        output_cap,
+    )
+}
+
+fn route_output_reservation_for_window(
+    model: &str,
+    window_tokens: u32,
+    route_limits: Option<RouteLimits>,
+) -> u32 {
+    if let Some(route_cap) = crate::route_budget::route_output_limit_tokens(route_limits) {
+        return route_cap.min(TURN_MAX_OUTPUT_TOKENS);
+    }
+    if window_tokens >= INTERNAL_BUDGET_LARGE_WINDOW_THRESHOLD {
         TURN_MAX_OUTPUT_TOKENS
     } else {
         effective_max_output_tokens(model)
-    };
-    let output = usize::try_from(reserved_output).ok()?;
-    window
-        .checked_sub(output)
-        .and_then(|v| v.checked_sub(CONTEXT_HEADROOM_TOKENS))
-}
-
-pub(super) fn turn_response_headroom_tokens() -> u64 {
-    u64::from(TURN_MAX_OUTPUT_TOKENS).saturating_add(CONTEXT_HEADROOM_TOKENS as u64)
+    }
 }
 
 pub(super) fn is_context_length_error_message(message: &str) -> bool {

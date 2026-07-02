@@ -5,49 +5,80 @@
 //! platform-correct binary, verifies its SHA256 checksum, and atomically
 //! replaces the currently running binary.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use codewhale_release::{
+    CHECKSUM_MANIFEST_ASSET, ReleaseChannel, ReleaseQuery, UPDATE_USER_AGENT,
+    compare_release_versions, is_beta_tag, mirror_asset_url, resolve_release_query,
+    update_is_needed, update_network_fallback_hint,
+};
+use reqwest::Proxy;
 use std::io::Write;
+use std::time::Duration;
 
-const CHECKSUM_MANIFEST_ASSET: &str = "codewhale-artifacts-sha256.txt";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Hmbown/CodeWhale/releases/latest";
-const RELEASES_URL: &str = "https://api.github.com/repos/Hmbown/CodeWhale/releases?per_page=100";
-const CNB_REPO_URL: &str = "https://cnb.cool/codewhale.net/codewhale";
-const RELEASE_BASE_URL_ENV: &str = "CODEWHALE_RELEASE_BASE_URL";
-const LEGACY_RELEASE_BASE_URL_ENV: &str = "DEEPSEEK_TUI_RELEASE_BASE_URL";
-const DEEPSEEK_RELEASE_BASE_URL_ENV: &str = "DEEPSEEK_RELEASE_BASE_URL";
-const CNB_MIRROR_ENV: &str = "CODEWHALE_USE_CNB_MIRROR";
-/// Base URL for CNB binary release asset downloads (China-friendly mirror).
-const CNB_RELEASE_ASSET_BASE: &str = "https://cnb.cool/Hmbown/CodeWhale/-/releases";
-const UPDATE_VERSION_ENV: &str = "DEEPSEEK_TUI_VERSION";
-const LEGACY_UPDATE_VERSION_ENV: &str = "DEEPSEEK_VERSION";
-const UPDATE_USER_AGENT: &str = "codewhale-updater";
+const GITHUB_LATEST_RELEASE_PAGE_URL: &str = "https://github.com/Hmbown/CodeWhale/releases/latest";
+const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
+    "https://github.com/Hmbown/CodeWhale/releases/download";
+const UPDATE_HTTP_ATTEMPTS: usize = 3;
+const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
 
 /// Run the self-update workflow.
-pub fn run_update(beta: bool) -> Result<()> {
+///
+/// OpenHarmony (HarmonyOS) won't compile this file, so no need to handle
+pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Result<()> {
     let current_exe =
         std::env::current_exe().context("failed to determine current executable path")?;
+    let legacy_binary = is_legacy_binary(&current_exe);
+
     let targets = update_targets_for_exe(&current_exe);
     let channel = ReleaseChannel::from_beta_flag(beta);
     let current_version = env!("CARGO_PKG_VERSION");
+    let proxy = proxy_arg
+        .as_deref()
+        .map(validate_and_build_proxy)
+        .transpose()?;
 
     println!("Checking for {} updates...", channel.label());
     println!("Current binary: {}", current_exe.display());
     println!("Current version: v{current_version}");
+    if legacy_binary {
+        println!();
+        println!("{}", legacy_binary_message(&current_exe));
+    }
+
+    if check_only {
+        let latest_tag = latest_release_tag(channel, proxy.as_ref())
+            .with_context(update_network_fallback_hint)?;
+        println!("Latest {} release: {latest_tag}", channel.label());
+        if update_is_needed(channel, current_version, &latest_tag)? {
+            println!("Update available. Run `codewhale update` to install {latest_tag}.");
+        } else {
+            match compare_release_versions(current_version, &latest_tag)? {
+                Ordering::Greater => {
+                    println!("Current build is newer than the latest published release.");
+                }
+                Ordering::Less | Ordering::Equal => {
+                    println!("Already up to date.");
+                }
+            }
+        }
+        return Ok(());
+    }
 
     // Step 1: Fetch latest release metadata
-    let fetched = fetch_latest_release(channel).with_context(update_network_fallback_hint)?;
+    let fetched =
+        fetch_latest_release(channel, proxy.as_ref()).with_context(update_network_fallback_hint)?;
     let release = &fetched.release;
     let latest_tag = &release.tag_name;
     println!("Latest {} release: {latest_tag}", channel.label());
 
-    if let ReleaseSource::Mirror { base_url } = &fetched.source {
+    if let UpdateReleaseSource::Mirror { base_url } = &fetched.source {
         if channel == ReleaseChannel::Beta {
             println!(
-                "Using release mirror {}; --beta does not select GitHub beta releases in mirror mode.",
-                base_url
+                "Using release mirror {base_url}; --beta does not select GitHub beta releases in mirror mode."
             );
         }
     } else if !update_is_needed(channel, current_version, latest_tag)? {
@@ -59,8 +90,8 @@ pub fn run_update(beta: bool) -> Result<()> {
     let checksum_manifest = match select_checksum_manifest_asset(release) {
         Some(checksum_asset) => {
             println!("Downloading {}...", checksum_asset.name);
-            let checksum_bytes =
-                download_url(&checksum_asset.browser_download_url).with_context(|| {
+            let checksum_bytes = download_url(&checksum_asset.browser_download_url, proxy.as_ref())
+                .with_context(|| {
                     format!(
                         "failed to download {}\n{}",
                         checksum_asset.name,
@@ -95,13 +126,14 @@ pub fn run_update(beta: bool) -> Result<()> {
         })?;
 
         println!("Downloading {}...", asset.name);
-        let bytes = download_url(&asset.browser_download_url).with_context(|| {
-            format!(
-                "failed to download {}\n{}",
-                asset.name,
-                update_network_fallback_hint()
-            )
-        })?;
+        let bytes =
+            download_url(&asset.browser_download_url, proxy.as_ref()).with_context(|| {
+                format!(
+                    "failed to download {}\n{}",
+                    asset.name,
+                    update_network_fallback_hint()
+                )
+            })?;
 
         if let Some(checksums) = &checksum_manifest {
             let expected = checksums
@@ -116,6 +148,7 @@ pub fn run_update(beta: bool) -> Result<()> {
             }
         }
 
+        preflight_downloaded_binary(&asset.name, &bytes)?;
         downloads.push((target.path.clone(), asset.name.clone(), bytes));
     }
 
@@ -143,33 +176,14 @@ pub fn run_update(beta: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseChannel {
-    Stable,
-    Beta,
-}
-
-impl ReleaseChannel {
-    fn from_beta_flag(beta: bool) -> Self {
-        if beta { Self::Beta } else { Self::Stable }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Stable => "stable",
-            Self::Beta => "beta",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FetchedRelease {
     release: Release,
-    source: ReleaseSource,
+    source: UpdateReleaseSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ReleaseSource {
+enum UpdateReleaseSource {
     GitHub,
     Mirror { base_url: String },
 }
@@ -182,12 +196,58 @@ pub(crate) fn release_arch_for_rust_arch(arch: &str) -> &str {
     }
 }
 
+/// Returns true when the binary name belongs to the pre-rebrand `deepseek-tui` era.
+pub(crate) fn is_legacy_binary(current_exe: &Path) -> bool {
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    exe_name.starts_with("deepseek")
+}
+
+fn legacy_binary_message(current_exe: &Path) -> String {
+    format!(
+        "\
+this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
+
+The package has been renamed to `codewhale`. This update will install canonical
+CodeWhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
+legacy command when the install directory is writable. DeepSeek provider support
+is unchanged.
+
+If this update cannot write to the install directory, reinstall using your
+original install method:
+
+  npm:
+    npm uninstall -g deepseek-tui
+    npm install -g codewhale
+
+  Cargo:
+    cargo uninstall deepseek-tui-cli 2>/dev/null || true
+    cargo uninstall deepseek-tui 2>/dev/null || true
+    cargo install codewhale-cli --locked
+    cargo install codewhale-tui --locked
+
+  Homebrew:
+    brew upgrade deepseek-tui
+
+  Manual binary:
+    download the matched codewhale and codewhale-tui assets from
+    https://github.com/Hmbown/CodeWhale/releases/latest
+
+Once `codewhale` is on your PATH, run `codewhale update` for future updates.",
+        exe = current_exe.display(),
+    )
+}
+
 pub(crate) fn binary_prefix_for_exe(current_exe: &Path) -> &'static str {
     let exe_name = current_exe
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("codewhale");
-    if exe_name.contains("codewhale-tui") {
+        .unwrap_or("codewhale")
+        .to_ascii_lowercase();
+    if exe_name.contains("codewhale-tui") || exe_name.contains("deepseek-tui") {
         "codewhale-tui"
     } else {
         "codewhale"
@@ -206,6 +266,40 @@ fn sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
     current_exe.with_file_name(format!("{sibling_prefix}{}", std::env::consts::EXE_SUFFIX))
 }
 
+fn canonical_binary_path_for_prefix(current_exe: &Path, prefix: &str) -> PathBuf {
+    if is_legacy_binary(current_exe) {
+        current_exe.with_file_name(format!("{prefix}{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        current_exe.to_path_buf()
+    }
+}
+
+fn legacy_binary_name_for_prefix(prefix: &str) -> &'static str {
+    if prefix == "codewhale-tui" {
+        "deepseek-tui"
+    } else {
+        "deepseek"
+    }
+}
+
+fn legacy_sibling_binary_path(current_exe: &Path, sibling_prefix: &str) -> PathBuf {
+    current_exe.with_file_name(format!(
+        "{}{}",
+        legacy_binary_name_for_prefix(sibling_prefix),
+        std::env::consts::EXE_SUFFIX
+    ))
+}
+
+fn should_update_sibling(
+    current_exe: &Path,
+    canonical_sibling: &Path,
+    sibling_prefix: &str,
+) -> bool {
+    canonical_sibling.exists()
+        || (is_legacy_binary(current_exe)
+            && legacy_sibling_binary_path(current_exe, sibling_prefix).exists())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpdateTarget {
     path: PathBuf,
@@ -215,7 +309,7 @@ struct UpdateTarget {
 fn update_targets_for_exe(current_exe: &Path) -> Vec<UpdateTarget> {
     let current_prefix = binary_prefix_for_exe(current_exe);
     let mut targets = vec![UpdateTarget {
-        path: current_exe.to_path_buf(),
+        path: canonical_binary_path_for_prefix(current_exe, current_prefix),
         asset_stem: release_asset_stem_for_prefix(
             current_prefix,
             std::env::consts::OS,
@@ -225,7 +319,7 @@ fn update_targets_for_exe(current_exe: &Path) -> Vec<UpdateTarget> {
 
     let sibling_prefix = sibling_prefix_for(current_prefix);
     let sibling = sibling_binary_path(current_exe, sibling_prefix);
-    if sibling.exists() {
+    if should_update_sibling(current_exe, &sibling, sibling_prefix) {
         targets.push(UpdateTarget {
             path: sibling,
             asset_stem: release_asset_stem_for_prefix(
@@ -342,72 +436,70 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn update_http_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+/// Validate the proxy URL format and build a proxy for update HTTP requests.
+pub(crate) fn validate_and_build_proxy(proxy_str: &str) -> Result<Proxy> {
+    let proxy_url = reqwest::Url::parse(proxy_str).with_context(|| {
+        format!(
+            "invalid proxy URL: {proxy_str}\n\
+             Expected format: http://host:port, https://host:port, or socks5://host:port"
+        )
+    })?;
+    Proxy::all(proxy_url).context("failed to configure update proxy")
+}
+
+fn update_http_client(proxy: Option<&Proxy>) -> Result<reqwest::blocking::Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut builder = reqwest::blocking::Client::builder();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy.clone());
+    }
+    builder
         .user_agent(UPDATE_USER_AGENT)
+        .timeout(Duration::from_secs(5 * 60))
         .build()
         .context("failed to build update HTTP client")
 }
 
+fn latest_release_tag(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Result<String> {
+    let FetchedRelease { release, .. } = fetch_latest_release(channel, proxy)?;
+    Ok(release.tag_name)
+}
+
 /// Fetch the latest release metadata from GitHub.
-fn fetch_latest_release(channel: ReleaseChannel) -> Result<FetchedRelease> {
-    let version = update_version_from_env().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
-    if let Some(base_url) = release_base_url_from_env(&version) {
-        return Ok(FetchedRelease {
+fn fetch_latest_release(channel: ReleaseChannel, proxy: Option<&Proxy>) -> Result<FetchedRelease> {
+    match resolve_release_query(channel) {
+        ReleaseQuery::Mirror { base_url, version } => Ok(FetchedRelease {
             release: release_from_mirror_base_url(
                 &base_url,
                 &version,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             ),
-            source: ReleaseSource::Mirror { base_url },
-        });
-    }
-    let release = match channel {
-        ReleaseChannel::Stable => fetch_latest_release_from_url(LATEST_RELEASE_URL),
-        ReleaseChannel::Beta => fetch_latest_beta_release_from_url(RELEASES_URL),
-    }?;
-    Ok(FetchedRelease {
-        release,
-        source: ReleaseSource::GitHub,
-    })
-}
-
-fn release_base_url_from_env(version: &str) -> Option<String> {
-    // Check canonical env first, then legacy envs
-    for env_name in [
-        RELEASE_BASE_URL_ENV,
-        LEGACY_RELEASE_BASE_URL_ENV,
-        DEEPSEEK_RELEASE_BASE_URL_ENV,
-    ] {
-        if let Ok(value) = std::env::var(env_name) {
-            let trimmed = value.trim().to_string();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
+            source: UpdateReleaseSource::Mirror { base_url },
+        }),
+        ReleaseQuery::GitHubLatest { url } => match fetch_latest_release_from_url(url, proxy) {
+            Ok(release) => Ok(FetchedRelease {
+                release,
+                source: UpdateReleaseSource::GitHub,
+            }),
+            Err(api_error) => {
+                eprintln!(
+                    "GitHub API release lookup failed; trying github.com releases/latest fallback..."
+                );
+                Ok(FetchedRelease {
+                    release: fetch_latest_stable_release_from_redirect(proxy).with_context(
+                        || format!("GitHub API release lookup failed first: {api_error:#}"),
+                    )?,
+                    source: UpdateReleaseSource::GitHub,
+                })
             }
-        }
+        },
+        ReleaseQuery::GitHubReleaseList { url } => Ok(FetchedRelease {
+            release: fetch_latest_beta_release_from_url(url, proxy)?,
+            source: UpdateReleaseSource::GitHub,
+        }),
     }
-    // Auto-detect CNB mirror when CODEWHALE_USE_CNB_MIRROR is set
-    if std::env::var(CNB_MIRROR_ENV).is_ok() {
-        return Some(cnb_release_base_url(version));
-    }
-    None
-}
-
-fn cnb_release_base_url(version: &str) -> String {
-    format!(
-        "{}/v{}",
-        CNB_RELEASE_ASSET_BASE.trim_end_matches('/'),
-        version.trim_start_matches('v')
-    )
-}
-
-fn update_version_from_env() -> Option<String> {
-    std::env::var(UPDATE_VERSION_ENV)
-        .ok()
-        .or_else(|| std::env::var(LEGACY_UPDATE_VERSION_ENV).ok())
-        .map(|value| value.trim().trim_start_matches('v').to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn release_from_mirror_base_url(
@@ -417,6 +509,21 @@ fn release_from_mirror_base_url(
     rust_arch: &str,
 ) -> Release {
     let tag_name = format!("v{}", version.trim_start_matches('v'));
+    release_from_asset_base_url(&tag_name, base_url, os, rust_arch)
+}
+
+fn release_from_github_download_tag(tag_name: &str, os: &str, rust_arch: &str) -> Release {
+    let tag_name = format!("v{}", tag_name.trim_start_matches('v'));
+    let base_url = format!("{GITHUB_RELEASE_DOWNLOAD_BASE_URL}/{tag_name}");
+    release_from_asset_base_url(&tag_name, &base_url, os, rust_arch)
+}
+
+fn release_from_asset_base_url(
+    tag_name: &str,
+    base_url: &str,
+    os: &str,
+    rust_arch: &str,
+) -> Release {
     let mut assets = vec![Asset {
         name: CHECKSUM_MANIFEST_ASSET.to_string(),
         browser_download_url: mirror_asset_url(base_url, CHECKSUM_MANIFEST_ASSET),
@@ -431,45 +538,69 @@ fn release_from_mirror_base_url(
     }
 
     Release {
-        tag_name,
+        tag_name: tag_name.to_string(),
         prerelease: false,
         assets,
     }
 }
 
-fn mirror_asset_url(base_url: &str, asset_name: &str) -> String {
-    format!("{}/{}", base_url.trim_end_matches('/'), asset_name)
-}
-
-fn update_network_fallback_hint() -> String {
-    format!(
-        "GitHub release downloads may be blocked or slow on this network.\n\
-         For mainland China, use one of these fallback paths:\n\
-           1. Source build from the CNB mirror, installing both shipped binaries:\n\
-              cargo install --git {CNB_REPO_URL} --tag vX.Y.Z codewhale-cli --locked --force\n\
-              cargo install --git {CNB_REPO_URL} --tag vX.Y.Z codewhale-tui --locked --force\n\
-           2. Use a binary asset mirror:\n\
-              {RELEASE_BASE_URL_ENV}=https://<mirror>/<release-assets>/ {UPDATE_VERSION_ENV}=X.Y.Z codewhale update\n\
-         The mirror directory must contain {CHECKSUM_MANIFEST_ASSET} and the platform binaries."
-    )
-}
-
-fn fetch_latest_release_from_url(url: &str) -> Result<Release> {
-    let client = update_http_client()?;
+fn fetch_release_json_once(
+    url: &str,
+    description: &str,
+    proxy: Option<&Proxy>,
+) -> Result<(reqwest::StatusCode, String)> {
+    let client = update_http_client(proxy)?;
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
-        .with_context(|| format!("failed to fetch release info from {url}"))?;
+        .with_context(|| format!("failed to fetch {description} from {url}"))?;
     let status = response.status();
     let body = response
         .text()
-        .with_context(|| format!("failed to read release response from {url}"))?;
+        .with_context(|| format!("failed to read {description} response body from {url}"))?;
+    Ok((status, body))
+}
 
-    if !status.is_success() {
-        bail!("GitHub release request failed with HTTP {status}: {body}");
+fn fetch_release_json(url: &str, description: &str, proxy: Option<&Proxy>) -> Result<String> {
+    let mut last_error = None;
+    for attempt in 1..=UPDATE_HTTP_ATTEMPTS {
+        match fetch_release_json_once(url, description, proxy) {
+            Ok((status, body)) if status.is_success() => return Ok(body),
+            Ok((status, body)) => {
+                let error =
+                    anyhow!("failed to fetch {description} from {url}: HTTP {status}\n{body}");
+                if should_retry_http_status(status) && attempt < UPDATE_HTTP_ATTEMPTS {
+                    last_error = Some(error);
+                    sleep_before_update_retry(attempt);
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) if attempt < UPDATE_HTTP_ATTEMPTS => {
+                last_error = Some(error);
+                sleep_before_update_retry(attempt);
+            }
+            Err(error) => return Err(error),
+        }
     }
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to fetch {description} from {url}")))
+}
 
+fn should_retry_http_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+fn sleep_before_update_retry(attempt: usize) {
+    std::thread::sleep(Duration::from_millis(
+        UPDATE_HTTP_RETRY_DELAY_MS * attempt as u64,
+    ));
+}
+
+fn fetch_latest_release_from_url(url: &str, proxy: Option<&Proxy>) -> Result<Release> {
+    let body = fetch_release_json(url, "release info", proxy)?;
     let release: Release = serde_json::from_str(&body).with_context(|| {
         format!("failed to parse release JSON from GitHub API. Response: {body}")
     })?;
@@ -477,22 +608,93 @@ fn fetch_latest_release_from_url(url: &str) -> Result<Release> {
     Ok(release)
 }
 
-fn fetch_latest_beta_release_from_url(url: &str) -> Result<Release> {
-    let client = update_http_client()?;
+fn fetch_latest_stable_release_from_redirect(proxy: Option<&Proxy>) -> Result<Release> {
+    let tag_name =
+        fetch_latest_stable_tag_from_redirect_url(GITHUB_LATEST_RELEASE_PAGE_URL, proxy)?;
+    Ok(release_from_github_download_tag(
+        &tag_name,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ))
+}
+
+fn fetch_latest_stable_tag_from_redirect_url(url: &str, proxy: Option<&Proxy>) -> Result<String> {
+    let client = update_http_client(proxy)?;
+    let mut last_error = None;
+    for attempt in 1..=UPDATE_HTTP_ATTEMPTS {
+        match fetch_latest_stable_tag_from_redirect_url_once(&client, url) {
+            Ok(tag_name) => return Ok(tag_name),
+            Err(error) if attempt < UPDATE_HTTP_ATTEMPTS => {
+                last_error = Some(error);
+                sleep_before_update_retry(attempt);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to resolve latest stable release from {url}")))
+}
+
+fn fetch_latest_stable_tag_from_redirect_url_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<String> {
     let response = client
         .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
-        .with_context(|| format!("failed to fetch release list from {url}"))?;
+        .with_context(|| format!("failed to fetch release redirect from {url}"))?;
     let status = response.status();
-    let body = response
-        .text()
-        .with_context(|| format!("failed to read release list response from {url}"))?;
-
-    if !status.is_success() {
-        bail!("GitHub release list request failed with HTTP {status}: {body}");
+    let final_url = response.url().clone();
+    if status.is_success() {
+        if let Some(tag_name) = release_tag_from_github_release_url(&final_url) {
+            return Ok(tag_name);
+        }
+        let body = response
+            .text()
+            .with_context(|| format!("failed to read release redirect response from {url}"))?;
+        if let Some(tag_name) = release_tag_from_github_release_html(&body) {
+            return Ok(tag_name);
+        }
+        bail!("release redirect did not resolve to a tag URL: {final_url}");
     }
 
+    let body = response
+        .text()
+        .with_context(|| format!("failed to read release redirect response from {url}"))?;
+    bail!("failed to fetch release redirect from {url}: HTTP {status}\n{body}");
+}
+
+fn release_tag_from_github_release_url(url: &reqwest::Url) -> Option<String> {
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    segments
+        .windows(3)
+        .find(|window| window[0] == "releases" && window[1] == "tag")
+        .map(|window| window[2].to_string())
+        .filter(|tag| !tag.is_empty())
+}
+
+fn release_tag_from_github_release_html(body: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "/Hmbown/CodeWhale/releases/tag/",
+        "/hmbown/CodeWhale/releases/tag/",
+        "/releases/tag/",
+    ];
+    for marker in MARKERS {
+        for rest in body.split(marker).skip(1) {
+            let tag = rest
+                .split(['"', '\'', '<', '>', '?', '#', '&'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !tag.is_empty() {
+                return Some(tag.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn fetch_latest_beta_release_from_url(url: &str, proxy: Option<&Proxy>) -> Result<Release> {
+    let body = fetch_release_json(url, "release list", proxy)?;
     // GitHub caps this endpoint at 100 releases per page. CodeWhale uses the
     // first page as the latest-beta search window, matching GitHub's ordering.
     let releases: Vec<Release> = serde_json::from_str(&body).with_context(|| {
@@ -501,60 +703,38 @@ fn fetch_latest_beta_release_from_url(url: &str) -> Result<Release> {
 
     releases
         .into_iter()
-        .find(is_beta_release)
+        .find(|release| is_beta_tag(&release.tag_name))
         .context("no beta release found in GitHub releases")
 }
 
-fn is_beta_release(release: &Release) -> bool {
-    release.tag_name.to_ascii_lowercase().contains("beta")
-}
-
-fn update_is_needed(
-    channel: ReleaseChannel,
-    current_version: &str,
-    latest_tag: &str,
-) -> Result<bool> {
-    let current = parse_release_version(current_version)
-        .with_context(|| format!("failed to parse current version {current_version:?}"))?;
-    let latest = parse_release_version(latest_tag)
-        .with_context(|| format!("failed to parse latest release tag {latest_tag:?}"))?;
-
-    match channel {
-        ReleaseChannel::Stable => Ok(current < latest),
-        ReleaseChannel::Beta => {
-            if current == latest {
-                return Ok(false);
+/// Download a URL to bytes.
+fn download_url(url: &str, proxy: Option<&Proxy>) -> Result<Vec<u8>> {
+    let mut last_error = None;
+    for attempt in 1..=UPDATE_HTTP_ATTEMPTS {
+        match download_url_once(url, proxy) {
+            Ok((status, bytes)) if status.is_success() => return Ok(bytes),
+            Ok((status, bytes)) => {
+                let body = String::from_utf8_lossy(&bytes);
+                let error = anyhow!("download failed with HTTP {status}: {body}");
+                if should_retry_http_status(status) && attempt < UPDATE_HTTP_ATTEMPTS {
+                    last_error = Some(error);
+                    sleep_before_update_retry(attempt);
+                    continue;
+                }
+                return Err(error);
             }
-            let latest_is_beta = version_is_beta(&latest);
-            let current_is_stable = current.pre.is_empty();
-            let same_release_line = current.major == latest.major
-                && current.minor == latest.minor
-                && current.patch == latest.patch;
-            if current > latest && !(current_is_stable && same_release_line) {
-                return Ok(false);
+            Err(error) if attempt < UPDATE_HTTP_ATTEMPTS => {
+                last_error = Some(error);
+                sleep_before_update_retry(attempt);
             }
-            Ok(latest_is_beta)
+            Err(error) => return Err(error),
         }
     }
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to download {url}")))
 }
 
-fn parse_release_version(value: &str) -> Result<semver::Version> {
-    let version = value
-        .trim()
-        .trim_start_matches('v')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    semver::Version::parse(version).with_context(|| format!("invalid semver: {value:?}"))
-}
-
-fn version_is_beta(version: &semver::Version) -> bool {
-    version.pre.as_str().to_ascii_lowercase().contains("beta")
-}
-
-/// Download a URL to bytes.
-fn download_url(url: &str) -> Result<Vec<u8>> {
-    let client = update_http_client()?;
+fn download_url_once(url: &str, proxy: Option<&Proxy>) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    let client = update_http_client(proxy)?;
     let response = client
         .get(url)
         .send()
@@ -564,19 +744,182 @@ fn download_url(url: &str) -> Result<Vec<u8>> {
         .bytes()
         .with_context(|| format!("failed to read response body from {url}"))?;
 
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes);
-        bail!("download failed with HTTP {status}: {body}");
-    }
-
-    Ok(bytes.to_vec())
+    Ok((status, bytes.to_vec()))
 }
 
 /// Compute the SHA256 hex digest of data.
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
     let hash = sha2::Sha256::digest(data);
-    format!("{hash:x}")
+    hex_bytes(hash)
+}
+
+fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct GlibcVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl GlibcVersion {
+    fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    fn display(self) -> String {
+        if self.patch == 0 {
+            format!("{}.{}", self.major, self.minor)
+        } else {
+            format!("{}.{}.{}", self.major, self.minor, self.patch)
+        }
+    }
+}
+
+fn parse_glibc_version(text: &str) -> Option<GlibcVersion> {
+    text.split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .filter(|part| part.contains('.'))
+        .find_map(parse_glibc_version_token)
+}
+
+fn parse_glibc_version_token(token: &str) -> Option<GlibcVersion> {
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    Some(GlibcVersion::new(major, minor, patch))
+}
+
+fn highest_required_glibc(bytes: &[u8]) -> Option<GlibcVersion> {
+    const MARKER: &[u8] = b"GLIBC_";
+    let mut offset = 0;
+    let mut highest = None;
+
+    while let Some(found) = find_bytes(&bytes[offset..], MARKER) {
+        let start = offset + found + MARKER.len();
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+            end += 1;
+        }
+        if end > start
+            && let Ok(token) = std::str::from_utf8(&bytes[start..end])
+            && let Some(version) = parse_glibc_version_token(token)
+            && highest.is_none_or(|current| version > current)
+        {
+            highest = Some(version);
+        }
+        offset = start;
+    }
+
+    highest
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn glibc_check_disabled() -> bool {
+    [
+        "CODEWHALE_SKIP_GLIBC_CHECK",
+        "DEEPSEEK_TUI_SKIP_GLIBC_CHECK",
+        "DEEPSEEK_SKIP_GLIBC_CHECK",
+    ]
+    .into_iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| value == std::ffi::OsStr::new("1")))
+}
+
+fn preflight_downloaded_binary(asset_name: &str, bytes: &[u8]) -> Result<()> {
+    if !cfg!(target_os = "linux") || glibc_check_disabled() {
+        return Ok(());
+    }
+
+    let Some(required) = highest_required_glibc(bytes) else {
+        return Ok(());
+    };
+    let host = detect_host_glibc();
+    if host.is_some_and(|host| host >= required) {
+        return Ok(());
+    }
+
+    bail!(
+        "{}",
+        glibc_compatibility_message(asset_name, required, host)
+    );
+}
+
+fn detect_host_glibc() -> Option<GlibcVersion> {
+    let getconf = std::process::Command::new("getconf")
+        .arg("GNU_LIBC_VERSION")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| parse_glibc_version(&output));
+    if getconf.is_some() {
+        return getconf;
+    }
+
+    std::process::Command::new("ldd")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+            if text.trim().is_empty() {
+                text = String::from_utf8_lossy(&output.stderr).to_string();
+            }
+            parse_glibc_version(&text)
+        })
+}
+
+fn glibc_compatibility_message(
+    asset_name: &str,
+    required: GlibcVersion,
+    host: Option<GlibcVersion>,
+) -> String {
+    let host_line = match host {
+        Some(host) => format!(
+            "this system has glibc {}, which is too old for that asset.",
+            host.display()
+        ),
+        None => "this system does not appear to provide GNU libc.".to_string(),
+    };
+    format!(
+        "\
+Prebuilt CodeWhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
+
+Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
+2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
+
+Install from source on this host instead:
+
+  cargo install codewhale-cli --locked
+  cargo install codewhale-tui --locked
+
+Release engineering follow-up: build Linux GNU assets against an older glibc
+baseline, or add a musl/static Linux asset. Set CODEWHALE_SKIP_GLIBC_CHECK=1 to
+bypass this preflight at your own risk.",
+        required = required.display(),
+    )
 }
 
 /// Replace the running binary.
@@ -706,6 +1049,10 @@ mod tests {
             "codewhale-tui"
         );
         assert_eq!(
+            binary_prefix_for_exe(Path::new("CodeWhale-TUI.exe")),
+            "codewhale-tui"
+        );
+        assert_eq!(
             binary_prefix_for_exe(Path::new("/usr/local/bin/codewhale-tui")),
             "codewhale-tui"
         );
@@ -726,6 +1073,114 @@ mod tests {
             binary_prefix_for_exe(Path::new("other-binary")),
             "codewhale"
         );
+
+        // Legacy names still map to the canonical update asset prefixes.
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("deepseek-tui")),
+            "codewhale-tui"
+        );
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("/usr/local/bin/deepseek-tui")),
+            "codewhale-tui"
+        );
+        assert_eq!(
+            binary_prefix_for_exe(Path::new("DeepSeek-TUI.exe")),
+            "codewhale-tui"
+        );
+        assert_eq!(binary_prefix_for_exe(Path::new("deepseek")), "codewhale");
+    }
+
+    #[test]
+    fn test_is_legacy_binary_detection() {
+        assert!(is_legacy_binary(Path::new("deepseek")));
+        assert!(is_legacy_binary(Path::new("deepseek-tui")));
+        assert!(is_legacy_binary(Path::new("/usr/local/bin/deepseek")));
+        assert!(is_legacy_binary(Path::new("/usr/local/bin/deepseek-tui")));
+        assert!(is_legacy_binary(Path::new("DeepSeek.exe")));
+        assert!(is_legacy_binary(Path::new("DeepSeek-TUI.exe")));
+        assert!(!is_legacy_binary(Path::new("codewhale")));
+        assert!(!is_legacy_binary(Path::new("codewhale-tui")));
+        assert!(!is_legacy_binary(Path::new("codew")));
+    }
+
+    #[test]
+    fn legacy_binary_message_gives_copy_pasteable_migration_steps() {
+        let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
+
+        assert!(message.contains("legacy deepseek/deepseek-tui command name"));
+        assert!(message.contains("install canonical"));
+        assert!(message.contains("DeepSeek provider support"));
+        assert!(message.contains("is unchanged"));
+        assert!(message.contains("npm uninstall -g deepseek-tui"));
+        assert!(message.contains("npm install -g codewhale"));
+        assert!(message.contains("cargo uninstall deepseek-tui-cli 2>/dev/null || true"));
+        assert!(message.contains("cargo uninstall deepseek-tui 2>/dev/null || true"));
+        assert!(message.contains("cargo install codewhale-cli --locked"));
+        assert!(message.contains("cargo install codewhale-tui --locked"));
+        assert!(message.contains("brew upgrade deepseek-tui"));
+        assert!(message.contains("https://github.com/Hmbown/CodeWhale/releases/latest"));
+    }
+
+    #[test]
+    fn legacy_dispatcher_update_targets_canonical_codewhale_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dispatcher = dir
+            .path()
+            .join(format!("deepseek{}", std::env::consts::EXE_SUFFIX));
+        let tui = dir
+            .path()
+            .join(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
+        std::fs::write(&tui, b"legacy tui").unwrap();
+
+        let targets = update_targets_for_exe(&dispatcher);
+        let paths = targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                dir.path()
+                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX)),
+                dir.path()
+                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX))
+            ]
+        );
+        assert!(targets[0].asset_stem.starts_with("codewhale-"));
+        assert!(targets[1].asset_stem.starts_with("codewhale-tui-"));
+    }
+
+    #[test]
+    fn legacy_tui_update_targets_canonical_tui_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dispatcher = dir
+            .path()
+            .join(format!("deepseek{}", std::env::consts::EXE_SUFFIX));
+        let tui = dir
+            .path()
+            .join(format!("deepseek-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&dispatcher, b"legacy dispatcher").unwrap();
+        std::fs::write(&tui, b"legacy tui").unwrap();
+
+        let targets = update_targets_for_exe(&tui);
+        let paths = targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                dir.path()
+                    .join(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX)),
+                dir.path()
+                    .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX))
+            ]
+        );
+        assert!(targets[0].asset_stem.starts_with("codewhale-tui-"));
+        assert!(targets[1].asset_stem.starts_with("codewhale-"));
     }
 
     #[test]
@@ -833,6 +1288,44 @@ mod tests {
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn glibc_version_parser_reads_getconf_and_symbol_text() {
+        assert_eq!(
+            parse_glibc_version("glibc 2.35\n"),
+            Some(GlibcVersion::new(2, 35, 0))
+        );
+        assert_eq!(
+            parse_glibc_version("requires GLIBC_2.39"),
+            Some(GlibcVersion::new(2, 39, 0))
+        );
+        assert_eq!(parse_glibc_version("not glibc"), None);
+    }
+
+    #[test]
+    fn highest_required_glibc_finds_highest_binary_symbol() {
+        let bytes = b"\0GLIBC_2.17\0other\0GLIBC_2.39\0GLIBC_2.35";
+
+        assert_eq!(
+            highest_required_glibc(bytes),
+            Some(GlibcVersion::new(2, 39, 0))
+        );
+    }
+
+    #[test]
+    fn glibc_compatibility_message_is_codewhale_branded_and_actionable() {
+        let message = glibc_compatibility_message(
+            "codewhale-linux-x64",
+            GlibcVersion::new(2, 39, 0),
+            Some(GlibcVersion::new(2, 35, 0)),
+        );
+
+        assert!(message.contains("Prebuilt CodeWhale asset `codewhale-linux-x64`"));
+        assert!(message.contains("requires GLIBC_2.39"));
+        assert!(message.contains("this system has glibc 2.35"));
+        assert!(message.contains("cargo install codewhale-cli --locked"));
+        assert!(message.contains("build Linux GNU assets against an older glibc"));
     }
 
     #[test]
@@ -1002,13 +1495,76 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     }
 
     #[test]
+    fn github_release_url_parser_extracts_tag() {
+        let url = reqwest::Url::parse("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.61")
+            .unwrap();
+
+        assert_eq!(
+            release_tag_from_github_release_url(&url).as_deref(),
+            Some("v0.8.61")
+        );
+    }
+
+    #[test]
+    fn github_release_download_fallback_uses_deterministic_asset_urls() {
+        let release = release_from_github_download_tag("0.8.61", "macos", "aarch64");
+
+        assert_eq!(release.tag_name, "v0.8.61");
+        assert_eq!(
+            release.assets[0].browser_download_url,
+            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-artifacts-sha256.txt"
+        );
+        let dispatcher =
+            select_platform_asset(&release, "codewhale-macos-arm64").expect("dispatcher asset");
+        assert_eq!(
+            dispatcher.browser_download_url,
+            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-macos-arm64"
+        );
+        let tui = select_platform_asset(&release, "codewhale-tui-macos-arm64").expect("tui asset");
+        assert_eq!(
+            tui.browser_download_url,
+            "https://github.com/Hmbown/CodeWhale/releases/download/v0.8.61/codewhale-tui-macos-arm64"
+        );
+    }
+
+    #[test]
+    fn latest_stable_redirect_fallback_reads_tag_url() {
+        let (url, request_rx, handle) = serve_http_once("200 OK", "text/html", b"<html></html>");
+        let tag_url = url.replace("/release", "/Hmbown/CodeWhale/releases/tag/v9.9.9");
+
+        let tag = fetch_latest_stable_tag_from_redirect_url(&tag_url, None)
+            .expect("tag should parse from final URL");
+
+        assert_eq!(tag, "v9.9.9");
+        let request = request_rx.recv().expect("captured request");
+        assert!(
+            request.starts_with("GET /Hmbown/CodeWhale/releases/tag/v9.9.9 "),
+            "got {request:?}"
+        );
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn github_release_html_parser_skips_empty_first_marker() {
+        let body = r#"
+            <a href="/Hmbown/CodeWhale/releases/tag/?expanded=true">generic</a>
+            <a href="/Hmbown/CodeWhale/releases/tag/v9.9.9">latest</a>
+        "#;
+
+        assert_eq!(
+            release_tag_from_github_release_html(body).as_deref(),
+            Some("v9.9.9")
+        );
+    }
+
+    #[test]
     fn cnb_release_base_url_includes_tag_directory() {
         assert_eq!(
-            cnb_release_base_url("0.8.47"),
+            codewhale_release::cnb_release_base_url("0.8.47"),
             "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
         );
         assert_eq!(
-            cnb_release_base_url("v0.8.47"),
+            codewhale_release::cnb_release_base_url("v0.8.47"),
             "https://cnb.cool/Hmbown/CodeWhale/-/releases/v0.8.47"
         );
     }
@@ -1037,11 +1593,11 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     #[test]
     fn parse_release_version_accepts_tags_and_build_suffixes() {
         assert_eq!(
-            parse_release_version("v0.9.0-beta.1").unwrap(),
+            codewhale_release::parse_release_version("v0.9.0-beta.1").unwrap(),
             semver::Version::parse("0.9.0-beta.1").unwrap()
         );
         assert_eq!(
-            parse_release_version("0.8.45 (abcdef123456)").unwrap(),
+            codewhale_release::parse_release_version("0.8.45 (abcdef123456)").unwrap(),
             semver::Version::parse("0.8.45").unwrap()
         );
     }
@@ -1064,20 +1620,55 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             assets: vec![],
         };
 
-        assert!(!is_beta_release(&rc_prerelease));
-        assert!(is_beta_release(&beta_tag));
-        assert!(!is_beta_release(&stable));
+        assert!(!is_beta_tag(&rc_prerelease.tag_name));
+        assert!(is_beta_tag(&beta_tag.tag_name));
+        assert!(!is_beta_tag(&stable.tag_name));
     }
 
     #[test]
     fn update_fallback_hint_points_china_users_to_cnb_and_asset_mirrors() {
         let hint = update_network_fallback_hint();
 
-        assert!(hint.contains(CNB_REPO_URL), "{hint}");
-        assert!(hint.contains(RELEASE_BASE_URL_ENV), "{hint}");
-        assert!(hint.contains(UPDATE_VERSION_ENV), "{hint}");
+        assert!(hint.contains(codewhale_release::CNB_REPO_URL), "{hint}");
+        assert!(
+            hint.contains(codewhale_release::RELEASE_BASE_URL_ENV),
+            "{hint}"
+        );
+        assert!(
+            hint.contains(codewhale_release::UPDATE_VERSION_ENV),
+            "{hint}"
+        );
         assert!(hint.contains("codewhale-cli"), "{hint}");
         assert!(hint.contains("codewhale-tui --locked"), "{hint}");
+    }
+
+    fn serve_http_responses(
+        responses: Vec<(&'static str, &'static str, &'static [u8])>,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let (request_tx, request_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept test request");
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).expect("read test request");
+                request_tx
+                    .send(String::from_utf8_lossy(&buf[..n]).to_string())
+                    .expect("send captured request");
+
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write test response headers");
+                stream.write_all(body).expect("write test response body");
+            }
+        });
+
+        (format!("http://{addr}/release"), request_rx, handle)
     }
 
     fn serve_http_once(
@@ -1085,28 +1676,20 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         content_type: &'static str,
         body: &'static [u8],
     ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let (request_tx, request_rx) = mpsc::channel();
+        serve_http_responses(vec![(status, content_type, body)])
+    }
 
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept test request");
-            let mut buf = [0_u8; 4096];
-            let n = stream.read(&mut buf).expect("read test request");
-            request_tx
-                .send(String::from_utf8_lossy(&buf[..n]).to_string())
-                .expect("send captured request");
+    #[test]
+    fn validate_and_build_proxy_accepts_supported_proxy_urls() {
+        validate_and_build_proxy("http://localhost:7897").expect("http proxy");
+        validate_and_build_proxy("https://proxy.example.com:8080").expect("https proxy");
+        validate_and_build_proxy("socks5://127.0.0.1:1080").expect("socks proxy");
+    }
 
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .expect("write test response headers");
-            stream.write_all(body).expect("write test response body");
-        });
-
-        (format!("http://{addr}/release"), request_rx, handle)
+    #[test]
+    fn validate_and_build_proxy_rejects_malformed_urls() {
+        let err = validate_and_build_proxy("not a valid url").expect_err("malformed URL");
+        assert!(err.to_string().contains("invalid proxy URL"));
     }
 
     #[test]
@@ -1119,7 +1702,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
           ]
         }"#;
         let (url, request_rx, handle) = serve_http_once("200 OK", "application/json", body);
-        let release = fetch_latest_release_from_url(&url).expect("release JSON should parse");
+        let release = fetch_latest_release_from_url(&url, None).expect("release JSON should parse");
 
         assert_eq!(release.tag_name, "v9.9.9");
         assert_eq!(release.assets.len(), 2);
@@ -1139,10 +1722,36 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     }
 
     #[test]
+    fn fetch_latest_release_from_url_retries_transient_gateway_error() {
+        let body = br#"{
+          "tag_name": "v9.9.9",
+          "assets": [
+            { "name": "codewhale-linux-x64", "browser_download_url": "http://example.invalid/codewhale-linux-x64" }
+          ]
+        }"#;
+        let (url, request_rx, handle) = serve_http_responses(vec![
+            ("504 Gateway Timeout", "text/plain", b"gateway timeout"),
+            ("200 OK", "application/json", body),
+        ]);
+        let release = fetch_latest_release_from_url(&url, None)
+            .expect("release JSON should parse after retry");
+
+        assert_eq!(release.tag_name, "v9.9.9");
+        let first = request_rx.recv().expect("first request");
+        let second = request_rx.recv().expect("second request");
+        assert!(first.starts_with("GET /release "), "got {first:?}");
+        assert!(second.starts_with("GET /release "), "got {second:?}");
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
     fn fetch_latest_release_from_url_reports_http_errors() {
-        let (url, _request_rx, handle) =
-            serve_http_once("500 Internal Server Error", "text/plain", b"server broke");
-        let err = fetch_latest_release_from_url(&url).expect_err("HTTP 500 should fail");
+        let (url, _request_rx, handle) = serve_http_responses(vec![
+            ("500 Internal Server Error", "text/plain", b"server broke"),
+            ("500 Internal Server Error", "text/plain", b"server broke"),
+            ("500 Internal Server Error", "text/plain", b"server broke"),
+        ]);
+        let err = fetch_latest_release_from_url(&url, None).expect_err("HTTP 500 should fail");
 
         assert!(
             err.to_string().contains("HTTP 500"),
@@ -1163,7 +1772,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         ]"#;
         let (url, request_rx, handle) = serve_http_once("200 OK", "application/json", body);
         let release =
-            fetch_latest_beta_release_from_url(&url).expect("beta release JSON should parse");
+            fetch_latest_beta_release_from_url(&url, None).expect("beta release JSON should parse");
 
         assert_eq!(release.tag_name, "v0.9.0-beta.2");
         assert!(release.prerelease);
@@ -1184,7 +1793,8 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
           { "tag_name": "v0.9.0", "prerelease": false, "assets": [] }
         ]"#;
         let (url, _request_rx, handle) = serve_http_once("200 OK", "application/json", body);
-        let err = fetch_latest_beta_release_from_url(&url).expect_err("missing beta should fail");
+        let err =
+            fetch_latest_beta_release_from_url(&url, None).expect_err("missing beta should fail");
 
         assert!(
             err.to_string().contains("no beta release found"),
@@ -1194,10 +1804,26 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
     }
 
     #[test]
+    fn download_url_retries_transient_gateway_error() {
+        let (url, request_rx, handle) = serve_http_responses(vec![
+            ("503 Service Unavailable", "text/plain", b"try again"),
+            ("200 OK", "application/octet-stream", b"\0binary bytes"),
+        ]);
+        let bytes = download_url(&url, None).expect("binary download should retry and succeed");
+
+        assert_eq!(bytes, b"\0binary bytes");
+        let first = request_rx.recv().expect("first request");
+        let second = request_rx.recv().expect("second request");
+        assert!(first.starts_with("GET /release "), "got {first:?}");
+        assert!(second.starts_with("GET /release "), "got {second:?}");
+        handle.join().expect("test server thread");
+    }
+
+    #[test]
     fn download_url_reads_binary_body_with_updater_user_agent() {
         let (url, request_rx, handle) =
             serve_http_once("200 OK", "application/octet-stream", b"\0binary bytes");
-        let bytes = download_url(&url).expect("binary download should succeed");
+        let bytes = download_url(&url, None).expect("binary download should succeed");
 
         assert_eq!(bytes, b"\0binary bytes");
 

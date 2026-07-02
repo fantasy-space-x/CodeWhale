@@ -2,18 +2,19 @@
 
 # Crates published for each codewhale release, in dependency order.
 release_crates=(
-  codewhale-secrets
-  codewhale-config
+  codewhale-mcp
   codewhale-protocol
+  codewhale-release
+  codewhale-secrets
   codewhale-state
-  codewhale-agent
+  codewhale-whaleflow
   codewhale-execpolicy
   codewhale-hooks
-  codewhale-mcp
   codewhale-tools
+  codewhale-config
+  codewhale-agent
+  codewhale-tui
   codewhale-core
   codewhale-app-server
-  codewhale-tui-core
   codewhale-cli
-  codewhale-tui
 )

@@ -7,7 +7,7 @@ Current boundary note (v0.8.6):
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
 - The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's post-tool-execution path
   (`core/engine/lsp_hooks.rs`), providing inline diagnostics after every edit_file/apply_patch/write_file.
-- The swarm agent system was removed in v0.8.5. The active v0.8.35 orchestration surface is persistent sub-agent sessions (`agent_open` / `agent_eval` / `agent_close`) and persistent RLM sessions (`rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close`).
+- The swarm agent system was removed in v0.8.5. The active sub-agent surface is the single `agent` tool; persistent RLM sessions remain available through `rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close`.
   No model-visible swarm tool remains in the active codebase.
 
 ## High-Level Overview
@@ -74,7 +74,6 @@ Current boundary note (v0.8.6):
 - **`core/`** - Main engine components
   - `engine.rs` - Engine state, operation handling, message processing
   - `engine/turn_loop.rs` - Streaming turn loop and tool execution orchestration
-  - `engine/capacity_flow.rs` - Capacity guardrail checkpoints and interventions
   - `session.rs` - Session state management
   - `turn.rs` - Turn-based conversation handling
   - `events.rs` - Event system for UI updates
@@ -98,7 +97,6 @@ Current boundary note (v0.8.6):
 - **`crates/protocol`** - Request/response framing and protocol types.
 - **`crates/secrets`** - OS keyring integration for API key storage.
 - **`crates/state`** - SQLite thread/session persistence layer.
-- **`crates/tui-core`** - Event-driven TUI state machine scaffold.
 
 ### LLM Integration
 
@@ -156,7 +154,7 @@ drives turns through Chat Completions.
   - `mod.rs` - `LspManager` — lazy per-language transport pool + config
   - `client.rs` - `StdioLspTransport` — JSON-RPC over stdio with `didOpen`/`didChange`/`publishDiagnostics`
   - `diagnostics.rs` - Diagnostic types, severity, and HTML-block renderer
-  - `registry.rs` - Language detection and default server map (rust-analyzer, pyright, gopls, clangd, typescript-language-server)
+  - `registry.rs` - Language detection and default server map (rust-analyzer, pyright, gopls, clangd, typescript-language-server, jdtls, vue-language-server)
   - Wired into the engine via `core/engine/lsp_hooks.rs` — called after every successful edit
 
 ### Security
@@ -174,6 +172,7 @@ drives turns through Chat Completions.
 - **`utils.rs`** - Common utilities
 - **`logging.rs`** - Logging infrastructure
 - **`compaction.rs`** - Context compaction for long conversations
+- **`purge.rs`** - Agent-driven context purging (surgical message removal/rewriting)
 - **`pricing.rs`** - Cost estimation
 - **`prompts.rs`** - System prompt templates
 - **`project_doc.rs`** - Project documentation handling
@@ -197,12 +196,12 @@ drives turns through Chat Completions.
 
 ### Crash Recovery + Offline Queue
 
-1. Before sending user input, the TUI writes a checkpoint snapshot to `~/.deepseek/sessions/checkpoints/latest.json`
+1. Before sending user input, the TUI writes a checkpoint snapshot to `~/.codewhale/sessions/checkpoints/latest.json`
 2. Startup remains fresh by default; prior sessions are resumed explicitly via `--resume`/`--continue` (or `Ctrl+R` in TUI)
-3. While degraded/offline, new prompts are queued in-memory and mirrored to `~/.deepseek/sessions/checkpoints/offline_queue.json`
+3. While degraded/offline, new prompts are queued in-memory and mirrored to `~/.codewhale/sessions/checkpoints/offline_queue.json`
 4. Queue edits (`/queue ...`) are persisted continuously so drafts and queued prompts survive restarts
 5. Successful turn completion clears the active checkpoint and writes a durable session snapshot
-6. Agent/Yolo turns also take pre/post-turn side-git workspace snapshots under `~/.deepseek/snapshots/<project_hash>/<worktree_hash>/.git`; `/restore N` and `revert_turn` restore file state without changing conversation history or the user's `.git`
+6. Agent/Yolo turns also take pre/post-turn side-git workspace snapshots under `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git`; `/restore N` and `revert_turn` restore file state without changing conversation history or the user's `.git`
 
 ### Tool Execution
 
@@ -220,7 +219,7 @@ drives turns through Chat Completions.
 ### Background Tasks
 
 1. Client enqueues task (`/task add ...` or `POST /v1/tasks`)
-2. `task_manager.rs` persists task + queue entry under `~/.deepseek/tasks`
+2. `task_manager.rs` persists task + queue entry under `~/.codewhale/tasks`
 3. Worker picks queued task (bounded pool), transitions to `running`
 4. Task creates/uses a runtime thread and starts a runtime turn
 5. `runtime_threads.rs` persists thread/turn/item records + monotonic event sequence
@@ -241,7 +240,8 @@ ordinary durable tasks.
 3. Engine events are mapped to item lifecycle events (`item.started|item.delta|item.completed`)
 4. Interrupt/steer operations apply to the active turn only
 5. Compaction (auto/manual) is emitted as `context_compaction` item lifecycle
-6. Clients replay history and resume with `/v1/threads/{id}/events?since_seq=<n>`
+6. Purge (agent-driven) is emitted as `context_purge` item lifecycle
+7. Clients replay history and resume with `/v1/threads/{id}/events?since_seq=<n>`
 
 ### Durable Schema Gates
 
@@ -259,7 +259,7 @@ ordinary durable tasks.
 
 ### Adding an MCP Server
 
-1. Configure in `~/.deepseek/mcp.json`
+1. Configure in `~/.codewhale/mcp.json`
 2. Server auto-discovered at startup
 3. Tools exposed to LLM automatically
 
@@ -267,11 +267,11 @@ ordinary durable tasks.
 
 1. Create skill directory with `SKILL.md`
 2. Define skill prompt and optional scripts
-3. Place in `~/.deepseek/skills/`
+3. Place in `~/.codewhale/skills/`
 
 ### Adding Hooks
 
-Configure in `~/.deepseek/config.toml`:
+Configure in `~/.codewhale/config.toml`:
 
 ```toml
 [[hooks]]
@@ -293,13 +293,13 @@ command = "echo 'Running tool: $TOOL_NAME'"
 
 ## Configuration Files
 
-- `~/.deepseek/config.toml` - Main configuration
+- `~/.codewhale/config.toml` - Main configuration (`~/.deepseek/config.toml` is still read as a legacy fallback)
 - `/etc/deepseek/managed_config.toml` - Optional managed defaults layer (Unix)
 - `/etc/deepseek/requirements.toml` - Optional allowed-policy constraints (Unix)
-- `~/.deepseek/mcp.json` - MCP server configuration
-- `~/.deepseek/skills/` - User skills directory
-- `~/.deepseek/sessions/` - Session history
-- `~/.deepseek/sessions/checkpoints/` - Crash checkpoint + offline queue persistence
-- `~/.deepseek/snapshots/` - Side-git pre/post-turn workspace snapshots for `/restore` and `revert_turn`
-- `~/.deepseek/tasks/` - Background task records, queue, timelines, artifacts
-- `~/.deepseek/audit.log` - Append-only audit events for credential + approval/elevation actions
+- `~/.codewhale/mcp.json` - MCP server configuration
+- `~/.codewhale/skills/` - User skills directory
+- `~/.codewhale/sessions/` - Session history
+- `~/.codewhale/sessions/checkpoints/` - Crash checkpoint + offline queue persistence
+- `~/.codewhale/snapshots/` - Side-git pre/post-turn workspace snapshots for `/restore` and `revert_turn`
+- `~/.codewhale/tasks/` - Background task records, queue, timelines, artifacts
+- `~/.codewhale/audit.log` - Append-only audit events for credential + approval/elevation actions

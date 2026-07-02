@@ -1,5 +1,3 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
 
 import {
@@ -16,70 +14,15 @@ import {
   parseList,
   parseApprovalDecisionArgs,
   parseTextContent,
+  preservedChatStateFields,
   splitMessage,
   stripGroupPrefix
 } from "./lib.mjs";
+import { ThreadStore as CoreThreadStore } from "../../bridge-core/src/lib.mjs";
 
-class ThreadStore {
-  static async open(filePath) {
-    const store = new ThreadStore(filePath);
-    await store.load();
-    return store;
-  }
-
+class ThreadStore extends CoreThreadStore {
   constructor(filePath) {
-    this.filePath = filePath;
-    this.data = { chats: {} };
-  }
-
-  async load() {
-    try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      this.data = JSON.parse(raw);
-      if (!this.data.chats) this.data.chats = {};
-      if (!this.data.messages) this.data.messages = [];
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-
-  async recordMessage(messageId) {
-    if (!messageId) return false;
-    if (!Array.isArray(this.data.messages)) this.data.messages = [];
-    if (this.data.messages.includes(messageId)) return true;
-    this.data.messages.push(messageId);
-    this.data.messages = this.data.messages.slice(-200);
-    await this.save();
-    return false;
-  }
-
-  async getChat(chatId) {
-    return this.data.chats[chatId] || null;
-  }
-
-  listChats() {
-    return Object.entries(this.data.chats || {});
-  }
-
-  async setChat(chatId, state) {
-    this.data.chats[chatId] = state;
-    await this.save();
-    return state;
-  }
-
-  async patchChat(chatId, patch) {
-    const current = this.data.chats[chatId] || {};
-    this.data.chats[chatId] = { ...current, ...patch };
-    await this.save();
-    return this.data.chats[chatId];
-  }
-
-  async save() {
-    const dir = path.dirname(this.filePath);
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-    const tmp = `${this.filePath}.tmp`;
-    await fs.writeFile(tmp, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tmp, this.filePath);
+    super(filePath, { messageLimit: 200 });
   }
 }
 
@@ -87,16 +30,16 @@ const config = {
   appId: requiredEnv("FEISHU_APP_ID"),
   appSecret: requiredEnv("FEISHU_APP_SECRET"),
   domain: process.env.FEISHU_DOMAIN || "feishu",
-  runtimeUrl: (process.env.DEEPSEEK_RUNTIME_URL || "http://127.0.0.1:7878").replace(/\/+$/, ""),
-  runtimeToken: requiredEnv("DEEPSEEK_RUNTIME_TOKEN"),
-  workspace: process.env.DEEPSEEK_WORKSPACE || process.cwd(),
-  model: process.env.DEEPSEEK_MODEL || "auto",
-  mode: process.env.DEEPSEEK_MODE || "agent",
-  allowShell: parseBool(process.env.DEEPSEEK_ALLOW_SHELL, true),
-  trustMode: parseBool(process.env.DEEPSEEK_TRUST_MODE, false),
-  autoApprove: parseBool(process.env.DEEPSEEK_AUTO_APPROVE, false),
-  allowlist: parseList(process.env.DEEPSEEK_CHAT_ALLOWLIST),
-  allowUnlisted: parseBool(process.env.DEEPSEEK_ALLOW_UNLISTED, false),
+  runtimeUrl: (process.env.CODEWHALE_RUNTIME_URL || process.env.DEEPSEEK_RUNTIME_URL || "http://127.0.0.1:7878").replace(/\/+$/, ""),
+  runtimeToken: process.env.CODEWHALE_RUNTIME_TOKEN || process.env.DEEPSEEK_RUNTIME_TOKEN || requiredEnv("CODEWHALE_RUNTIME_TOKEN"),
+  workspace: process.env.CODEWHALE_WORKSPACE || process.env.DEEPSEEK_WORKSPACE || process.cwd(),
+  model: process.env.CODEWHALE_MODEL || process.env.DEEPSEEK_MODEL || "auto",
+  mode: process.env.CODEWHALE_MODE || process.env.DEEPSEEK_MODE || "agent",
+  allowShell: parseBool(process.env.CODEWHALE_ALLOW_SHELL ?? process.env.DEEPSEEK_ALLOW_SHELL, true),
+  trustMode: parseBool(process.env.CODEWHALE_TRUST_MODE ?? process.env.DEEPSEEK_TRUST_MODE, false),
+  autoApprove: parseBool(process.env.CODEWHALE_AUTO_APPROVE ?? process.env.DEEPSEEK_AUTO_APPROVE, false),
+  allowlist: parseList(process.env.CODEWHALE_CHAT_ALLOWLIST || process.env.DEEPSEEK_CHAT_ALLOWLIST),
+  allowUnlisted: parseBool(process.env.CODEWHALE_ALLOW_UNLISTED ?? process.env.DEEPSEEK_ALLOW_UNLISTED, false),
   threadMapPath:
     process.env.FEISHU_THREAD_MAP_PATH ||
     "/var/lib/codewhale-feishu-bridge/thread-map.json",
@@ -104,7 +47,7 @@ const config = {
   requirePrefixInGroup: parseBool(process.env.FEISHU_REQUIRE_PREFIX_IN_GROUP, true),
   groupPrefix: process.env.FEISHU_GROUP_PREFIX || "/ds",
   maxReplyChars: Number(process.env.FEISHU_MAX_REPLY_CHARS || 3500),
-  turnTimeoutMs: Number(process.env.DEEPSEEK_TURN_TIMEOUT_MS || 900000)
+  turnTimeoutMs: Number(process.env.CODEWHALE_TURN_TIMEOUT_MS || process.env.DEEPSEEK_TURN_TIMEOUT_MS || 900000)
 };
 
 const sdkConfig = {
@@ -231,6 +174,9 @@ async function handleCommand(chatId, command) {
     case "approval":
       await decideApproval(chatId, action);
       return;
+    case "set_model":
+      await setChatModel(chatId, action.modelName);
+      return;
     case "prompt":
       await runPrompt(chatId, action.prompt);
       return;
@@ -243,10 +189,14 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   const existing = await threadStore.getChat(chatId);
   if (existing?.threadId && !forceNew) return existing;
 
+  // Use per-chat model if set, fall back to bridge-level default.
+  // / 优先使用 per-chat 模型（/model 命令设置），否则用桥接级别的默认模型。
+  const effectiveModel = existing?.model || config.model;
+
   const thread = await runtimeJson("/v1/threads", {
     method: "POST",
     body: {
-      model: config.model,
+      model: effectiveModel,
       workspace: config.workspace,
       mode: config.mode,
       allow_shell: config.allowShell,
@@ -259,6 +209,7 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   });
 
   const state = {
+    ...preservedChatStateFields(existing),
     threadId: thread.id,
     lastSeq: 0,
     activeTurnId: null,
@@ -274,6 +225,10 @@ async function runPrompt(chatId, prompt) {
     return;
   }
   const state = await ensureThread(chatId);
+  // Use per-chat model for this turn (may differ from the thread's
+  // creation model if the user ran /model after the thread was created).
+  // / 使用 per-chat 模型执行本轮对话（如果用户在创建线程后切换过模型）。
+  const effectiveModel = state?.model || config.model;
   const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
   const activeBlock = activeTurnBlock(detail, state);
   if (activeBlock) {
@@ -296,7 +251,7 @@ async function runPrompt(chatId, prompt) {
       body: {
         prompt,
         input_summary: prompt.slice(0, 200),
-        model: config.model,
+        model: effectiveModel,
         mode: config.mode,
         allow_shell: config.allowShell,
         trust_mode: config.trustMode,
@@ -494,7 +449,9 @@ async function resumeThread(chatId, args) {
     return;
   }
   const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(threadId)}`);
+  const existing = await threadStore.getChat(chatId);
   await threadStore.setChat(chatId, {
+    ...preservedChatStateFields(existing),
     threadId,
     lastSeq: Number(detail.latest_seq || 0),
     activeTurnId: null,
@@ -553,6 +510,24 @@ async function decideApproval(chatId, action) {
   await sendText(chatId, `Approval ${approvalId}: ${decision}${remember ? " and remember" : ""}`);
 }
 
+async function setChatModel(chatId, modelName) {
+  // /model <name> — set per-chat model; "default" or empty resets to bridge default.
+  // / /model "default" 或空参数 — 恢复桥接级别的默认模型。
+  if (!modelName || modelName === "default") {
+    await threadStore.patchChat(chatId, {
+      model: null,
+      updatedAt: new Date().toISOString()
+    });
+    await sendText(chatId, `Reset per-chat model. Using bridge default: ${config.model}`);
+    return;
+  }
+  await threadStore.patchChat(chatId, {
+    model: modelName,
+    updatedAt: new Date().toISOString()
+  });
+  await sendText(chatId, `Per-chat model set to: ${modelName}`);
+}
+
 async function sendText(chatId, text) {
   // Try reply API first — keeps bot responses inside the same Feishu
   // thread/topic instead of spawning new standalone topics.
@@ -572,22 +547,28 @@ async function sendText(chatId, text) {
     throw new Error("Lark SDK client does not expose im message create API");
   }
 
+  let canReply = Boolean(replyMessage);
   for (const chunk of splitMessage(text, config.maxReplyChars)) {
     const body = {
       msg_type: "text",
       content: JSON.stringify({ text: chunk })
     };
-    if (replyMessage) {
-      await replyMessage({
-        path: { message_id: replyToMessageId },
-        data: body
-      });
-    } else {
-      await createMessage({
-        params: { receive_id_type: "chat_id" },
-        data: { ...body, receive_id: chatId }
-      });
+    if (canReply) {
+      try {
+        await replyMessage({
+          path: { message_id: replyToMessageId },
+          data: body
+        });
+        continue;
+      } catch (error) {
+        canReply = false;
+        console.warn("Feishu reply API failed; falling back to message create", error);
+      }
     }
+    await createMessage({
+      params: { receive_id_type: "chat_id" },
+      data: { ...body, receive_id: chatId }
+    });
   }
 }
 

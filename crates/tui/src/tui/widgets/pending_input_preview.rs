@@ -24,6 +24,9 @@ use crate::tui::widgets::Renderable;
 
 /// Per-item line cap before we collapse the rest into a `…` overflow row.
 const PREVIEW_LINE_LIMIT: usize = 3;
+const PENDING_STEER_PREFIX: &str = "  ↳ Live steer pending: ";
+const REJECTED_STEER_PREFIX: &str = "  ↳ Rejected live steer: ";
+const EDITING_QUEUED_PREFIX: &str = "  ↳ Editing queued follow-up: ";
 
 /// Description of the keybinding the hint line at the bottom should advertise
 /// for the "edit last queued message" action.
@@ -43,6 +46,7 @@ pub struct PendingInputPreview {
     pub pending_steers: Vec<String>,
     pub rejected_steers: Vec<String>,
     pub queued_messages: Vec<String>,
+    pub editing_queued_message: Option<String>,
     pub edit_binding: EditBinding,
 }
 
@@ -66,6 +70,7 @@ impl PendingInputPreview {
             pending_steers: Vec::new(),
             rejected_steers: Vec::new(),
             queued_messages: Vec::new(),
+            editing_queued_message: None,
             edit_binding: EditBinding::UP,
         }
     }
@@ -74,6 +79,7 @@ impl PendingInputPreview {
         !self.pending_steers.is_empty()
             || !self.rejected_steers.is_empty()
             || !self.queued_messages.is_empty()
+            || self.editing_queued_message.is_some()
     }
 
     /// Build the (possibly empty) ordered line list this widget would render
@@ -109,18 +115,66 @@ impl PendingInputPreview {
                 &mut lines,
                 Line::from(vec![Span::raw("• "), Span::raw("Pending inputs")]),
             );
+            let pending_steer_indent = continuation_indent(PENDING_STEER_PREFIX);
             for steer in &self.pending_steers {
-                push_truncated_item(&mut lines, steer, width, dim, "  ↳ ", "    ");
+                push_truncated_item(
+                    &mut lines,
+                    steer,
+                    width,
+                    dim,
+                    PENDING_STEER_PREFIX,
+                    &pending_steer_indent,
+                );
             }
+            let rejected_steer_indent = continuation_indent(REJECTED_STEER_PREFIX);
             for steer in &self.rejected_steers {
-                push_truncated_item(&mut lines, steer, width, dim, "  ↳ ", "    ");
+                push_truncated_item(
+                    &mut lines,
+                    steer,
+                    width,
+                    dim,
+                    REJECTED_STEER_PREFIX,
+                    &rejected_steer_indent,
+                );
             }
-            for message in &self.queued_messages {
-                push_truncated_item(&mut lines, message, width, dim_italic, "  ↳ ", "    ");
+            if let Some(draft) = self.editing_queued_message.as_deref() {
+                let editing_indent = continuation_indent(EDITING_QUEUED_PREFIX);
+                push_truncated_item(
+                    &mut lines,
+                    draft,
+                    width,
+                    dim_italic,
+                    EDITING_QUEUED_PREFIX,
+                    &editing_indent,
+                );
+                lines.push(Line::from(vec![Span::styled(
+                    "    Esc restores queued follow-up".to_string(),
+                    dim,
+                )]));
+            }
+            for (idx, message) in self.queued_messages.iter().enumerate() {
+                let row_number = idx + 1;
+                let queued_prefix = format!("  ↳ Queued follow-up #{row_number}: ");
+                let queued_message_indent = continuation_indent(&queued_prefix);
+                push_truncated_item(
+                    &mut lines,
+                    message,
+                    width,
+                    dim_italic,
+                    &queued_prefix,
+                    &queued_message_indent,
+                );
+                lines.push(Line::from(vec![Span::styled(
+                    format!("    /queue send {row_number} · drop {row_number} · clear"),
+                    dim,
+                )]));
             }
             if !self.queued_messages.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("    {} edit last queued message", self.edit_binding.label),
+                    format!(
+                        "    Ctrl+S send now · {} edit last queued",
+                        self.edit_binding.label
+                    ),
                     dim,
                 )]));
             }
@@ -152,6 +206,10 @@ impl Renderable for PendingInputPreview {
         let lines = self.lines(width);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
     }
+}
+
+fn continuation_indent(prefix: &str) -> String {
+    " ".repeat(display_width(prefix))
 }
 
 fn push_section_header(lines: &mut Vec<Line<'static>>, header: Line<'static>) {
@@ -333,11 +391,39 @@ mod tests {
         let mut preview = PendingInputPreview::new();
         preview.queued_messages.push("Hello, world!".to_string());
         let rows = render_to_string(&preview, 40);
-        // Expect: header line, message line, hint line.
-        assert_eq!(rows.len(), 3, "got rows: {rows:?}");
+        // Expect: header line, message line, action line, hint line.
+        assert_eq!(rows.len(), 4, "got rows: {rows:?}");
         assert!(rows[0].contains("Pending inputs"));
         assert!(rows[1].contains("Hello, world!"));
-        assert!(rows[2].contains("edit last queued message"));
+        assert!(rows[2].contains("/queue send 1"));
+        assert!(rows[2].contains("drop 1"));
+        assert!(rows[2].contains("clear"));
+        assert!(rows[3].contains("Ctrl+S send now"));
+        assert!(rows[3].contains("edit last queued"));
+    }
+
+    #[test]
+    fn editing_queued_message_renders_explicit_state_and_restore_hint() {
+        let mut preview = PendingInputPreview::new();
+        preview.editing_queued_message = Some("revise before sending".to_string());
+
+        let rows = render_to_string(&preview, 80);
+
+        assert!(rows[0].contains("Pending inputs"));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Editing queued follow-up: revise before sending")),
+            "missing editing label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Esc restores queued follow-up")),
+            "missing restore hint: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("edit last queued")),
+            "editing mode should not also advertise opening a queued edit: {rows:?}"
+        );
     }
 
     #[test]
@@ -400,7 +486,7 @@ mod tests {
             "unexpected Esc hint: {rows:?}"
         );
         assert!(
-            !rows.iter().any(|r| r.contains("edit last queued message")),
+            !rows.iter().any(|r| r.contains("edit last queued")),
             "unexpected edit hint in pending-steer-only view: {rows:?}"
         );
     }
@@ -421,6 +507,59 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("rejected")));
         assert!(rows.iter().any(|r| r.contains("queued")));
         assert!(rows.iter().any(|r| r.contains("↑")));
+        assert!(rows.iter().any(|r| r.contains("Ctrl+S")));
+    }
+
+    #[test]
+    fn pending_input_rows_label_each_delivery_mode() {
+        let mut preview = PendingInputPreview::new();
+        preview.pending_steers.push("steer".to_string());
+        preview.rejected_steers.push("rejected".to_string());
+        preview.queued_messages.push("queued".to_string());
+        preview.editing_queued_message = Some("editing".to_string());
+
+        let rows = render_to_string(&preview, 80);
+
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Live steer pending: steer")),
+            "missing pending-steer label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Rejected live steer: rejected")),
+            "missing rejected-steer label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Queued follow-up #1: queued")),
+            "missing queued-follow-up label: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Editing queued follow-up: editing")),
+            "missing queued-edit label: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_pending_input_aligns_continuation_under_label() {
+        let mut preview = PendingInputPreview::new();
+        preview
+            .queued_messages
+            .push("alpha beta gamma delta epsilon zeta".to_string());
+
+        let rows = render_to_string(&preview, 34);
+
+        assert!(rows[1].contains("Queued follow-up #1: alpha"));
+        assert!(
+            rows[2].starts_with(&continuation_indent("  ↳ Queued follow-up #1: ")),
+            "continuation should align under label: {rows:?}"
+        );
+        assert!(
+            !rows[2].trim().is_empty(),
+            "continuation should keep wrapped text: {rows:?}"
+        );
     }
 
     #[test]
@@ -430,14 +569,16 @@ mod tests {
             .queued_messages
             .push("line1\nline2\nline3\nline4\nline5".to_string());
         let rows = render_to_string(&preview, 40);
-        // Header + 3 visible lines + ellipsis row + hint = 6 rows.
-        assert_eq!(rows.len(), 6, "got rows: {rows:?}");
+        // Header + 3 visible lines + ellipsis row + actions + hint = 7 rows.
+        assert_eq!(rows.len(), 7, "got rows: {rows:?}");
         assert!(rows[0].contains("Pending inputs"));
         assert!(rows[1].contains("line1"));
         assert!(rows[2].contains("line2"));
         assert!(rows[3].contains("line3"));
         assert!(rows[4].contains("…"));
-        assert!(rows[5].contains("edit last queued message"));
+        assert!(rows[5].contains("/queue send 1"));
+        assert!(rows[6].contains("Ctrl+S send now"));
+        assert!(rows[6].contains("edit last queued"));
     }
 
     #[test]
@@ -448,9 +589,9 @@ mod tests {
                 .to_string(),
         );
         let rows = render_to_string(&preview, 36);
-        // Header + URL row + hint = 3 rows; the URL must NOT cause a chain of
-        // wrapped-ellipsis rows.
-        assert_eq!(rows.len(), 3, "got rows: {rows:?}");
+        // Header + URL row + action row + hint = 4 rows; the URL must NOT
+        // cause a chain of wrapped-ellipsis rows.
+        assert_eq!(rows.len(), 4, "got rows: {rows:?}");
         assert!(!rows.iter().any(|r| r.contains("…")));
     }
 

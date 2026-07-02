@@ -3,11 +3,56 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::models::{ContentBlock, Message};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde_json::Value;
+
+const LOG_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const LOG_FINGERPRINT_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Return a stable, non-reversible log label for an identifier.
+///
+/// This is meant for correlation in diagnostics where the raw value may be a
+/// session token, remote protocol session id, or other bearer-like handle.
+#[must_use]
+pub fn redacted_identifier_for_log(identifier: &str) -> String {
+    if identifier.is_empty() {
+        return "<redacted:empty>".to_string();
+    }
+
+    let mut hash = LOG_FINGERPRINT_OFFSET_BASIS;
+    for byte in identifier.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(LOG_FINGERPRINT_PRIME);
+    }
+    hash ^= identifier.len() as u64;
+    hash = hash.wrapping_mul(LOG_FINGERPRINT_PRIME);
+
+    format!("<redacted:{hash:016x}>")
+}
+
+#[cfg(windows)]
+pub(crate) fn suppress_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn suppress_console_window(_cmd: &mut Command) {}
+
+#[cfg(windows)]
+pub(crate) fn suppress_tokio_console_window(cmd: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn suppress_tokio_console_window(_cmd: &mut tokio::process::Command) {}
 
 // === Project Mapping Helpers ===
 
@@ -110,17 +155,17 @@ pub fn summarize_project(root: &Path) -> String {
 /// directory still precedes its children because `"src" < "src/lib.rs"`)
 /// while making the rendered output byte-stable across runs.
 #[must_use]
-pub fn project_tree(root: &Path, max_depth: usize) -> String {
+pub fn project_tree(root: &Path, max_depth: usize, follow_symlinks: bool) -> String {
     let mut entries: Vec<(PathBuf, bool)> = Vec::new();
 
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
-        .follow_links(false)
+        .follow_links(follow_symlinks)
         .max_depth(Some(max_depth + 1));
 
     for entry in builder.build().flatten() {
-        if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+        if entry.file_type().is_some_and(|ft| ft.is_symlink()) && !follow_symlinks {
             continue;
         }
         let depth = entry.depth();
@@ -208,11 +253,68 @@ pub fn flush_and_sync(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io
     writer.get_ref().sync_all()
 }
 
+/// Open a URL in the system's default browser.
+///
+/// Dispatches to the platform-appropriate opener:
+/// - macOS: `open`
+/// - Linux: `xdg-open`
+/// - Windows: `cmd /C start ""`
+/// - Other: returns an error.
+///
+/// This is the single entry point for URL opening — every call site in
+/// the codebase should use this instead of hardcoding `Command::new("open")`,
+/// `Command::new("xdg-open")`, or `Command::new("cmd")`.
+pub fn open_url(url: &str) -> Result<()> {
+    let mut command = browser_open_command(url)?;
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("failed to launch browser command: {e}"))
+}
+
+fn browser_open_command(url: &str) -> Result<Command> {
+    if url.trim().is_empty() {
+        return Err(anyhow::anyhow!("browser URL cannot be empty"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        command.arg(url);
+        Ok(command)
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        Ok(command)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        Ok(cmd)
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "windows"
+    )))]
+    Err(anyhow::anyhow!(
+        "browser opening is unsupported on this platform"
+    ))
+}
+
 /// Spawn a tokio task with panic supervision.
 ///
 /// Wraps the future in `AssertUnwindSafe` + `catch_unwind`. On panic:
 /// 1. Logs the panic with the task name and caller location via `tracing::error!`.
-/// 2. Writes a crash dump to `~/.deepseek/crashes/<timestamp>-<name>.log`.
+/// 2. Writes a crash dump to `~/.codewhale/crashes/<timestamp>-<name>.log`.
 ///
 /// The returned `JoinHandle` resolves to `()` — the panic is caught and
 /// handled internally so the parent process stays alive.
@@ -228,13 +330,7 @@ where
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
         if let Err(panic_info) = result {
-            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = panic_message(&*panic_info);
             tracing::error!(
                 target: "panic",
                 "Task '{name}' panicked at {}: {msg}",
@@ -246,7 +342,33 @@ where
     })
 }
 
-/// Write a panic dump file to `~/.deepseek/crashes/`.
+/// Extract a human-readable message from a caught panic payload (the `Err`
+/// value of `catch_unwind`). Mirrors how the panic hook formats `&str` and
+/// `String` payloads so crash dumps stay consistent across call sites.
+#[must_use]
+pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Record a panic that was caught at a call site (via `catch_unwind`) rather
+/// than by a task supervisor. Logs it on the `panic` target and writes a
+/// best-effort crash dump to `~/.codewhale/crashes/`, so diagnostics land in
+/// the same place `spawn_supervised` writes them even when the caller recovers
+/// and keeps running.
+#[track_caller]
+pub fn record_caught_panic(name: &'static str, message: &str) {
+    let location = std::panic::Location::caller();
+    tracing::error!(target: "panic", "Task '{name}' panicked at {location}: {message}");
+    let _ = write_panic_dump(name, location, message);
+}
+
+/// Write a panic dump file to `~/.codewhale/crashes/`.
 ///
 /// Creates the directory if needed and writes a timestamped log
 /// with the task name, caller location, and panic message.
@@ -297,7 +419,7 @@ fn write_panic_dump_to(
 /// CPU-bound or blocking-I/O task must run off the async runtime and its
 /// completion is *not* awaited — for example a post-turn disk snapshot or a
 /// file-tree build polled later via a shared data structure.  If the closure
-/// panics, a crash dump is written to `~/.deepseek/crashes/` and the panic
+/// panics, a crash dump is written to `~/.codewhale/crashes/` and the panic
 /// is logged at ERROR level rather than being silently swallowed.
 #[track_caller]
 pub fn spawn_blocking_supervised<F>(name: &'static str, f: F) -> tokio::task::JoinHandle<()>
@@ -308,13 +430,7 @@ where
     tokio::task::spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if let Err(panic_info) = result {
-            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = panic_message(&*panic_info);
             tracing::error!(
                 target: "panic",
                 "Blocking task '{name}' panicked at {location}: {msg}",
@@ -426,12 +542,13 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
         for block in &msg.content {
             match block {
                 ContentBlock::Text { text, .. } => total += text.len(),
-                ContentBlock::Thinking { thinking } => total += thinking.len(),
+                ContentBlock::Thinking { thinking, .. } => total += thinking.len(),
                 ContentBlock::ToolUse { input, .. } => total += input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => total += content.len(),
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. } => {}
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::ImageUrl { .. } => {}
             }
         }
     }
@@ -446,11 +563,28 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
 // without additional platform scaffolding.
 #[cfg(test)]
 mod tests {
-    use super::display_path_with_home;
+    use super::{display_path_with_home, redacted_identifier_for_log};
     use std::path::PathBuf;
 
     fn home(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn redacted_identifier_for_log_hides_value_and_stays_stable() {
+        let identifier = "session-secret-1234567890";
+        let redacted = redacted_identifier_for_log(identifier);
+
+        assert!(redacted.starts_with("<redacted:"));
+        assert!(redacted.ends_with('>'));
+        assert!(!redacted.contains(identifier));
+        assert_eq!(redacted, redacted_identifier_for_log(identifier));
+        assert_ne!(redacted, redacted_identifier_for_log("another-session"));
+    }
+
+    #[test]
+    fn redacted_identifier_for_log_marks_empty_values() {
+        assert_eq!(redacted_identifier_for_log(""), "<redacted:empty>");
     }
 
     #[test]
@@ -683,7 +817,7 @@ mod project_mapping_tests {
         fs::write(root.join("apple.txt"), "a").expect("write apple");
         fs::write(root.join("mango.txt"), "m").expect("write mango");
 
-        let tree = project_tree(root, 1);
+        let tree = project_tree(root, 1, false);
         let lines: Vec<&str> = tree.lines().collect();
         let apple_pos = lines
             .iter()
@@ -713,7 +847,7 @@ mod project_mapping_tests {
         fs::write(src.join("lib.rs"), "lib").expect("write lib");
         fs::write(src.join("main.rs"), "main").expect("write main");
 
-        let tree = project_tree(root, 2);
+        let tree = project_tree(root, 2, false);
         let src_pos = tree.find("DIR: src").expect("src dir line");
         let lib_pos = tree.find("FILE: lib.rs").expect("lib file line");
         let main_pos = tree.find("FILE: main.rs").expect("main file line");
@@ -729,7 +863,7 @@ mod project_mapping_tests {
         fs::write(root.join("z.txt"), "z").expect("write");
         fs::write(root.join("a.txt"), "a").expect("write");
 
-        assert_eq!(project_tree(root, 1), project_tree(root, 1));
+        assert_eq!(project_tree(root, 1, false), project_tree(root, 1, false));
     }
 
     #[test]
@@ -745,7 +879,7 @@ mod project_mapping_tests {
         std::os::unix::fs::symlink(&outside_file, root.join("Cargo.toml")).expect("symlink");
 
         assert_eq!(summarize_project(&root), "Unknown project type");
-        assert!(!project_tree(&root, 1).contains("Cargo.toml"));
+        assert!(!project_tree(&root, 1, false).contains("Cargo.toml"));
     }
 
     #[test]
@@ -772,5 +906,64 @@ mod project_mapping_tests {
             .strip_prefix("Project with key files: ")
             .expect("prefix");
         assert_eq!(suffix, "Makefile, README.md");
+    }
+
+    // ===================================================================
+    // open_url tests
+    // ===================================================================
+
+    #[test]
+    fn open_url_builds_platform_command_without_spawning() {
+        let command = super::browser_open_command("https://example.com").expect("command");
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), "open");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["https://example.com"]
+            );
+        }
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            assert_eq!(command.get_program(), "xdg-open");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["https://example.com"]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(command.get_program(), "cmd");
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                vec!["/C", "start", "", "https://example.com"]
+            );
+        }
+    }
+
+    #[test]
+    fn open_url_rejects_empty_url_gracefully() {
+        // An empty URL should fail with a clear error, not panic.
+        let result = super::browser_open_command("");
+        match result {
+            Ok(_) => panic!("empty URL should not build an opener command"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(!msg.is_empty(), "error message must not be empty");
+                assert!(msg.contains("empty"), "unexpected error message: {msg}");
+            }
+        }
     }
 }

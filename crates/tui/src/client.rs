@@ -4,21 +4,33 @@
 //! client now routes all normal traffic through that surface.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose};
+use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{ApiProvider, Config, RetryPolicy};
+use codewhale_config::catalog::{
+    CatalogOffering, CatalogRefreshError, CatalogSource, CatalogStatus, ProviderCatalogCache,
+    ProviderCatalogDelta, base_url_fingerprint, now_unix,
+};
+use codewhale_config::route::ReadyRouteCandidate;
+
+use crate::config::{ApiProvider, Config, RetryPolicy, wire_model_for_provider};
 use crate::llm_client::{
-    LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after, with_retry,
+    LlmClient, LlmError, RetryConfig as LlmRetryConfig, extract_retry_after,
+    sanitize_http_error_body, with_retry,
 };
 use crate::logging;
-use crate::models::{MessageRequest, MessageResponse, ServerToolUsage, SystemPrompt, Usage};
+use crate::models::{
+    ContentBlock, Message, MessageRequest, MessageResponse, ServerToolUsage, SystemPrompt, Usage,
+};
 
 pub(super) fn to_api_tool_name(name: &str) -> String {
     let mut out = String::new();
@@ -59,7 +71,10 @@ pub(super) fn from_api_tool_name(name: &str) -> String {
                     break;
                 }
             }
-            if let Ok(code) = u32::from_str_radix(&hex, 16)
+            // Only decode if we got exactly 6 hex digits (matching encoder output).
+            // Fewer digits means a truncated/malformed sequence — pass through as-is.
+            if hex.len() == 6
+                && let Ok(code) = u32::from_str_radix(&hex, 16)
                 && let Some(decoded) = std::char::from_u32(code)
             {
                 if let Some('-') = iter.peek().copied() {
@@ -119,6 +134,31 @@ pub struct AvailableModel {
     pub created: Option<u64>,
 }
 
+/// Request payload for Xiaomi MiMo speech synthesis models.
+///
+/// MiMo-V2.5-TTS / MiMo-V2-TTS use the OpenAI-compatible
+/// `/v1/chat/completions` endpoint: the optional style/voice instruction is
+/// sent as a `user` message, while the text to synthesize is sent as an
+/// `assistant` message.
+#[derive(Debug, Clone)]
+pub struct SpeechSynthesisRequest {
+    pub model: String,
+    pub text: String,
+    pub instruction: Option<String>,
+    pub audio_format: String,
+    pub voice: Option<String>,
+}
+
+/// Decoded speech synthesis result.
+#[derive(Debug, Clone)]
+pub struct SpeechSynthesisResponse {
+    pub model: String,
+    pub audio_format: String,
+    pub audio_bytes: Vec<u8>,
+    pub transcript: Option<String>,
+    pub voice: Option<String>,
+}
+
 /// Client for DeepSeek's OpenAI-compatible APIs.
 #[must_use]
 pub struct DeepSeekClient {
@@ -130,6 +170,10 @@ pub struct DeepSeekClient {
     default_model: String,
     connection_health: Arc<AsyncMutex<ConnectionHealth>>,
     rate_limiter: Arc<AsyncMutex<TokenBucket>>,
+    request_concurrency: Option<ProviderConcurrencyLimiter>,
+    path_suffix: Option<String>,
+    pub(super) reasoning_stream_style: Option<String>,
+    pub(super) stream_idle_timeout: Duration,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
@@ -177,6 +221,52 @@ struct TokenBucket {
     tokens: f64,
     refill_per_sec: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderConcurrencyLimiter {
+    semaphore: Arc<Semaphore>,
+    active: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+struct ProviderRequestPermit {
+    _permit: OwnedSemaphorePermit,
+    active: Arc<AtomicUsize>,
+}
+
+impl ProviderConcurrencyLimiter {
+    fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            active: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    async fn acquire(&self) -> Option<ProviderRequestPermit> {
+        let permit = Arc::clone(&self.semaphore).acquire_owned().await.ok()?;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Some(ProviderRequestPermit {
+            _permit: permit,
+            active: Arc::clone(&self.active),
+        })
+    }
+
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Drop for ProviderRequestPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl TokenBucket {
@@ -296,6 +386,10 @@ impl Clone for DeepSeekClient {
             default_model: self.default_model.clone(),
             connection_health: self.connection_health.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            request_concurrency: self.request_concurrency.clone(),
+            path_suffix: self.path_suffix.clone(),
+            reasoning_stream_style: self.reasoning_stream_style.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         }
     }
 }
@@ -322,6 +416,7 @@ pub(super) async fn bounded_error_text(response: reqwest::Response, max_bytes: u
 }
 
 fn validate_base_url_security(base_url: &str) -> Result<()> {
+    let display_base_url = redact_url_for_display(base_url);
     if base_url.starts_with("https://")
         || base_url.starts_with("http://localhost")
         || base_url.starts_with("http://127.0.0.1")
@@ -344,7 +439,7 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
 
     if base_url.starts_with("http://") {
         anyhow::bail!(
-            "Refusing insecure base URL '{base_url}'.\n\
+            "Refusing insecure base URL '{display_base_url}'.\n\
              \n\
              Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
              For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
@@ -355,8 +450,63 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
     }
 
     anyhow::bail!(
-        "Refusing base URL '{base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
+        "Refusing base URL '{display_base_url}': only HTTPS (or explicitly allowed HTTP) URLs are supported.",
     )
+}
+
+pub(crate) fn redact_url_for_display(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let _ = parsed.set_username("***");
+        let _ = parsed.set_password(Some("***"));
+    }
+    if parsed.query().is_none() {
+        return parsed.to_string();
+    }
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if is_sensitive_url_query_key(&key) {
+                "***".to_string()
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    parsed.set_query(None);
+    let mut query = parsed.query_pairs_mut();
+    for (key, value) in pairs {
+        query.append_pair(&key, &value);
+    }
+    drop(query);
+    parsed.to_string()
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "apikey"
+            | "access_token"
+            | "auth_token"
+            | "authorization"
+            | "bearer"
+            | "client_secret"
+            | "credential"
+            | "id_token"
+            | "password"
+            | "refresh_token"
+            | "secret"
+            | "token"
+    ) || normalized.ends_with("_api_key")
+        || normalized.ends_with("_authorization")
+        || normalized.ends_with("_password")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_token")
 }
 
 pub(super) fn versioned_base_url(base_url: &str) -> String {
@@ -391,9 +541,20 @@ fn is_version_segment(segment: &str) -> bool {
 }
 
 pub(super) fn api_url(base_url: &str, path: &str) -> String {
+    api_url_with_suffix(base_url, path, None)
+}
+
+pub(super) fn api_url_with_suffix(base_url: &str, path: &str, path_suffix: Option<&str>) -> String {
     let path = path.trim_start_matches('/');
     if path.starts_with("beta/") {
         return format!("{}/{}", unversioned_base_url(base_url), path);
+    }
+    if let ("chat/completions", Some(suffix)) = (path, path_suffix) {
+        return format!(
+            "{}/{}",
+            unversioned_base_url(base_url),
+            suffix.trim_start_matches('/')
+        );
     }
     let mut versioned = versioned_base_url(base_url);
     // The /beta suffix is not a real API version — it is an
@@ -405,6 +566,74 @@ pub(super) fn api_url(base_url: &str, path: &str) -> String {
         versioned = format!("{}/v1", unversioned_base_url(base_url));
     }
     format!("{}/{}", versioned.trim_end_matches('/'), path)
+}
+
+fn normalize_audio_format(format: &str) -> String {
+    let normalized = format.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "wav".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn parse_speech_audio_response(payload: &Value) -> Result<(Vec<u8>, Option<String>)> {
+    let audio = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("audio"))
+                .or_else(|| choice.get("delta").and_then(|delta| delta.get("audio")))
+        })
+        .or_else(|| payload.get("audio"))
+        .context("Speech synthesis response did not include choices[0].message.audio")?;
+
+    let data = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .context("Speech synthesis response did not include audio.data")?
+        .trim();
+    let data = data
+        .split_once(',')
+        .map(|(_, base64)| base64.trim())
+        .unwrap_or(data);
+    let audio_bytes = general_purpose::STANDARD
+        .decode(data)
+        .context("Failed to decode speech audio base64 data")?;
+    let transcript = audio
+        .get("transcript")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok((audio_bytes, transcript))
+}
+
+fn build_speech_synthesis_body(
+    model: &str,
+    text: &str,
+    instruction: Option<&str>,
+    audio: Value,
+) -> Value {
+    let mut messages = Vec::new();
+    if let Some(instruction) = instruction.map(str::trim).filter(|value| !value.is_empty()) {
+        messages.push(json!({
+            "role": "user",
+            "content": instruction,
+        }));
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": text,
+    }));
+
+    json!({
+        "model": model,
+        "messages": messages,
+        "audio": audio,
+    })
 }
 
 // === DeepSeekClient ===
@@ -467,28 +696,84 @@ fn add_extra_root_certs(
 impl DeepSeekClient {
     /// Create a DeepSeek client from CLI configuration.
     pub fn new(config: &Config) -> Result<Self> {
+        Self::from_parts(config.deepseek_base_url(), config.default_model(), config)
+    }
+
+    /// Create a DeepSeek client whose transport is bound to a runtime-resolved
+    /// route (#3384).
+    ///
+    /// The base URL and default model come from the executable `candidate`, so
+    /// the client talks to exactly the endpoint and wire model the resolver
+    /// chose instead of re-deriving them from `Config`. Secrets stay in
+    /// `Config`: `ReadyRouteCandidate` is secret-free by design (it carries only
+    /// an auth-source *class*), so the API key and provider are still read from
+    /// `config`.
+    pub fn from_candidate(config: &Config, candidate: &ReadyRouteCandidate) -> Result<Self> {
+        Self::from_parts(
+            candidate.endpoint.base_url.clone(),
+            candidate.wire_model_id.as_str().to_string(),
+            config,
+        )
+    }
+
+    /// Shared constructor body for [`Self::new`] and [`Self::from_candidate`].
+    ///
+    /// `base_url` and `default_model` are the only inputs that differ between
+    /// the two entry points; everything else (auth, provider, retry, headers,
+    /// timeouts) is derived from `config` so the two paths cannot drift.
+    fn from_parts(base_url: String, default_model: String, config: &Config) -> Result<Self> {
         let api_key = config.deepseek_api_key()?;
-        let base_url = config.deepseek_base_url();
         let api_provider = config.api_provider();
         validate_base_url_security(&base_url)?;
         let retry = config.retry_policy();
-        let default_model = config.default_model();
+        let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let http_headers = config.http_headers();
+        let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
+        let path_suffix = config
+            .provider_config_for(api_provider)
+            .and_then(|p| p.path_suffix.clone());
+        let reasoning_stream_style = config
+            .provider_config_for(api_provider)
+            .and_then(|p| p.reasoning_stream_style.clone());
+        let request_concurrency_limit = config.provider_max_concurrency(api_provider);
 
         logging::info(format!("API provider: {}", api_provider.as_str()));
-        logging::info(format!("API base URL: {base_url}"));
+        logging::info(format!(
+            "API base URL: {}",
+            redact_url_for_display(&base_url)
+        ));
+        if let Some(suffix) = &path_suffix {
+            logging::info(format!("API path suffix override: {suffix}"));
+        }
         if !http_headers.is_empty() {
             logging::info(format!(
                 "{} custom HTTP header(s) configured",
                 http_headers.len()
             ));
         }
+        if insecure_skip_tls_verify {
+            logging::warn(format!(
+                "TLS certificate verification cannot be disabled for provider {}; use SSL_CERT_FILE with a trusted custom CA bundle instead",
+                api_provider.as_str()
+            ));
+            bail!(
+                "TLS certificate verification cannot be disabled for provider {}; configure SSL_CERT_FILE with a trusted custom CA bundle instead",
+                api_provider.as_str()
+            );
+        }
         logging::info(format!(
             "Retry policy: enabled={}, max_retries={}, initial_delay={}s, max_delay={}s",
             retry.enabled, retry.max_retries, retry.initial_delay, retry.max_delay
         ));
+        if let Some(limit) = request_concurrency_limit {
+            logging::info(format!(
+                "Provider request concurrency cap: {} in-flight request(s)",
+                limit
+            ));
+        }
 
-        let http_client = Self::build_http_client(&api_key, &http_headers)?;
+        let http_client =
+            Self::build_http_client(&api_key, &http_headers, api_provider, &base_url)?;
 
         Ok(Self {
             http_client,
@@ -499,21 +784,39 @@ impl DeepSeekClient {
             default_model,
             connection_health: Arc::new(AsyncMutex::new(ConnectionHealth::default())),
             rate_limiter: Arc::new(AsyncMutex::new(TokenBucket::from_env())),
+            request_concurrency: request_concurrency_limit.map(ProviderConcurrencyLimiter::new),
+            path_suffix,
+            reasoning_stream_style,
+            stream_idle_timeout,
         })
     }
 
     fn build_http_client(
         api_key: &str,
         extra_headers: &HashMap<String, String>,
+        api_provider: ApiProvider,
+        base_url: &str,
     ) -> Result<reqwest::Client> {
-        let headers = build_default_headers(api_key, extra_headers)?;
-        let mut builder = reqwest::Client::builder()
-            .default_headers(headers)
-            .user_agent(concat!(
+        let headers = build_default_headers(api_key, extra_headers, api_provider, base_url)?;
+        // The ChatGPT Codex backend sits behind Cloudflare bot protection that
+        // only admits the Codex CLI's user agent; present a codex_cli_rs UA on
+        // that path so the request is handled like the official client.
+        let user_agent: &str = if api_provider == ApiProvider::OpenaiCodex {
+            concat!(
+                "codex_cli_rs/0.137.0 (CodeWhale ",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            )
+        } else {
+            concat!(
                 "Mozilla/5.0 (compatible; codewhale/",
                 env!("CARGO_PKG_VERSION"),
                 "; +https://github.com/Hmbown/CodeWhale)"
-            ))
+            )
+        };
+        let mut builder = crate::tls::reqwest_client_builder()
+            .default_headers(headers)
+            .user_agent(user_agent)
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
@@ -536,21 +839,67 @@ impl DeepSeekClient {
         api_key: &str,
         extra_headers: &HashMap<String, String>,
     ) -> Result<HeaderMap> {
-        build_default_headers(api_key, extra_headers)
+        build_default_headers(
+            api_key,
+            extra_headers,
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        )
+    }
+
+    #[cfg(test)]
+    fn default_headers_for_provider(
+        api_key: &str,
+        extra_headers: &HashMap<String, String>,
+        api_provider: ApiProvider,
+        base_url: &str,
+    ) -> Result<HeaderMap> {
+        build_default_headers(api_key, extra_headers, api_provider, base_url)
     }
 }
 
 fn build_default_headers(
     api_key: &str,
     extra_headers: &HashMap<String, String>,
+    api_provider: ApiProvider,
+    base_url: &str,
 ) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if !api_key.trim().is_empty() {
+    let api_key = api_key.trim();
+    if api_provider_uses_anthropic_messages(api_provider) {
+        // #3014: most Messages API routes authenticate with `x-api-key`.
+        // OpenModel also supports Bearer auth for Messages, and its `/models`
+        // endpoint requires it, so the header chooser below keeps OpenModel on
+        // Bearer while still pinning the Anthropic wire contract here.
         headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
         );
+    }
+    let auth_header_name = if !api_key.is_empty()
+        && api_provider_uses_anthropic_messages(api_provider)
+        && api_provider != ApiProvider::Openmodel
+    {
+        Some(HeaderName::from_static("x-api-key"))
+    } else if !api_key.is_empty()
+        && api_provider == ApiProvider::XiaomiMimo
+        && (xiaomi_mimo_base_url_uses_token_plan(base_url)
+            || xiaomi_mimo_api_key_uses_token_plan(api_key))
+    {
+        Some(HeaderName::from_static("api-key"))
+    } else if !api_key.is_empty() {
+        Some(AUTHORIZATION)
+    } else {
+        None
+    };
+    if let Some(header_name) = auth_header_name.as_ref() {
+        let header_value = if *header_name == AUTHORIZATION {
+            HeaderValue::from_str(&format!("Bearer {api_key}"))?
+        } else {
+            HeaderValue::from_str(api_key)?
+        };
+        headers.insert(header_name.clone(), header_value);
     }
     for (name, value) in extra_headers {
         let name = name.trim();
@@ -559,7 +908,11 @@ fn build_default_headers(
             continue;
         }
         let header_name = HeaderName::from_bytes(name.as_bytes())?;
-        if header_name == AUTHORIZATION || header_name == CONTENT_TYPE {
+        if header_name == AUTHORIZATION
+            || header_name == CONTENT_TYPE
+            || auth_header_name.as_ref() == Some(&header_name)
+            || (auth_header_name.is_some() && is_auth_dialect_header(&header_name))
+        {
             continue;
         }
         headers.insert(header_name, HeaderValue::from_str(value)?);
@@ -567,7 +920,147 @@ fn build_default_headers(
     Ok(headers)
 }
 
+fn is_auth_dialect_header(header_name: &HeaderName) -> bool {
+    header_name == AUTHORIZATION
+        || header_name == HeaderName::from_static("api-key")
+        || header_name == HeaderName::from_static("x-api-key")
+}
+
+fn api_provider_uses_anthropic_messages(api_provider: ApiProvider) -> bool {
+    matches!(
+        api_provider,
+        ApiProvider::Anthropic | ApiProvider::DeepseekAnthropic | ApiProvider::Openmodel
+    )
+}
+
+fn api_provider_skips_models_probe(api_provider: ApiProvider) -> bool {
+    matches!(api_provider, ApiProvider::DeepseekAnthropic)
+}
+
+fn translation_system_prompt(target_language: &str) -> String {
+    format!(
+        "You are a professional translator. Your ONLY task is to translate text to {target_language}. \
+         Rules:\n\
+         1. Output ONLY the translation, nothing else — no explanations, no notes, no quotes.\n\
+         2. Preserve all code blocks (```...```), URLs, file paths, command names, \
+         and technical terms like API names, function names, and library names untranslated.\n\
+         3. Keep Markdown formatting (headings, lists, bold, italics, links) intact.\n\
+         4. Translate all natural-language prose naturally and professionally.\n\
+         5. Do NOT add any prefix, suffix, or commentary.\n\
+         6. If the input is already in {target_language} or contains no prose to translate, \
+         return it as-is."
+    )
+}
+
+fn translation_message_request(text: &str, model: String, target_language: &str) -> MessageRequest {
+    MessageRequest {
+        model,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }],
+        max_tokens: 4096,
+        system: Some(SystemPrompt::Text(translation_system_prompt(
+            target_language,
+        ))),
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: Some("off".to_string()),
+        stream: Some(false),
+        temperature: Some(0.1),
+        top_p: None,
+    }
+}
+
+fn translation_text_from_response(response: &MessageResponse) -> Result<String> {
+    let translated = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string();
+    if translated.is_empty() {
+        bail!("translate: Anthropic Messages response did not contain text content");
+    }
+    Ok(translated)
+}
+
+fn xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
+    let normalized = base_url.trim().to_ascii_lowercase();
+    let without_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = host.split(':').next().unwrap_or(host);
+    host.starts_with("token-plan-") && host.ends_with(".xiaomimimo.com")
+}
+
+fn xiaomi_mimo_api_key_uses_token_plan(api_key: &str) -> bool {
+    api_key.trim_start().starts_with("tp-")
+}
+
 impl DeepSeekClient {
+    /// Returns the API base URL used by this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Returns the active API provider for this client.
+    pub fn api_provider(&self) -> ApiProvider {
+        self.api_provider
+    }
+
+    /// Resolved in-flight provider request cap, if one is active.
+    #[must_use]
+    pub fn provider_request_concurrency_limit(&self) -> Option<usize> {
+        self.request_concurrency
+            .as_ref()
+            .map(ProviderConcurrencyLimiter::limit)
+    }
+
+    /// Number of currently active requests held by this client's shared
+    /// provider request limiter.
+    #[must_use]
+    pub fn active_provider_requests(&self) -> usize {
+        self.request_concurrency
+            .as_ref()
+            .map_or(0, ProviderConcurrencyLimiter::active)
+    }
+
+    async fn acquire_provider_request_permit(&self) -> Option<ProviderRequestPermit> {
+        match self.request_concurrency.as_ref() {
+            Some(limiter) => limiter.acquire().await,
+            None => None,
+        }
+    }
+
+    fn hold_provider_request_permit_for_stream(
+        stream: crate::llm_client::StreamEventBox,
+        permit: Option<ProviderRequestPermit>,
+    ) -> crate::llm_client::StreamEventBox {
+        Box::pin(async_stream::stream! {
+            let _permit = permit;
+            let mut stream = stream;
+            while let Some(event) = stream.next().await {
+                yield event;
+            }
+        })
+    }
+
     /// Translate text to the requested target language using a focused
     /// non-streaming chat completion call on the supplied model.
     ///
@@ -580,24 +1073,25 @@ impl DeepSeekClient {
         model: &str,
         target_language: &str,
     ) -> Result<String> {
-        let url = api_url(&self.base_url, "chat/completions");
+        let model = wire_model_for_provider(self.api_provider, model);
+        if api_provider_uses_anthropic_messages(self.api_provider) {
+            let response = self
+                .handle_anthropic_message(translation_message_request(text, model, target_language))
+                .await?;
+            return translation_text_from_response(&response);
+        }
+
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
         let mut body = serde_json::json!({
             "model": model,
             "messages": [
                 {
                     "role": "system",
-                    "content": format!(
-                        "You are a professional translator. Your ONLY task is to translate text to {target_language}. \
-                         Rules:\n\
-                         1. Output ONLY the translation, nothing else — no explanations, no notes, no quotes.\n\
-                         2. Preserve all code blocks (```...```), URLs, file paths, command names, \
-                         and technical terms like API names, function names, and library names untranslated.\n\
-                         3. Keep Markdown formatting (headings, lists, bold, italics, links) intact.\n\
-                         4. Translate all natural-language prose naturally and professionally.\n\
-                         5. Do NOT add any prefix, suffix, or commentary.\n\
-                         6. If the input is already in {target_language} or contains no prose to translate, \
-                         return it as-is."
-                    )
+                    "content": translation_system_prompt(target_language)
                 },
                 {
                     "role": "user",
@@ -631,12 +1125,235 @@ impl DeepSeekClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             anyhow::bail!("Failed to list models: HTTP {status}: {error_text}");
         }
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read models response body")?;
 
         parse_models_response(&response_text)
+    }
+
+    /// The catalog provider id for this client (the `ProviderKind` slug, falling
+    /// back to the `ApiProvider` slug for legacy variants without a kind). This
+    /// is the id used as the cache scope and `CatalogOffering.provider`.
+    fn catalog_provider_id(&self) -> String {
+        self.api_provider
+            .kind()
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| self.api_provider.as_str().to_string())
+    }
+
+    /// Fetch the provider's live `/models` listing as a secret-free
+    /// [`ProviderCatalogDelta`] (#3385).
+    ///
+    /// Uses the same URL construction and auth client as [`Self::list_models`],
+    /// but issues a single request without `send_with_retry` so a refresh
+    /// failure stays typed and non-fatal — bundled / saved / static rows are
+    /// untouched. The delta is scoped to the base-URL fingerprint and stamped
+    /// with the fetch time; the API key authorizes the request but is **never**
+    /// persisted into the delta or cache. Unknown live rows carry no canonical
+    /// model, capabilities, or pricing, per the #3385 contract.
+    pub async fn fetch_catalog_delta(&self) -> Result<ProviderCatalogDelta, CatalogRefreshError> {
+        let url = api_url(&self.base_url, "models");
+        // A catalog refresh is non-fatal and must produce a *typed* outcome, so
+        // it issues a single request and maps the raw status. This intentionally
+        // does NOT route through `send_with_retry` like `list_models` does: that
+        // path erases the HTTP status into a generic error and retries
+        // non-retryable auth failures, neither of which suits a typed refresh.
+        // Auth headers are baked into `http_client` (the key is used but never
+        // persisted into the delta or cache).
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| CatalogRefreshError::Network)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 => CatalogRefreshError::Unauthorized,
+                403 => CatalogRefreshError::Forbidden,
+                404 => CatalogRefreshError::NotFound,
+                429 => CatalogRefreshError::RateLimited,
+                // Any other non-success (5xx, unexpected) is treated as a
+                // transient transport-class failure.
+                _ => CatalogRefreshError::Network,
+            });
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|_| CatalogRefreshError::Network)?;
+        let models =
+            parse_models_response(&body).map_err(|_| CatalogRefreshError::InvalidResponse)?;
+        if models.is_empty() {
+            return Err(CatalogRefreshError::EmptyList);
+        }
+
+        let provider = self.catalog_provider_id();
+        let fingerprint = base_url_fingerprint(&self.base_url);
+        let fetched_at = now_unix();
+        let offerings = models
+            .into_iter()
+            .map(|model| CatalogOffering {
+                provider: provider.clone(),
+                wire_model_id: model.id,
+                canonical_model: None,
+                // This refresh calls the chat-model listing endpoint. A future
+                // provider-specific catalog adapter can split image/TTS/embed
+                // rows before they become executable route candidates.
+                endpoint_key: "chat".to_string(),
+                default_for_provider: false,
+                family: None,
+                limit: None,
+                cost: None,
+                // The chat-model listing endpoint does not state modalities; a
+                // future per-provider catalog adapter can fill this in. Left
+                // unknown rather than assumed text-only.
+                modalities: None,
+                reasoning: None,
+                reasoning_options: Vec::new(),
+                source: CatalogSource::Live {
+                    base_url_fingerprint: fingerprint.clone(),
+                    fetched_at,
+                },
+            })
+            .collect();
+
+        Ok(ProviderCatalogDelta {
+            provider,
+            base_url_fingerprint: fingerprint,
+            fetched_at,
+            offerings,
+        })
+    }
+
+    /// Refresh `cache` for this client's provider + base URL, recording either a
+    /// success or a typed failure (#3385). Returns the resulting status so the UI
+    /// can surface a visible "fresh / failed(reason)" chip without inspecting the
+    /// cache internals. A failed refresh preserves any previously cached rows.
+    pub async fn refresh_catalog_cache(
+        &self,
+        cache: &mut ProviderCatalogCache,
+        ttl_secs: u64,
+    ) -> CatalogStatus {
+        match self.fetch_catalog_delta().await {
+            Ok(delta) => {
+                cache.record_success(delta, ttl_secs);
+                CatalogStatus::Fresh
+            }
+            Err(reason) => {
+                cache.record_failure(
+                    &self.catalog_provider_id(),
+                    &base_url_fingerprint(&self.base_url),
+                    reason,
+                );
+                CatalogStatus::Failed { reason }
+            }
+        }
+    }
+
+    /// Generate speech with Xiaomi MiMo TTS models.
+    ///
+    /// The spoken text is placed in an `assistant` message because Xiaomi
+    /// MiMo's TTS chat-completions surface expects that shape. The optional
+    /// `instruction` is a `user` message that controls style, voice design, or
+    /// voice-clone performance and is not spoken verbatim.
+    pub async fn synthesize_speech(
+        &self,
+        request: SpeechSynthesisRequest,
+    ) -> Result<SpeechSynthesisResponse> {
+        if self.api_provider != crate::config::ApiProvider::XiaomiMimo {
+            anyhow::bail!(
+                "speech synthesis requires provider 'xiaomi-mimo' (current: {})",
+                self.api_provider.as_str()
+            );
+        }
+
+        let model = request.model.trim().to_string();
+        if model.is_empty() {
+            anyhow::bail!("Speech model cannot be empty");
+        }
+        let text = request.text.trim().to_string();
+        if text.is_empty() {
+            anyhow::bail!("Speech text cannot be empty");
+        }
+
+        let audio_format = normalize_audio_format(&request.audio_format);
+        let model = wire_model_for_provider(self.api_provider, &model);
+        let model_lower = model.to_ascii_lowercase();
+        let instruction = request
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let voice = request
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if model_lower.contains("voicedesign") && instruction.is_none() {
+            anyhow::bail!(
+                "Model '{model}' requires a voice design prompt. Pass --voice-prompt or --instruction."
+            );
+        }
+        if model_lower.contains("voiceclone") && voice.is_none() {
+            anyhow::bail!(
+                "Model '{model}' requires cloned voice data. Pass --clone-voice <mp3|wav> or --voice <data-uri>."
+            );
+        }
+
+        let mut audio = json!({
+            "format": audio_format.clone(),
+        });
+        if let Some(voice) = voice.as_deref() {
+            audio["voice"] = json!(voice);
+        }
+
+        let body = build_speech_synthesis_body(&model, &text, instruction, audio);
+
+        let url = api_url(&self.base_url, "chat/completions");
+        let response = self
+            .send_with_retry(|| self.http_client.post(&url).json(&body))
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
+            anyhow::bail!("Speech synthesis failed: HTTP {status}: {error_text}");
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read speech synthesis response body")?;
+        let payload: Value = serde_json::from_str(&response_text)
+            .context("Failed to parse speech synthesis response JSON")?;
+        let (audio_bytes, transcript) = parse_speech_audio_response(&payload)?;
+
+        Ok(SpeechSynthesisResponse {
+            model,
+            audio_format,
+            audio_bytes,
+            transcript,
+            voice,
+        })
     }
 
     async fn wait_for_rate_limit(&self) {
@@ -673,10 +1390,17 @@ impl DeepSeekClient {
         if !should_probe {
             return;
         }
+        if api_provider_skips_models_probe(self.api_provider) {
+            self.mark_request_success().await;
+            logging::info("Skipping /models recovery probe for provider without a models endpoint");
+            return;
+        }
         let health_url = api_url(&self.base_url, "models");
         let probe = self.http_client.get(health_url).send().await;
         match probe {
             Ok(resp) if resp.status().is_success() => {
+                // Consume the response body so the connection can be returned to the pool.
+                let _ = resp.text().await;
                 self.mark_request_success().await;
                 logging::info("Recovery probe succeeded");
             }
@@ -701,6 +1425,9 @@ impl DeepSeekClient {
             || {
                 let request = build();
                 async move {
+                    while let Some(delay) = crate::retry_status::rate_limit_remaining() {
+                        tokio::time::sleep(delay).await;
+                    }
                     self.wait_for_rate_limit().await;
                     let response = request
                         .send()
@@ -712,6 +1439,11 @@ impl DeepSeekClient {
                     }
                     let retry_after = extract_retry_after(response.headers());
                     let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = sanitize_http_error_body(
+                        Some(self.api_provider.display_name()),
+                        status.as_u16(),
+                        &body,
+                    );
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -727,6 +1459,9 @@ impl DeepSeekClient {
                     attempt + 1,
                     delay.as_secs_f64(),
                 ));
+                if matches!(err, LlmError::RateLimited { .. }) {
+                    crate::retry_status::note_rate_limit(delay);
+                }
                 crate::retry_status::start(attempt + 1, delay, human_reason);
             })),
         )
@@ -739,6 +1474,12 @@ impl DeepSeekClient {
                 Ok(response)
             }
             Err(err) => {
+                if let LlmError::RateLimited { retry_after, .. } = &err.last_error {
+                    crate::retry_status::note_rate_limit(
+                        retry_after
+                            .unwrap_or_else(|| retry_cfg.delay_for_attempt(retry_cfg.max_retries)),
+                    );
+                }
                 let last = err.last_error.to_string();
                 if err.attempts > 1 {
                     crate::retry_status::failed(last.clone());
@@ -784,11 +1525,17 @@ impl LlmClient for DeepSeekClient {
     }
 
     async fn health_check(&self) -> Result<bool> {
+        if api_provider_skips_models_probe(self.api_provider) {
+            self.mark_request_success().await;
+            return Ok(true);
+        }
         let health_url = api_url(&self.base_url, "models");
         self.wait_for_rate_limit().await;
         let response = self.http_client.get(health_url).send().await;
         match response {
             Ok(resp) if resp.status().is_success() => {
+                // Consume the response body so the connection can be returned to the pool.
+                let _ = resp.text().await;
                 self.mark_request_success().await;
                 Ok(true)
             }
@@ -807,7 +1554,14 @@ impl LlmClient for DeepSeekClient {
 
     async fn create_message(&self, request: MessageRequest) -> Result<MessageResponse> {
         let start = std::time::Instant::now();
-        let result = self.create_message_chat(&request).await;
+        let _permit = self.acquire_provider_request_permit().await;
+        let result = if self.api_provider == ApiProvider::OpenaiCodex {
+            self.handle_responses_message(request.clone()).await
+        } else if api_provider_uses_anthropic_messages(self.api_provider) {
+            self.handle_anthropic_message(request.clone()).await
+        } else {
+            self.create_message_chat(&request).await
+        };
         crate::api_hook::log_non_streaming(
             self.provider_name(),
             self.model(),
@@ -826,9 +1580,19 @@ impl LlmClient for DeepSeekClient {
         let provider = self.provider_name();
         let model = request.model.clone();
         let start = std::time::Instant::now();
-        let stream = self.handle_chat_completion_stream(request.clone()).await;
-        match stream {
-            Ok(s) => Ok(crate::api_hook::wrap_stream(provider, model, request, s)),
+        let permit = self.acquire_provider_request_permit().await;
+        let stream_result = if self.api_provider == ApiProvider::OpenaiCodex {
+            self.handle_responses_stream(request.clone()).await
+        } else if api_provider_uses_anthropic_messages(self.api_provider) {
+            self.handle_anthropic_stream(request.clone()).await
+        } else {
+            self.handle_chat_completion_stream(request.clone()).await
+        };
+        match stream_result {
+            Ok(s) => {
+                let s = Self::hold_provider_request_permit_for_stream(s, permit);
+                Ok(crate::api_hook::wrap_stream(provider, model, request, s))
+            }
             Err(err) => {
                 crate::api_hook::log_stream_error(provider, &model, request, &err, start).await;
                 Err(err)
@@ -893,6 +1657,13 @@ pub(super) fn apply_reasoning_effort(
     effort: Option<&str>,
     provider: ApiProvider,
 ) {
+    if matches!(provider, ApiProvider::Minimax) {
+        // MiniMax's OpenAI-compatible API keeps thinking inside `content`
+        // unless reasoning_split is enabled. Always request the split shape
+        // so private thinking renders as Thinking cells rather than answer
+        // prose.
+        body["reasoning_split"] = json!(true);
+    }
     let Some(effort) = effort else {
         return;
     };
@@ -902,9 +1673,20 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
             | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
             | ApiProvider::Novita
-            | ApiProvider::Sglang => {
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine
+            | ApiProvider::Deepinfra
+            | ApiProvider::Together
+            | ApiProvider::Atlascloud
+            | ApiProvider::Zai => {
                 body["thinking"] = json!({ "type": "disabled" });
+            }
+            ApiProvider::OpenaiCodex => {
+                // OpenAI Codex uses Responses API — thinking handled differently
             }
             ApiProvider::Fireworks => {}
             // vLLM is an OpenAI-protocol server, not an Anthropic-protocol one.
@@ -922,26 +1704,52 @@ pub(super) fn apply_reasoning_effort(
                 });
             }
             ApiProvider::Openai
-            | ApiProvider::Atlascloud
             | ApiProvider::WanjieArk
-            | ApiProvider::Moonshot
-            | ApiProvider::Ollama => {}
+            | ApiProvider::Qianfan
+            | ApiProvider::Arcee
+            | ApiProvider::Huggingface
+            | ApiProvider::Custom => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable/disable.
+                body["thinking"] = json!({ "type": "disabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama OpenAI-compat endpoint accepts think param.
+                body["think"] = json!(false);
+            }
+            ApiProvider::Anthropic | ApiProvider::DeepseekAnthropic | ApiProvider::Openmodel => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": false,
                 });
             }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "disabled" });
+            }
+            ApiProvider::Stepfun => {}
+            ApiProvider::Sakana => {}
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
             // DeepSeek compatibility: low/medium both map to high
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
+            ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine
+            | ApiProvider::Deepinfra
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("high");
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            // OpenRouter/Novita: pass through the actual user-chosen value.
+            // OpenRouter/Novita/Together: pass through the actual user-chosen value.
             // OpenRouter's unified scale is none/minimal/low/medium/high/xhigh;
             // DeepSeek models hosted there accept those directly.
-            ApiProvider::Openrouter | ApiProvider::Novita => {
+            ApiProvider::Openrouter | ApiProvider::Novita | ApiProvider::Together => {
                 let value = match normalized.as_str() {
                     "low" | "minimal" => "low",
                     "medium" | "mid" => "medium",
@@ -949,6 +1757,18 @@ pub(super) fn apply_reasoning_effort(
                 };
                 body["reasoning_effort"] = json!(value);
                 body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Arcee | ApiProvider::Huggingface => {
+                let value = match normalized.as_str() {
+                    "minimal" => "minimal",
+                    "low" => "low",
+                    "medium" | "mid" => "medium",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(value);
             }
             ApiProvider::Fireworks => {
                 body["reasoning_effort"] = json!("high");
@@ -967,25 +1787,62 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!(value);
             }
             ApiProvider::Openai
-            | ApiProvider::Atlascloud
             | ApiProvider::WanjieArk
-            | ApiProvider::Moonshot
-            | ApiProvider::Ollama => {}
+            | ApiProvider::Qianfan
+            | ApiProvider::OpenaiCodex
+            | ApiProvider::Custom => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable.
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama think param.
+                body["think"] = json!(true);
+            }
+            ApiProvider::Anthropic | ApiProvider::DeepseekAnthropic | ApiProvider::Openmodel => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
                     "reasoning_effort": "high",
                 });
             }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "adaptive" });
+            }
+            ApiProvider::Zai => {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "clear_thinking": false,
+                });
+            }
+            ApiProvider::Stepfun => {}
+            ApiProvider::Sakana => {}
         },
-        "xhigh" | "max" | "highest" => match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Sglang => {
+        "xhigh" | "max" | "highest" | "ultracode" => match provider {
+            ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Sglang
+            | ApiProvider::Volcengine
+            | ApiProvider::Deepinfra
+            | ApiProvider::Atlascloud => {
                 body["reasoning_effort"] = json!("max");
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            ApiProvider::Openrouter | ApiProvider::Novita => {
+            ApiProvider::Openrouter | ApiProvider::Novita | ApiProvider::Together => {
                 body["reasoning_effort"] = json!("xhigh");
                 body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::XiaomiMimo => {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Arcee | ApiProvider::Huggingface => {
+                body["reasoning_effort"] = json!("high");
             }
             ApiProvider::Fireworks => {
                 body["reasoning_effort"] = json!("max");
@@ -999,16 +1856,40 @@ pub(super) fn apply_reasoning_effort(
                 body["reasoning_effort"] = json!("high");
             }
             ApiProvider::Openai
-            | ApiProvider::Atlascloud
             | ApiProvider::WanjieArk
-            | ApiProvider::Moonshot
-            | ApiProvider::Ollama => {}
+            | ApiProvider::Qianfan
+            | ApiProvider::OpenaiCodex
+            | ApiProvider::Custom => {}
+            ApiProvider::Moonshot => {
+                // #3024: Kimi models accept thinking enable.
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+            ApiProvider::Ollama => {
+                // #3024: Ollama think param.
+                body["think"] = json!(true);
+            }
+            ApiProvider::Anthropic | ApiProvider::DeepseekAnthropic | ApiProvider::Openmodel => {
+                // #3014: thinking/effort shaping happens natively inside
+                // client/anthropic.rs (adaptive thinking + output_config),
+                // not via OpenAI-dialect fields.
+            }
             ApiProvider::NvidiaNim => {
                 body["chat_template_kwargs"] = json!({
                     "thinking": true,
                     "reasoning_effort": "max",
                 });
             }
+            ApiProvider::Minimax => {
+                body["thinking"] = json!({ "type": "adaptive" });
+            }
+            ApiProvider::Zai => {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "clear_thinking": false,
+                });
+            }
+            ApiProvider::Stepfun => {}
+            ApiProvider::Sakana => {}
         },
         _ => {}
     }
@@ -1054,7 +1935,7 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
     let prompt_cache_miss_tokens = usage
         .and_then(|u| u.get("prompt_cache_miss_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| cached_tokens.map(|cached| input_tokens.saturating_sub(cached)))
+        .or_else(|| prompt_cache_hit_tokens.map(|hit| input_tokens.saturating_sub(u64::from(hit))))
         .map(|v| v as u32);
     let reasoning_tokens = reasoning_tokens_raw.map(|v| v as u32);
 
@@ -1074,8 +1955,8 @@ pub(super) fn parse_usage(usage: Option<&Value>) -> Usage {
     });
 
     Usage {
-        input_tokens: input_tokens as u32,
-        output_tokens: output_tokens as u32,
+        input_tokens: input_tokens.min(u64::from(u32::MAX)) as u32,
+        output_tokens: output_tokens.min(u64::from(u32::MAX)) as u32,
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
         reasoning_tokens,
@@ -1093,7 +1974,14 @@ impl DeepSeekClient {
         suffix: &str,
         max_tokens: u32,
     ) -> anyhow::Result<String> {
-        let url = api_url(&self.base_url, "beta/completions");
+        if api_provider_uses_anthropic_messages(self.api_provider) {
+            bail!(
+                "FIM completion is not supported for {} because it uses the Anthropic Messages protocol",
+                self.api_provider.display_name()
+            );
+        }
+        let url = api_url_with_suffix(&self.base_url, "beta/completions", None);
+        let model = wire_model_for_provider(self.api_provider, model);
         let body = json!({
             "model": model,
             "prompt": prompt,
@@ -1105,10 +1993,18 @@ impl DeepSeekClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             anyhow::bail!("FIM API error: HTTP {status}: {error_text}");
         }
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read FIM API response body")?;
         let value: serde_json::Value =
             serde_json::from_str(&response_text).context("Failed to parse FIM API response")?;
         let text = value
@@ -1119,9 +2015,16 @@ impl DeepSeekClient {
     }
 }
 
+mod anthropic;
 mod chat;
+mod responses;
 
-pub(crate) use chat::PromptInspection;
+fn extract_sse_data_value(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(|value| value.strip_prefix(' ').unwrap_or(value))
+}
+
+pub(crate) use chat::{CacheWarmupKey, PromptInspection};
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
     chat::inspect_prompt_for_request(request)
@@ -1140,10 +2043,13 @@ mod tests {
         parse_chat_message, parse_sse_chunk, sanitize_thinking_mode_messages, tool_to_chat,
         tool_to_chat_for_base_url,
     };
+    use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::models::{
         ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, Tool,
     };
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_tool(name: &str) -> Tool {
         Tool {
@@ -1160,6 +2066,165 @@ mod tests {
             strict: Some(true),
             cache_control: None,
         }
+    }
+
+    fn deepseek_anthropic_client(server: &MockServer) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let providers = ProvidersConfig {
+            deepseek_anthropic: ProviderConfig {
+                api_key: Some("ds-test".to_string()),
+                base_url: Some(server.uri()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        };
+        DeepSeekClient::new(&Config {
+            provider: Some("deepseek-anthropic".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        })
+        .expect("deepseek anthropic client")
+    }
+
+    fn zai_client_for_test() -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let providers = ProvidersConfig {
+            zai: ProviderConfig {
+                api_key: Some("zai-test".to_string()),
+                base_url: Some("https://api.z.ai/api/coding/paas/v4".to_string()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        };
+        DeepSeekClient::new(&Config {
+            provider: Some("zai".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        })
+        .expect("zai client")
+    }
+
+    #[tokio::test]
+    async fn provider_request_concurrency_limiter_is_shared_across_client_clones() {
+        let client = zai_client_for_test();
+        assert_eq!(
+            client.provider_request_concurrency_limit(),
+            Some(crate::config::DEFAULT_ZAI_PROVIDER_MAX_CONCURRENCY)
+        );
+
+        let clone = client.clone();
+        let permit = client
+            .acquire_provider_request_permit()
+            .await
+            .expect("zai default should install provider request limiter");
+
+        assert_eq!(client.active_provider_requests(), 1);
+        assert_eq!(clone.active_provider_requests(), 1);
+
+        drop(permit);
+
+        assert_eq!(client.active_provider_requests(), 0);
+        assert_eq!(clone.active_provider_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_request_permit_lives_until_stream_is_consumed() {
+        let client = zai_client_for_test();
+        let permit = client
+            .acquire_provider_request_permit()
+            .await
+            .expect("zai default should install provider request limiter");
+        let stream: crate::llm_client::StreamEventBox =
+            Box::pin(futures_util::stream::iter(vec![Ok(
+                StreamEvent::MessageStop,
+            )]));
+        let mut wrapped =
+            DeepSeekClient::hold_provider_request_permit_for_stream(stream, Some(permit));
+
+        assert_eq!(client.active_provider_requests(), 1);
+        assert!(wrapped.next().await.is_some());
+        assert!(wrapped.next().await.is_none());
+        assert_eq!(client.active_provider_requests(), 0);
+    }
+
+    #[test]
+    fn parse_speech_audio_response_accepts_message_audio() {
+        let encoded = general_purpose::STANDARD.encode(b"hi");
+        let payload = json!({
+            "choices": [{
+                "message": {
+                    "audio": {
+                        "data": encoded,
+                        "transcript": "hi"
+                    }
+                }
+            }]
+        });
+
+        let (audio, transcript) = parse_speech_audio_response(&payload).unwrap();
+        assert_eq!(audio, b"hi");
+        assert_eq!(transcript.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_speech_audio_response_accepts_data_uri() {
+        let encoded = general_purpose::STANDARD.encode(b"wav");
+        let payload = json!({
+            "audio": {
+                "data": format!("data:audio/wav;base64,{encoded}")
+            }
+        });
+
+        let (audio, transcript) = parse_speech_audio_response(&payload).unwrap();
+        assert_eq!(audio, b"wav");
+        assert_eq!(transcript, None);
+    }
+
+    #[test]
+    fn speech_synthesis_body_omits_user_message_without_instruction() {
+        let body =
+            build_speech_synthesis_body("mimo-v2.5-tts", "hello", None, json!({"format": "wav"}));
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "hello");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["content"].as_str() != Some(""))
+        );
+    }
+
+    #[test]
+    fn speech_synthesis_body_ignores_blank_instruction() {
+        let body = build_speech_synthesis_body(
+            "mimo-v2.5-tts",
+            "hello",
+            Some("  \t\n  "),
+            json!({"format": "wav"}),
+        );
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+    }
+
+    #[test]
+    fn speech_synthesis_body_includes_non_empty_instruction_first() {
+        let body = build_speech_synthesis_body(
+            "mimo-v2.5-tts-voicedesign",
+            "hello",
+            Some("warm and calm"),
+            json!({"format": "wav"}),
+        );
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "warm and calm");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "hello");
     }
 
     #[test]
@@ -1297,11 +2362,373 @@ mod tests {
     }
 
     #[test]
+    fn build_http_client_accepts_default_tls_verification() {
+        let client = DeepSeekClient::build_http_client(
+            "sk-test",
+            &HashMap::new(),
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        );
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn client_new_rejects_provider_scoped_tls_skip_verify() {
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openai.api_key = Some("sk-test".to_string());
+        providers.openai.base_url = Some(crate::config::DEFAULT_OPENAI_BASE_URL.to_string());
+        providers.openai.insecure_skip_tls_verify = Some(true);
+        let config = Config {
+            provider: Some("openai".to_string()),
+            providers: Some(providers),
+            ..Config::default()
+        };
+        assert!(config.insecure_skip_tls_verify());
+
+        let err = match DeepSeekClient::new(&config) {
+            Ok(_) => panic!("tls skip verify should be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("cannot be disabled"));
+        assert!(message.contains("SSL_CERT_FILE"));
+    }
+
+    #[test]
+    fn client_stream_idle_timeout_uses_tui_config() {
+        let client = DeepSeekClient::new(&Config {
+            api_key: Some("sk-test".to_string()),
+            tui: Some(crate::config::TuiConfig {
+                stream_chunk_timeout_secs: Some(777),
+                ..crate::config::TuiConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("client");
+
+        assert_eq!(client.stream_idle_timeout, Duration::from_secs(777));
+    }
+
+    #[test]
+    fn xiaomi_mimo_token_plan_endpoint_uses_api_key_header() {
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "tp-test",
+            &HashMap::new(),
+            ApiProvider::XiaomiMimo,
+            crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("tp-test")
+        );
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "Token Plan requires api-key instead of Authorization Bearer"
+        );
+    }
+
+    #[test]
+    fn xiaomi_mimo_tp_key_uses_api_key_header_with_custom_base_url() {
+        let mut extra = HashMap::new();
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "tp-custom",
+            &extra,
+            ApiProvider::XiaomiMimo,
+            "https://proxy.example.test/mimo/v1",
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("tp-custom")
+        );
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "tp-* Token Plan keys should use api-key auth even through custom gateways"
+        );
+    }
+
+    #[test]
+    fn openrouter_uses_bearer_header_after_mimo_token_plan_context() {
+        let mut extra = HashMap::new();
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "sk-or-test",
+            &extra,
+            ApiProvider::Openrouter,
+            crate::config::DEFAULT_OPENROUTER_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-or-test")
+        );
+        assert!(
+            headers.get("api-key").is_none(),
+            "OpenRouter must not inherit Xiaomi MiMo's api-key header dialect"
+        );
+    }
+
+    #[test]
+    fn siliconflow_cn_uses_bearer_header_and_pins_content_type() {
+        let mut extra = HashMap::new();
+        extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
+        extra.insert("Content-Type".to_string(), "text/plain".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "sf-cn-test",
+            &extra,
+            ApiProvider::SiliconflowCn,
+            crate::config::DEFAULT_SILICONFLOW_CN_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sf-cn-test")
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(headers.get("api-key").is_none());
+    }
+
+    #[test]
+    fn tokenhub_openai_compatible_route_uses_bearer_header() {
+        let mut extra = HashMap::new();
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        extra.insert("x-api-key".to_string(), "wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "tokenhub-test",
+            &extra,
+            ApiProvider::Openai,
+            "https://tokenhub.tencentmaas.com/v1",
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer tokenhub-test")
+        );
+        assert!(headers.get("api-key").is_none());
+        assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn deepseek_anthropic_uses_anthropic_header_dialect() {
+        let mut extra = HashMap::new();
+        extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "ds-test",
+            &extra,
+            ApiProvider::DeepseekAnthropic,
+            crate::config::DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("ds-test")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "Anthropic-compatible DeepSeek route must not use Bearer auth"
+        );
+        assert!(
+            headers.get("api-key").is_none(),
+            "Anthropic-compatible DeepSeek route must not inherit MiMo auth headers"
+        );
+    }
+
+    #[test]
+    fn openmodel_uses_bearer_auth_with_anthropic_version() {
+        let mut extra = HashMap::new();
+        extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
+        extra.insert("api-key".to_string(), "wrong".to_string());
+        extra.insert("x-api-key".to_string(), "wrong".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "om-test",
+            &extra,
+            ApiProvider::Openmodel,
+            crate::config::DEFAULT_OPENMODEL_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer om-test")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "OpenModel uses Bearer auth so /v1/models and /v1/messages share one client"
+        );
+        assert!(
+            headers.get("api-key").is_none(),
+            "OpenModel Messages route must not inherit MiMo auth headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_anthropic_translate_uses_messages_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hola"}],
+                "model": "deepseek-chat",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = deepseek_anthropic_client(&server);
+        let translated = client
+            .translate("Hello", "deepseek-chat", "Spanish")
+            .await
+            .expect("translation succeeds");
+
+        assert_eq!(translated, "Hola");
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            body.pointer("/messages/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Hello")
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "translation disables thinking: {body}"
+        );
+        assert!(
+            body.get("system")
+                .and_then(Value::as_str)
+                .is_some_and(|system| system.contains("Spanish")),
+            "target language should be in system prompt: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_anthropic_health_check_skips_models_probe() {
+        let server = MockServer::start().await;
+        let client = deepseek_anthropic_client(&server);
+
+        assert!(client.health_check().await.expect("health check"));
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            requests.is_empty(),
+            "DeepSeek Anthropic-compatible route must not probe /models"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_anthropic_fim_fails_without_http_request() {
+        let server = MockServer::start().await;
+        let client = deepseek_anthropic_client(&server);
+
+        let err = client
+            .fim_completion("deepseek-chat", "fn main() {", "}", 16)
+            .await
+            .expect_err("FIM is unsupported");
+        let message = err.to_string();
+        assert!(
+            message.contains("FIM completion is not supported"),
+            "{message}"
+        );
+        assert!(message.contains("Anthropic Messages protocol"), "{message}");
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            requests.is_empty(),
+            "unsupported FIM should fail locally before any HTTP call"
+        );
+    }
+
+    #[test]
+    fn custom_api_key_header_is_allowed_without_primary_provider_key() {
+        let mut extra = HashMap::new();
+        extra.insert("api-key".to_string(), "gateway-key".to_string());
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "",
+            &extra,
+            ApiProvider::Openai,
+            "https://gateway.example.test/v1",
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers.get("api-key").and_then(|value| value.to_str().ok()),
+            Some("gateway-key")
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn xiaomi_mimo_pay_as_you_go_endpoint_keeps_bearer_header() {
+        let headers = DeepSeekClient::default_headers_for_provider(
+            "sk-test",
+            &HashMap::new(),
+            ApiProvider::XiaomiMimo,
+            crate::config::XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL,
+        )
+        .expect("headers");
+
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+        assert!(headers.get("api-key").is_none());
+    }
+
+    #[test]
     fn chat_messages_keep_current_turn_reasoning_content() {
         let message = Message {
             role: "assistant".to_string(),
             content: vec![
                 ContentBlock::Thinking {
+                    signature: None,
                     thinking: "plan".to_string(),
                 },
                 ContentBlock::Text {
@@ -1340,6 +2767,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "plan".to_string(),
                     },
                     ContentBlock::Text {
@@ -1389,6 +2817,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1440,6 +2869,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -1510,6 +2940,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Internal explanation plan".to_string(),
                     },
                     ContentBlock::Text {
@@ -1553,6 +2984,7 @@ mod tests {
             role: "assistant".to_string(),
             content: vec![
                 ContentBlock::Thinking {
+                    signature: None,
                     thinking: "I should explain step by step.".to_string(),
                 },
                 ContentBlock::Text {
@@ -1989,6 +3421,70 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_off_is_omitted_for_strict_openai_like_providers() {
+        for provider in [
+            ApiProvider::Openai,
+            ApiProvider::WanjieArk,
+            ApiProvider::Qianfan,
+            ApiProvider::Arcee,
+            ApiProvider::Huggingface,
+            ApiProvider::Fireworks,
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some("off"), provider);
+
+            assert_eq!(
+                body,
+                json!({}),
+                "provider {provider:?} should not receive unsupported reasoning-off fields"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_atlascloud_speaks_deepseek_dialect() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "high", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Atlascloud);
+        assert_eq!(
+            body,
+            json!({ "reasoning_effort": "max", "thinking": { "type": "enabled" } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Atlascloud);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_moonshot_toggles_thinking() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "enabled" } }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Moonshot);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
+    fn reasoning_effort_ollama_toggles_think_flag() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": true }));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Ollama);
+        assert_eq!(body, json!({ "think": false }));
+    }
+
+    #[test]
     fn reasoning_effort_uses_nvidia_nim_chat_template_kwargs() {
         let mut body = json!({});
         apply_reasoning_effort(&mut body, Some("max"), ApiProvider::NvidiaNim);
@@ -2039,6 +3535,30 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_uses_arcee_reasoning_effort_without_thinking_object() {
+        for (input, expected) in [
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("mid", "medium"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "high"),
+        ] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::Arcee);
+
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                Some(expected)
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "Arcee documents reasoning_effort rather than a DeepSeek thinking object"
+            );
+        }
+    }
+
+    #[test]
     fn reasoning_effort_maps_openrouter_scale_without_deepseek_max_label() {
         for (input, expected) in [
             ("low", "low"),
@@ -2065,6 +3585,87 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_uses_xiaomi_mimo_thinking_parameter_only() {
+        for input in ["low", "medium", "max", "xhigh"] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(input), ApiProvider::XiaomiMimo);
+
+            assert_eq!(
+                body.pointer("/thinking/type").and_then(Value::as_str),
+                Some("enabled"),
+                "MiMo thinking mapping for {input}"
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::XiaomiMimo);
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_minimax_splits_reasoning_from_content() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Minimax);
+        assert_eq!(
+            body.get("reasoning_split").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive")
+        );
+        assert!(body.get("reasoning_effort").is_none());
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Minimax);
+        assert_eq!(
+            body.get("reasoning_split").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.pointer("/thinking/type").and_then(Value::as_str),
+            Some("disabled")
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, None, ApiProvider::Minimax);
+        assert_eq!(body, json!({ "reasoning_split": true }));
+    }
+
+    #[test]
+    fn reasoning_effort_zai_uses_documented_thinking_shape() {
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("high"), ApiProvider::Zai);
+        assert_eq!(
+            body,
+            json!({ "thinking": { "type": "enabled", "clear_thinking": false } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("max"), ApiProvider::Zai);
+        assert_eq!(
+            body,
+            json!({ "thinking": { "type": "enabled", "clear_thinking": false } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("ultracode"), ApiProvider::Zai);
+        assert_eq!(
+            body,
+            json!({ "thinking": { "type": "enabled", "clear_thinking": false } })
+        );
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, Some("off"), ApiProvider::Zai);
+        assert_eq!(body, json!({ "thinking": { "type": "disabled" } }));
+    }
+
+    #[test]
     fn chat_parser_accepts_nvidia_nim_reasoning_field() -> Result<()> {
         let response = parse_chat_message(&json!({
             "id": "chatcmpl-test",
@@ -2085,7 +3686,7 @@ mod tests {
 
         assert!(matches!(
             response.content.first(),
-            Some(ContentBlock::Thinking { thinking }) if thinking == "thinking via NIM"
+            Some(ContentBlock::Thinking { thinking, .. }) if thinking == "thinking via NIM"
         ));
         assert!(matches!(
             response.content.get(1),
@@ -2100,6 +3701,7 @@ mod tests {
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &json!({
                 "choices": [{
@@ -2112,6 +3714,7 @@ mod tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             true,
         );
 
@@ -2227,6 +3830,7 @@ mod tests {
         let message = Message {
             role: "assistant".to_string(),
             content: vec![ContentBlock::Thinking {
+                signature: None,
                 thinking: "plan".to_string(),
             }],
         };
@@ -2265,12 +3869,14 @@ mod tests {
         let mut thinking_started = false;
         let mut tool_indices: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             false,
         );
 
@@ -2324,12 +3930,14 @@ mod tests {
         let mut thinking_started = false;
         let mut tool_indices: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         let events = parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             false,
         );
 
@@ -2370,6 +3978,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to inspect the directory".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -2410,6 +4019,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to search".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -2499,6 +4109,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "Need to list files".to_string(),
                     },
                     ContentBlock::ToolUse {
@@ -2654,6 +4265,228 @@ mod tests {
         );
     }
 
+    // === #3385: provider live /models fetch + secret-free cache ==============
+    //
+    // All model ids below are SYNTHETIC (never real vendor model names), per the
+    // issue's anti-hardcoding rule.
+
+    /// Build a client whose OpenRouter base URL points at a mock server.
+    fn openrouter_client_for(server: &MockServer) -> DeepSeekClient {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        DeepSeekClient::new(&Config {
+            provider: Some("openrouter".to_string()),
+            providers: Some(ProvidersConfig {
+                openrouter: ProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(server.uri()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        })
+        .expect("openrouter client")
+    }
+
+    async fn mount_models_json(server: &MockServer, status: u16, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_success_builds_scoped_secret_free_live_delta() {
+        let server = MockServer::start().await;
+        mount_models_json(
+            &server,
+            200,
+            json!({"data": [
+                {"id": "synthetic-model-alpha", "owned_by": "synthetic-owner"},
+                {"id": "synthetic-model-beta"}
+            ]}),
+        )
+        .await;
+        let client = openrouter_client_for(&server);
+
+        let delta = client.fetch_catalog_delta().await.expect("delta");
+        assert_eq!(delta.provider, "openrouter");
+        assert_eq!(
+            delta.base_url_fingerprint,
+            base_url_fingerprint(&server.uri()),
+            "delta is scoped to the base-URL fingerprint"
+        );
+        let ids: Vec<&str> = delta
+            .offerings
+            .iter()
+            .map(|offering| offering.wire_model_id.as_str())
+            .collect();
+        assert!(ids.contains(&"synthetic-model-alpha"), "ids: {ids:?}");
+        assert!(ids.contains(&"synthetic-model-beta"), "ids: {ids:?}");
+        for offering in &delta.offerings {
+            // Live rows carry honest provenance and no inferred facts/secrets.
+            assert!(matches!(offering.source, CatalogSource::Live { .. }));
+            assert_eq!(offering.canonical_model, None);
+            assert_eq!(offering.cost, None);
+            assert!(offering.reasoning.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_maps_http_statuses_to_typed_errors() {
+        for (status, expected) in [
+            (401u16, CatalogRefreshError::Unauthorized),
+            (403, CatalogRefreshError::Forbidden),
+            (404, CatalogRefreshError::NotFound),
+            (429, CatalogRefreshError::RateLimited),
+            (500, CatalogRefreshError::Network),
+        ] {
+            let server = MockServer::start().await;
+            mount_models_json(&server, status, json!({"error": "nope"})).await;
+            let client = openrouter_client_for(&server);
+            let err = client.fetch_catalog_delta().await.expect_err("should fail");
+            assert_eq!(err, expected, "status {status} should map to {expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_catalog_delta_maps_invalid_json_and_empty_list() {
+        // Invalid JSON -> InvalidResponse.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let client = openrouter_client_for(&server);
+        assert_eq!(
+            client
+                .fetch_catalog_delta()
+                .await
+                .expect_err("invalid json"),
+            CatalogRefreshError::InvalidResponse
+        );
+
+        // Empty list -> EmptyList.
+        let server = MockServer::start().await;
+        mount_models_json(&server, 200, json!({"data": []})).await;
+        let client = openrouter_client_for(&server);
+        assert_eq!(
+            client.fetch_catalog_delta().await.expect_err("empty list"),
+            CatalogRefreshError::EmptyList
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_catalog_cache_records_success_then_preserves_rows_on_failure() {
+        // First refresh succeeds and caches live rows.
+        let server = MockServer::start().await;
+        mount_models_json(
+            &server,
+            200,
+            json!({"data": [{"id": "synthetic-model-gamma"}]}),
+        )
+        .await;
+        let client = openrouter_client_for(&server);
+        let mut cache = ProviderCatalogCache::new();
+
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert_eq!(status, CatalogStatus::Fresh);
+        let fp = base_url_fingerprint(&server.uri());
+        let cached = cache.get("openrouter", &fp).expect("cached entry");
+        assert_eq!(cached.offerings.len(), 1);
+        assert_eq!(cached.offerings[0].wire_model_id, "synthetic-model-gamma");
+
+        // A later failing refresh on the same base URL flips status to Failed
+        // but PRESERVES the rows.
+        server.reset().await;
+        mount_models_json(&server, 401, json!({"error": "denied"})).await;
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert!(matches!(
+            status,
+            CatalogStatus::Failed {
+                reason: CatalogRefreshError::Unauthorized,
+                ..
+            }
+        ));
+        let cached = cache.get("openrouter", &fp).expect("entry still present");
+        assert_eq!(
+            cached.offerings.len(),
+            1,
+            "rows from the prior success must survive a failed refresh"
+        );
+        assert!(matches!(cached.status, CatalogStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn live_catalog_is_scoped_by_base_url_fingerprint() {
+        // Same provider, two different base URLs -> two distinct cache scopes.
+        let server_a = MockServer::start().await;
+        mount_models_json(&server_a, 200, json!({"data": [{"id": "synthetic-a"}]})).await;
+        let server_b = MockServer::start().await;
+        mount_models_json(&server_b, 200, json!({"data": [{"id": "synthetic-b"}]})).await;
+
+        let mut cache = ProviderCatalogCache::new();
+        openrouter_client_for(&server_a)
+            .refresh_catalog_cache(&mut cache, 3600)
+            .await;
+        openrouter_client_for(&server_b)
+            .refresh_catalog_cache(&mut cache, 3600)
+            .await;
+
+        let fp_a = base_url_fingerprint(&server_a.uri());
+        let fp_b = base_url_fingerprint(&server_b.uri());
+        assert_ne!(
+            fp_a, fp_b,
+            "different base URLs must fingerprint differently"
+        );
+        assert_eq!(
+            cache.get("openrouter", &fp_a).expect("a").offerings[0].wire_model_id,
+            "synthetic-a"
+        );
+        assert_eq!(
+            cache.get("openrouter", &fp_b).expect("b").offerings[0].wire_model_id,
+            "synthetic-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_rows_survive_a_live_refresh_failure() {
+        // Bundled/static rows compile through even when the live layer is empty
+        // (the state after a failed refresh with no prior success).
+        let server = MockServer::start().await;
+        mount_models_json(&server, 503, json!({"error": "down"})).await;
+        let client = openrouter_client_for(&server);
+        let mut cache = ProviderCatalogCache::new();
+        let status = client.refresh_catalog_cache(&mut cache, 3600).await;
+        assert!(matches!(status, CatalogStatus::Failed { .. }));
+
+        let static_row = CatalogOffering {
+            provider: "openrouter".to_string(),
+            wire_model_id: "synthetic-static".to_string(),
+            endpoint_key: "chat".to_string(),
+            ..CatalogOffering::default()
+        };
+        let fp = base_url_fingerprint(&server.uri());
+        let fresh_live: Vec<CatalogOffering> = cache
+            .get("openrouter", &fp)
+            .filter(|entry| entry.is_fresh(now_unix()))
+            .map(|entry| entry.offerings.clone())
+            .unwrap_or_default();
+        let snapshot = codewhale_config::catalog::CatalogCompiler::new()
+            .with_bundled(vec![static_row])
+            .with_live(fresh_live)
+            .compile();
+        assert!(
+            snapshot
+                .offerings
+                .iter()
+                .any(|offering| offering.wire_model_id == "synthetic-static"),
+            "static fallback row must remain available after a failed refresh"
+        );
+    }
+
     #[test]
     fn parse_usage_reads_deepseek_cache_and_reasoning_tokens() {
         let usage = parse_usage(Some(&json!({
@@ -2720,6 +4553,22 @@ mod tests {
 
         assert_eq!(usage.input_tokens, 4000);
         assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(3000));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(1000));
+    }
+
+    #[test]
+    fn parse_usage_infers_cache_miss_from_selected_hit_source() {
+        let usage = parse_usage(Some(&json!({
+            "prompt_tokens": 4000,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 3000,
+            "prompt_tokens_details": {
+                "cached_tokens": 1000
+            }
+        })));
+
+        assert_eq!(usage.input_tokens, 4000);
         assert_eq!(usage.prompt_cache_hit_tokens, Some(3000));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(1000));
     }
@@ -2954,6 +4803,22 @@ mod tests {
     }
 
     #[test]
+    fn base_url_security_errors_redact_sensitive_url_parts() {
+        let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+        let _guard = AllowInsecureHttpEnvGuard::capture();
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
+        let err =
+            validate_base_url_security("http://user:secret@example.com/v1?api_key=sk-test&ok=1")
+                .expect_err("non-local insecure HTTP should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains("http://***:***@example.com/v1?api_key=***&ok=1"));
+        assert!(!message.contains("user:secret"));
+        assert!(!message.contains("sk-test"));
+    }
+
+    #[test]
     fn base_url_security_allows_localhost_http() {
         let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
         let _guard = AllowInsecureHttpEnvGuard::capture();
@@ -3090,8 +4955,216 @@ mod tests {
             unsafe { std::env::set_var("DEEPSEEK_FORCE_HTTP1", value) };
             assert!(
                 !force_http1_from_env(),
-                "{value:?} should NOT be parsed as truthy",
+                "{value:?} should NOT be parsed as truthy"
             );
         }
+    }
+
+    #[test]
+    fn api_url_with_suffix_strips_version_before_chat_suffix() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "chat/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/beta",
+                "chat/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_handles_leading_slash() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "chat/completions",
+                Some("chat/completions")
+            ),
+            "https://api.example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_ignores_suffix_for_models() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "models",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_ignores_suffix_for_beta_paths() {
+        assert_eq!(
+            api_url_with_suffix(
+                "https://api.example.com/v1",
+                "beta/completions",
+                Some("/chat/completions")
+            ),
+            "https://api.example.com/beta/completions"
+        );
+    }
+
+    #[test]
+    fn api_url_with_suffix_default_behavior_without_suffix() {
+        assert_eq!(
+            api_url_with_suffix("https://api.deepseek.com", "chat/completions", None),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_display_masks_userinfo_and_sensitive_query_values() {
+        let redacted = redact_url_for_display(
+            "https://user:secret@example.com/v1?api_key=sk-test&region=us&refresh-token=abc",
+        );
+
+        assert_eq!(
+            redacted,
+            "https://***:***@example.com/v1?api_key=***&region=us&refresh-token=***"
+        );
+    }
+
+    #[test]
+    fn extract_sse_data_value_accepts_optional_space() {
+        assert_eq!(
+            extract_sse_data_value("data: {\"ok\":true}"),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            extract_sse_data_value("data:{\"ok\":true}"),
+            Some("{\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn extract_sse_data_value_handles_done_marker() {
+        assert_eq!(extract_sse_data_value("data: [DONE]"), Some("[DONE]"));
+        assert_eq!(extract_sse_data_value("data:[DONE]"), Some("[DONE]"));
+    }
+
+    #[test]
+    fn extract_sse_data_value_rejects_non_data_lines() {
+        assert_eq!(extract_sse_data_value("event: message"), None);
+        assert_eq!(extract_sse_data_value(": heartbeat"), None);
+    }
+
+    /// Build a DeepSeek config with an inline key/base URL plus the resolved
+    /// runtime route for it. `RouteResolver` (reached through
+    /// `resolve_runtime_route`) is the only producer of `ReadyRouteCandidate`,
+    /// so we mint candidates the same way the engine does at switch time.
+    fn deepseek_route_for_test(
+        base_url: &str,
+        model: &str,
+    ) -> (Config, crate::route_runtime::ResolvedRuntimeRoute) {
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            api_key: Some("ds-test".to_string()),
+            base_url: Some(base_url.to_string()),
+            default_text_model: Some(model.to_string()),
+            ..Config::default()
+        };
+        let route = crate::route_runtime::resolve_runtime_route(
+            &config,
+            ApiProvider::Deepseek,
+            Some(model),
+        )
+        .expect("deepseek route should resolve");
+        (config, route)
+    }
+
+    #[test]
+    fn from_candidate_uses_candidate_base_url_and_wire_model() {
+        let (_config, route) =
+            deepseek_route_for_test("https://route.example.com/v1", "deepseek-v4-pro");
+
+        let client = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            .expect("client should construct from candidate");
+
+        // The transport is bound to the candidate, not re-derived from Config.
+        assert_eq!(client.base_url, route.candidate.endpoint.base_url);
+        assert_eq!(client.default_model, route.candidate.wire_model_id.as_str());
+    }
+
+    #[test]
+    fn from_candidate_matches_new_when_config_agrees() {
+        // For a normal route, the resolver writes the candidate's wire model and
+        // endpoint back into `route.config`, so constructing from the candidate
+        // must be byte-identical to constructing from that config. This pins the
+        // "no behavior change today" guarantee for Slice A.
+        let (_config, route) =
+            deepseek_route_for_test("https://api.deepseek.com/v1", "deepseek-v4-pro");
+
+        let from_new = DeepSeekClient::new(&route.config).expect("new client");
+        let from_candidate = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            .expect("candidate client");
+
+        assert_eq!(from_candidate.base_url, from_new.base_url);
+        assert_eq!(from_candidate.default_model, from_new.default_model);
+        assert_eq!(from_candidate.api_provider, from_new.api_provider);
+    }
+
+    #[test]
+    fn from_candidate_binds_custom_provider_base_url_and_model() {
+        // #1519: a custom OpenAI-compatible provider resolves to a candidate
+        // whose endpoint/model come from the named `[providers.<name>]` table,
+        // and `from_candidate` must bind that verbatim base URL + wire model.
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "my_thing".to_string(),
+            ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some("https://api.example.com/v1".to_string()),
+                model: Some("custom-model-v1".to_string()),
+                api_key_env: Some("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider: Some("my_thing".to_string()),
+            providers: Some(ProvidersConfig {
+                custom,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+
+        // The config names a custom provider, so it must resolve as Custom.
+        assert_eq!(config.api_provider(), ApiProvider::Custom);
+
+        let route = crate::route_runtime::resolve_runtime_route(&config, ApiProvider::Custom, None)
+            .expect("custom route should resolve");
+
+        // Provide the key the route's auth path will read.
+        // SAFETY: single-threaded unit test mutating a uniquely-named var.
+        unsafe {
+            std::env::set_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST", "sk-custom");
+        }
+        let client = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            .expect("client should construct from custom candidate");
+        unsafe {
+            std::env::remove_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST");
+        }
+
+        assert_eq!(client.base_url, "https://api.example.com/v1");
+        assert_eq!(client.default_model, "custom-model-v1");
+        assert_eq!(client.api_provider, ApiProvider::Custom);
+        // The candidate carried the custom endpoint + verbatim wire model.
+        assert_eq!(
+            route.candidate.endpoint.base_url,
+            "https://api.example.com/v1"
+        );
+        assert_eq!(route.candidate.wire_model_id.as_str(), "custom-model-v1");
     }
 }

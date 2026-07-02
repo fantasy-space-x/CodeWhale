@@ -4,18 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core runtime boundaries for DeepSeek workspace architecture"
+description = "Core runtime boundaries for CodeWhale"
 
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.46" }
-codewhale-config = { path = "../config", version = "0.8.46" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.46" }
-codewhale-hooks = { path = "../hooks", version = "0.8.46" }
-codewhale-mcp = { path = "../mcp", version = "0.8.46" }
-codewhale-protocol = { path = "../protocol", version = "0.8.46" }
-codewhale-state = { path = "../state", version = "0.8.46" }
-codewhale-tools = { path = "../tools", version = "0.8.46" }
+codewhale-agent = { path = "../agent", version = "0.8.66" }
+codewhale-config = { path = "../config", version = "0.8.66" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.66" }
+codewhale-hooks = { path = "../hooks", version = "0.8.66" }
+codewhale-mcp = { path = "../mcp", version = "0.8.66" }
+codewhale-protocol = { path = "../protocol", version = "0.8.66" }
+codewhale-state = { path = "../state", version = "0.8.66" }
+codewhale-tools = { path = "../tools", version = "0.8.66" }
 serde_json.workspace = true
+tracing.workspace = true
 uuid.workspace = true

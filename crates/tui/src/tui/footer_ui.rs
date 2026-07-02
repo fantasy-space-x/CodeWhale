@@ -3,10 +3,10 @@ use std::time::Instant;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
-use crate::core::coherence::CoherenceState;
+use crate::localization::{Locale, MessageId};
 use crate::palette;
 use crate::tools::subagent::SubAgentStatus;
-use crate::tui::app::App;
+use crate::tui::app::{App, TaskPanelEntryKind};
 use crate::tui::format_helpers;
 use crate::tui::history::{HistoryCell, ToolCell, ToolStatus, summarize_tool_output};
 use crate::tui::key_shortcuts;
@@ -16,6 +16,7 @@ use crate::tui::ui::{
     status_color,
 };
 use crate::tui::ui_text::{concise_shell_command_label, truncate_line_to_width};
+use crate::tui::widgets::tool_card::tool_activity_label_for_name;
 use crate::tui::widgets::{FooterProps, FooterToast, FooterWidget, Renderable};
 use crate::tui::workspace_context;
 
@@ -43,21 +44,12 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         None
     };
-    let toast = quit_prompt
-        .or_else(|| {
-            // Version-update hint takes precedence over ephemeral status toasts
-            // so the user sees it even when status traffic would hide it.
-            app.version_hint.as_ref().map(|hint| FooterToast {
-                text: hint.clone(),
-                color: palette::STATUS_INFO,
-            })
+    let toast = quit_prompt.or_else(|| {
+        app.active_status_toast().map(|toast| FooterToast {
+            text: toast.text,
+            color: status_color(toast.level),
         })
-        .or_else(|| {
-            app.active_status_toast().map(|toast| FooterToast {
-                text: toast.text,
-                color: status_color(toast.level),
-            })
-        });
+    });
 
     // Drive every cluster from the user's configured `status_items`. Mode
     // and Model are always rendered by `FooterProps` itself (their position
@@ -85,18 +77,13 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
             .turn_started_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        let mut label = active_subagent_status_label(app)
+        let active_subagent_label = active_subagent_status_label(app);
+        let mut label = active_subagent_label
+            .clone()
             .or_else(|| active_tool_status_label(app))
             .unwrap_or_else(|| {
-                // Show a more specific label when the model is still loading
-                // or compacting, not just a generic "working…".
-                let base = if app.is_loading {
-                    crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale)
-                } else if app.is_compacting {
-                    "compacting".to_string()
-                } else {
-                    crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale)
-                };
+                // Show the working label during active turns (loading, compacting, etc.).
+                let base = crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale);
                 if elapsed_secs > 0 {
                     format!("{base} ({elapsed_secs}s)")
                 } else {
@@ -108,6 +95,9 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
             label = format!("{label}  ({reason})");
         }
         props.state_label = label;
+        if active_subagent_label.is_some() {
+            props.agents.clear();
+        }
         props.state_color = palette::DEEPSEEK_SKY;
 
         // Water-spout frame source: wall-clock milliseconds. The sine-wave
@@ -119,7 +109,7 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
         if app.fancy_animations {
             props.working_strip_frame = Some(now_ms);
         }
-    } else if props.state_label == "ready"
+    } else if matches!(props.state_label.as_str(), "idle" | "ready")
         && let Some(label) = selected_detail_footer_label(app)
     {
         props.state_label = label;
@@ -134,22 +124,22 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
 /// Classify why a turn that has been running for > 30 s might appear stalled.
 /// Returns a short human-readable reason string, or `None` when the turn has
 /// not been running long enough to classify as stalled.
-pub(crate) fn stall_reason(app: &App) -> Option<&'static str> {
+pub(crate) fn stall_reason(app: &App) -> Option<String> {
     let elapsed = app.turn_started_at?.elapsed();
     if elapsed.as_secs() < 30 {
         return None;
     }
     if app.is_compacting {
-        return Some("compacting context");
+        return Some("compacting context".to_string());
     }
     if app.is_loading {
-        return Some("waiting for model");
+        return Some(provider_wait_reason(app));
     }
     if running_agent_count(app) > 0 {
-        return Some("sub-agents working");
+        return Some("sub-agents working".to_string());
     }
     if app.task_panel.iter().any(|task| task.status == "running") {
-        return Some("background jobs running");
+        return Some("background jobs running".to_string());
     }
     let active = app.active_cell.as_ref()?;
     if active.entries().iter().any(|cell| match cell {
@@ -165,12 +155,96 @@ pub(crate) fn stall_reason(app: &App) -> Option<&'static str> {
         },
         _ => false,
     }) {
-        return Some("tools executing");
+        return Some("tools executing".to_string());
     }
     if app.runtime_turn_status.as_deref() == Some("in_progress") {
-        return Some("waiting - no recent activity");
+        return Some("waiting - no recent activity".to_string());
     }
     None
+}
+
+/// Seconds the current turn has gone without observable stream activity.
+pub(crate) fn provider_wait_idle_secs(app: &App) -> u64 {
+    app.turn_last_activity_at
+        .or(app.turn_started_at)
+        .map(|at| at.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+/// Idle threshold (seconds) above which the footer surfaces the elapsed
+/// idle time during a provider wait.  Below this threshold the footer shows
+/// only the concise label without a running counter (#3189).
+const PROVIDER_WAIT_IDLE_SHOW_SECS: u64 = 60;
+
+/// `waiting for model` reason — kept short by default: only the label when
+/// the idle time is below [`PROVIDER_WAIT_IDLE_SHOW_SECS`].  Once the idle
+/// exceeds that threshold the elapsed seconds appear, and when the idle
+/// approaches the stream-idle budget the full `Ns/Ms idle timeout` detail
+/// surfaces so the user knows the stream is at risk of timing out (#3189).
+/// Provider and model stay in the header bar; the structured incident logger
+/// (`maybe_log_provider_wait_incident`) captures full diagnostics regardless
+/// of the footer copy.
+fn provider_wait_reason(app: &App) -> String {
+    let idle = provider_wait_idle_secs(app);
+    let budget = app.stream_chunk_timeout_secs;
+
+    if running_agent_count(app) == 0 {
+        if let Some((0, total)) = active_fanout_counts(app) {
+            return format!("waiting · fanout 0/{total}");
+        } else if app.pending_subagent_dispatch.is_some() {
+            return "waiting · dispatch pending".to_string();
+        }
+    }
+
+    let near_timeout = budget > 0 && idle >= budget.saturating_mul(3) / 4; // ≥ 75%
+    if near_timeout {
+        format!("waiting for model · {idle}s/{budget}s idle timeout")
+    } else if idle < PROVIDER_WAIT_IDLE_SHOW_SECS {
+        // Normal wait — no countdown noise.
+        "waiting for model".to_string()
+    } else {
+        // Significant idle — surface the elapsed seconds so the user can judge
+        // whether the stream is making progress.
+        format!("waiting for model · {idle}s")
+    }
+}
+
+/// Threshold after which a provider wait with a planned fanout is logged as
+/// a structured incident (once per turn).
+const PROVIDER_WAIT_INCIDENT_SECS: u64 = 120;
+
+/// Log a compact structured incident when the parent turn has spent a long
+/// time in provider wait while a sub-agent fanout plan is present (#3095).
+pub(crate) fn maybe_log_provider_wait_incident(app: &mut App) {
+    if app.provider_wait_incident_logged || !app.is_loading {
+        return;
+    }
+    let elapsed = match app.turn_started_at {
+        Some(at) => at.elapsed().as_secs(),
+        None => return,
+    };
+    if elapsed < PROVIDER_WAIT_INCIDENT_SECS {
+        return;
+    }
+    let fanout = active_fanout_counts(app);
+    let pending_dispatch = app.pending_subagent_dispatch.is_some();
+    if fanout.is_none() && !pending_dispatch {
+        return;
+    }
+    let (fanout_running, fanout_total) = fanout.unwrap_or((0, 0));
+    app.provider_wait_incident_logged = true;
+    crate::logging::warn(format!(
+        "provider-wait incident: provider={} model={} elapsed_secs={elapsed} \
+         idle_secs={} stream_idle_budget_secs={} max_subagents={} \
+         fanout_running={fanout_running} fanout_total={fanout_total} \
+         running_agents={} pending_dispatch={pending_dispatch}",
+        app.api_provider.as_str(),
+        app.model,
+        provider_wait_idle_secs(app),
+        app.stream_chunk_timeout_secs,
+        app.max_subagents,
+        running_agent_count(app),
+    ));
 }
 
 /// Whether the footer should animate the water-spout strip. Driven by the
@@ -183,7 +257,11 @@ pub(crate) fn stall_reason(app: &App) -> Option<&'static str> {
 /// though the agent is still working.
 pub(crate) fn footer_working_strip_active(app: &App) -> bool {
     let turn_in_progress = app.runtime_turn_status.as_deref() == Some("in_progress");
-    app.is_loading || app.is_compacting || running_agent_count(app) > 0 || turn_in_progress
+    app.is_loading
+        || app.is_compacting
+        || app.is_purging
+        || running_agent_count(app) > 0
+        || turn_in_progress
 }
 
 pub(crate) fn footer_working_label_frame(now_ms: u64, fancy_animations: bool) -> u64 {
@@ -192,7 +270,13 @@ pub(crate) fn footer_working_label_frame(now_ms: u64, fancy_animations: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::footer_working_label_frame;
+    use super::{
+        active_subagent_status_label, footer_state_label, footer_working_label_frame,
+        one_line_summary,
+    };
+    use crate::config::Config;
+    use crate::tui::app::{App, TuiOptions};
+    use std::path::PathBuf;
 
     #[test]
     fn footer_working_label_frame_is_static_without_fancy_animations() {
@@ -200,6 +284,160 @@ mod tests {
         assert_eq!(footer_working_label_frame(399, false), 0);
         assert_eq!(footer_working_label_frame(1_600, false), 0);
         assert_eq!(footer_working_label_frame(1_600, true), 4);
+    }
+
+    #[test]
+    fn one_line_summary_strips_ansi_before_collapsing_text() {
+        let summary = one_line_summary("read \x1b[38;2;6;174;242mfile.rs\x1b[0m", 80);
+        assert_eq!(summary, "read file.rs");
+        assert!(!summary.contains("38;2"));
+    }
+
+    #[test]
+    fn active_subagent_status_label_is_descriptive_without_shortcut_or_timer() {
+        let mut app = create_test_app();
+        app.agent_progress.insert(
+            "agent_live".to_string(),
+            "reading summary files".to_string(),
+        );
+
+        let label = active_subagent_status_label(&app).expect("active agent label");
+
+        assert_eq!(label, "agents 1/1 running · reading summary files");
+        assert!(!label.contains("Ctrl+Alt+4"));
+        assert!(!label.contains("0s"));
+    }
+
+    fn create_test_app() -> App {
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: PathBuf::from("."),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        App::new(options, &Config::default())
+    }
+
+    #[test]
+    fn footer_state_label_reports_paused_when_command_is_on_hold() {
+        let mut app = create_test_app();
+        app.is_loading = false;
+        app.paused = false;
+        app.paused_quarry = Some("Scan nested git repositories".to_string());
+
+        let (label, _) = footer_state_label(&app);
+        assert_eq!(
+            label, "paused \u{23F8}",
+            "footer should surface a paused command once the turn has drained, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn footer_state_label_reports_paused_via_app_flag_even_without_quarry() {
+        let mut app = create_test_app();
+        app.is_loading = false;
+        app.paused = true;
+        app.paused_quarry = None;
+
+        let (label, _) = footer_state_label(&app);
+        assert_eq!(
+            label, "paused \u{23F8}",
+            "footer should honor app.paused directly, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn footer_state_label_prefers_busy_while_pausing_and_loading() {
+        // While the turn is still draining the pause request, the coarse
+        // footer stays "busy"; the finer Pausing/Paused split lives in the
+        // sidebar. This guards against reintroducing a redundant vocabulary.
+        let mut app = create_test_app();
+        app.is_loading = true;
+        app.paused = true;
+        app.paused_quarry = Some("Deploy to staging".to_string());
+
+        let (label, _) = footer_state_label(&app);
+        assert_eq!(label, "busy");
+    }
+
+    #[test]
+    fn footer_state_label_falls_back_to_idle_at_rest() {
+        let app = create_test_app();
+        let (label, _) = footer_state_label(&app);
+        assert_eq!(label, "idle");
+    }
+
+    // #3189: provider-wait reason thresholds
+
+    #[test]
+    fn provider_wait_reason_fresh_show_only_label() {
+        let mut app = create_test_app();
+        app.stream_chunk_timeout_secs = 300;
+        app.turn_started_at = Some(std::time::Instant::now()); // < 60s
+        let reason = super::provider_wait_reason(&app);
+        assert_eq!(reason, "waiting for model");
+        assert!(!reason.contains("idle"));
+        assert!(!reason.contains("s/"));
+    }
+
+    #[test]
+    fn provider_wait_reason_thresholded_show_idle_seconds() {
+        let mut app = create_test_app();
+        app.stream_chunk_timeout_secs = 300;
+        // Simulate idle >= 60s
+        app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        let reason = super::provider_wait_reason(&app);
+        assert!(reason.contains("waiting for model"));
+        assert!(reason.contains("60s"));
+        // Should NOT show the full timeout budget yet (<75% of 300s = 225s)
+        assert!(!reason.contains("/300s"));
+    }
+
+    #[test]
+    fn provider_wait_reason_near_timeout_show_full_idle_budget() {
+        let mut app = create_test_app();
+        app.stream_chunk_timeout_secs = 300;
+        // ≥ 75% of 300s = 225s
+        app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(240));
+        let reason = super::provider_wait_reason(&app);
+        assert!(reason.contains("waiting for model"));
+        assert!(reason.contains("/300s idle timeout"));
+        assert!(reason.contains("240s"));
+    }
+
+    #[test]
+    fn provider_wait_reason_short_budget_still_shows_near_timeout() {
+        let mut app = create_test_app();
+        app.stream_chunk_timeout_secs = 30;
+        app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(25));
+        let reason = super::provider_wait_reason(&app);
+        assert!(reason.contains("waiting for model"));
+        assert!(reason.contains("25s/30s idle timeout"), "{reason}");
+    }
+
+    #[test]
+    fn provider_wait_reason_dispatch_pending() {
+        let mut app = create_test_app();
+        app.stream_chunk_timeout_secs = 300;
+        app.turn_started_at = Some(std::time::Instant::now());
+        app.pending_subagent_dispatch = Some("test".to_string());
+        let reason = super::provider_wait_reason(&app);
+        assert_eq!(reason, "waiting · dispatch pending");
     }
 }
 
@@ -261,17 +499,9 @@ pub(crate) fn active_subagent_status_label(app: &App) -> Option<String> {
         })
         .unwrap_or_else(|| "working".to_string());
     let detail = truncate_line_to_width(&detail, 34);
-    let elapsed = app
-        .agent_activity_started_at
-        .or(app.turn_started_at)
-        .map(|started| format!("{}s", started.elapsed().as_secs()));
-
-    let mut parts = vec![format!("agents {display_running}/{total}"), detail];
-    if let Some(elapsed) = elapsed {
-        parts.push(elapsed);
-    }
-    parts.push("Alt+4".to_string());
-    Some(parts.join(" \u{00B7} "))
+    Some(format!(
+        "agents {display_running}/{total} running \u{00B7} {detail}"
+    ))
 }
 
 #[derive(Default)]
@@ -317,7 +547,7 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
 
     let mut snapshot = ActiveToolStatusSnapshot::default();
     for cell in active.entries() {
-        collect_active_tool_status(cell, &mut snapshot);
+        collect_active_tool_status(cell, &mut snapshot, app.ui_locale);
     }
     if snapshot.total() == 0 {
         return None;
@@ -344,11 +574,15 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
     if active_foreground_shell_running(app) {
         parts.push("Ctrl+B shell".to_string());
     }
-    parts.push(key_shortcuts::tool_details_shortcut_label().to_string());
+    parts.push(key_shortcuts::tool_details_shortcut_action_hint("details"));
     Some(parts.join(" \u{00B7} "))
 }
 
-fn collect_active_tool_status(cell: &HistoryCell, snapshot: &mut ActiveToolStatusSnapshot) {
+fn collect_active_tool_status(
+    cell: &HistoryCell,
+    snapshot: &mut ActiveToolStatusSnapshot,
+    locale: Locale,
+) {
     let HistoryCell::Tool(tool) = cell else {
         return;
     };
@@ -400,17 +634,23 @@ fn collect_active_tool_status(cell: &HistoryCell, snapshot: &mut ActiveToolStatu
             // status. RLM is different today: it is a foreground tool call,
             // so keep it in the live tool footer until the async RLM
             // workbench lands (#513).
-            if matches!(generic.name.as_str(), "agent_open" | "agent_spawn") {
+            if generic.name == "agent" {
                 return;
             }
-            snapshot.record(format!("tool {}", generic.name), generic.status, None);
+            snapshot.record(
+                tool_activity_label_for_name(&generic.name, locale),
+                generic.status,
+                None,
+            );
         }
     }
 }
 
 pub(crate) fn one_line_summary(text: &str, max_width: usize) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
     truncate_line_to_width(
-        &text.split_whitespace().collect::<Vec<_>>().join(" "),
+        &cleaned.split_whitespace().collect::<Vec<_>>().join(" "),
         max_width,
     )
 }
@@ -442,11 +682,6 @@ pub(crate) fn render_footer_from(
         ("ready", app.ui_theme.text_muted)
     };
 
-    let coherence = if has(S::Coherence) {
-        footer_coherence_spans(app)
-    } else {
-        Vec::new()
-    };
     let agents = if has(S::Agents) {
         crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale)
     } else {
@@ -473,6 +708,11 @@ pub(crate) fn render_footer_from(
     } else {
         Vec::new()
     };
+    let balance = if has(S::Balance) {
+        footer_balance_spans(app)
+    } else {
+        Vec::new()
+    };
 
     // Build the props; `Mode` and `Model` toggles modulate downstream by
     // blanking the rendered text rather than restructuring the widget — the
@@ -482,11 +722,11 @@ pub(crate) fn render_footer_from(
         toast,
         state_label,
         state_color,
-        coherence,
         agents,
         reasoning_replay,
         cache,
         cost,
+        balance,
     );
     if !has(S::Mode) {
         props.mode_label = "";
@@ -495,9 +735,9 @@ pub(crate) fn render_footer_from(
         props.model.clear();
     }
 
-    // Shell-running chip: visible whenever a foreground shell command is
-    // active, regardless of user-configured status items.
-    let shell_chip = crate::tui::widgets::footer_shell_chip(active_foreground_shell_running(app));
+    // Shell-running chip: visible whenever foreground or background shell work
+    // is active, regardless of user-configured status items.
+    let shell_chip = footer_shell_spans(app);
 
     // Right-cluster extension chips: append in `items` order so user
     // ordering is preserved across the new variants.
@@ -538,13 +778,71 @@ pub(crate) fn render_footer_from(
 }
 
 pub(crate) fn footer_git_branch_spans(app: &App) -> Vec<Span<'static>> {
-    let Some(branch) = workspace_context::branch(&app.workspace) else {
+    // Identity is sourced strictly from workspace/git detection (the cached
+    // "branch | status" context and the workspace path) — never from
+    // provider/model/config text (#3188). The cached context being `None`
+    // means "not a git repo", which we surface as an explicit non-repo state
+    // rather than an empty `Repo:` label.
+    //
+    // We render the full `Repo: <name> @ <branch>` identity and let the footer
+    // widget clip the whole bar to the real terminal width (matching the prior
+    // branch-only chip, which also emitted its full string). The width-aware
+    // `format_repo_identity` truncation policy is exercised in unit tests with
+    // explicit widths; here we pass an effectively unbounded budget so a normal
+    // branch name is never dropped on a wide terminal.
+    let identity =
+        workspace_context::identity_from_context(&app.workspace, app.workspace_context.as_deref());
+    let label = workspace_context::format_repo_identity(&identity, usize::MAX);
+    if label.is_empty() {
         return Vec::new();
-    };
+    }
     vec![Span::styled(
-        branch,
+        label,
         Style::default().fg(app.ui_theme.text_muted),
     )]
+}
+
+fn footer_shell_spans(app: &App) -> Vec<Span<'static>> {
+    if let Some(label) = active_foreground_shell_label(app) {
+        return crate::tui::widgets::footer_shell_label_chip(label);
+    }
+
+    let mut running = app.task_panel.iter().filter(|task| {
+        task.kind == TaskPanelEntryKind::Background
+            && task.status == "running"
+            && task.id.starts_with("shell_")
+    });
+    let Some(first) = running.next() else {
+        return Vec::new();
+    };
+    let extra = running.count();
+    let command = first
+        .prompt_summary
+        .strip_prefix("shell: ")
+        .unwrap_or(first.prompt_summary.as_str());
+    let label = if extra == 0 {
+        format!("shell bg: {}", concise_shell_command_label(command, 48))
+    } else {
+        format!("shell bg: {} jobs", extra + 1)
+    };
+    crate::tui::widgets::footer_shell_label_chip(label)
+}
+
+fn active_foreground_shell_label(app: &App) -> Option<String> {
+    let active = app.active_cell.as_ref()?;
+    active.entries().iter().find_map(|cell| {
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = cell else {
+            return None;
+        };
+        if exec.status == ToolStatus::Running && exec.interaction.is_none() {
+            Some(format!(
+                "shell fg: {}",
+                concise_shell_command_label(&exec.command, 48)
+            ))
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn footer_prefix_stability_spans(app: &App) -> Vec<Span<'static>> {
@@ -595,28 +893,53 @@ pub(crate) fn footer_cost_spans(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
+pub(crate) fn footer_balance_spans(app: &App) -> Vec<Span<'static>> {
+    let balance = match app.balance_cell.lock() {
+        Ok(guard) => guard,
+        Err(_) => return Vec::new(),
+    };
+    let info = match balance.as_ref() {
+        Some(info) => info,
+        None => return Vec::new(),
+    };
+    let total = match info.total_balance_f64() {
+        Some(total) if total > 0.0 => total,
+        _ => return Vec::new(),
+    };
+    let currency = match info.currency.as_str() {
+        "CNY" | "cny" => "¥",
+        _ => "$",
+    };
+    let prefix = app.tr(MessageId::FooterBalancePrefix);
+    let label = if total >= 1000.0 {
+        format!("{prefix} {currency}{total:.0}")
+    } else if total >= 10.0 {
+        format!("{prefix} {currency}{total:.1}")
+    } else {
+        format!("{prefix} {currency}{total:.2}")
+    };
+    vec![Span::styled(
+        label,
+        Style::default().fg(palette::TEXT_MUTED),
+    )]
+}
+
 pub(crate) fn should_show_footer_cost(displayed_cost: f64) -> bool {
     displayed_cost.is_finite() && displayed_cost > 0.0
 }
 
 /// Session token-usage chip for the footer right cluster.
 ///
-/// Renders the accumulated input / cache-hit / output token breakdown
-/// since the current runtime session started (not persisted across
-/// restarts). Returns empty when no tokens have been recorded yet.
+/// Renders a compact accumulated token count for the current runtime session.
+/// Detailed cache stats live in the separate `cache` chip.
 pub(crate) fn footer_session_tokens_spans(app: &App) -> Vec<Span<'static>> {
     let session = &app.session;
     if session.total_input_tokens == 0 && session.total_output_tokens == 0 {
         return Vec::new();
     }
-    let in_str = format_token_count_compact(u64::from(session.total_input_tokens));
-    let out_str = format_token_count_compact(u64::from(session.total_output_tokens));
-    let text = if session.total_cache_hit_tokens == 0 && session.total_cache_miss_tokens == 0 {
-        format!("{in_str} in · {out_str} out")
-    } else {
-        let cache_str = format_token_count_compact(u64::from(session.total_cache_hit_tokens));
-        format!("{in_str} in · {cache_str} cch · {out_str} out")
-    };
+    let total = u64::from(session.total_input_tokens)
+        .saturating_add(u64::from(session.total_output_tokens));
+    let text = format!("tok {}", format_token_count_compact(total));
     vec![Span::styled(text, Style::default().fg(palette::TEXT_MUTED))]
 }
 
@@ -628,9 +951,8 @@ pub(crate) fn footer_session_tokens_spans(app: &App) -> Vec<Span<'static>> {
 pub(crate) fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'static>> {
     // Context % is already shown in the header signal bar — don't
     // duplicate it in the footer. The footer carries unique info only:
-    // prefix stability, coherence, in-flight sub-agents, reasoning
-    // replay tokens, cache hit rate, and session cost.
-    let coherence_spans = footer_coherence_spans(app);
+    // prefix stability, in-flight sub-agents, reasoning replay tokens, cache
+    // hit rate, and session cost.
     let agents_spans =
         crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale);
     let replay_spans = footer_reasoning_replay_spans(app);
@@ -647,10 +969,9 @@ pub(crate) fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'s
         })
         .unwrap_or_default();
 
-    let shell_spans = crate::tui::widgets::footer_shell_chip(active_foreground_shell_running(app));
+    let shell_spans = footer_shell_spans(app);
 
     let parts: Vec<&Vec<Span<'static>>> = [
-        &coherence_spans,
         &agents_spans,
         &replay_spans,
         &prefix_spans,
@@ -677,22 +998,6 @@ pub(crate) fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'s
         }
     }
     Vec::new()
-}
-
-pub(crate) fn footer_coherence_spans(app: &App) -> Vec<Span<'static>> {
-    // Only surface coherence when the engine is actively intervening — the
-    // user-facing signal is "we're doing something different now," not
-    // "your conversation is getting complex," which the context-percent
-    // header already covers. `GettingCrowded` is just a soft hint, so we
-    // suppress it; the active interventions get their own visible label.
-    let (label, color) = match app.coherence_state {
-        CoherenceState::Healthy | CoherenceState::GettingCrowded => return Vec::new(),
-        CoherenceState::RefreshingContext => ("refreshing context", palette::STATUS_WARNING),
-        CoherenceState::VerifyingRecentWork => ("verifying", palette::DEEPSEEK_SKY),
-        CoherenceState::ResettingPlan => ("resetting plan", palette::STATUS_ERROR),
-    };
-
-    vec![Span::styled(label.to_string(), Style::default().fg(color))]
 }
 
 pub(crate) fn footer_cache_spans(app: &App) -> Vec<Span<'static>> {
@@ -820,18 +1125,39 @@ pub(crate) fn footer_status_line_spans(app: &App, max_width: usize) -> Vec<Span<
 }
 
 pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Color) {
+    if app.is_fallback_active() {
+        return ("fallback ->", app.ui_theme.status_warning);
+    }
     if app.is_compacting {
         return ("compacting \u{238B}", app.ui_theme.status_warning);
     }
-    // Note: we deliberately do NOT show a "thinking" label for `is_loading`.
-    // The animated water-spout strip in the footer's spacer is the visual
-    // signal that the model is live; "thinking" was misleading because it
-    // fired for every kind of in-flight work (tool calls, streaming, etc.),
-    // not strictly reasoning. Sub-agents still surface "working" because
-    // that's a distinct lifecycle the user can act on (open `/agents`).
+    if app.is_purging {
+        return ("purging \u{238B}", app.ui_theme.status_warning);
+    }
+    if app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")) {
+        return ("busy", app.ui_theme.status_working);
+    }
+    // Note: we deliberately do NOT show a "thinking" label for live turns.
+    // Busy can mean model bytes, tool calls, approval waits, or sub-agents;
+    // the label should be a state indicator, not an invented activity.
+    // Sub-agents still surface "working" because that's a distinct lifecycle
+    // the user can act on (open `/agents`).
     if running_agent_count(app) > 0 {
         return ("working", app.ui_theme.status_working);
     }
+    // A paused pausable command is an actionable state even after the turn's
+    // tools have drained: the user can resume or ESC-to-cancel. Without this
+    // branch the footer would read "idle" while a command is on hold, so the
+    // pause state would only be visible in the Work sidebar. The sidebar's
+    // `live_pause_indicator` keeps the finer "(Pausing)" vs "(Paused)" split;
+    // here we surface a single coarse "paused" state because the `busy` branch
+    // above already covers the draining transition. `paused_quarry` is checked
+    // alongside `app.paused` so the label survives the turn-end window where
+    // `app.paused` has been cleared but the hold is still resumable.
+    if app.paused || app.paused_quarry.is_some() {
+        return ("paused \u{23F8}", app.ui_theme.status_warning);
+    }
+
     if app.queued_draft.is_some() {
         return ("draft", app.ui_theme.text_muted);
     }
@@ -844,7 +1170,7 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
         return ("draft", app.ui_theme.text_muted);
     }
 
-    ("ready", app.ui_theme.status_ready)
+    ("idle", app.ui_theme.status_ready)
 }
 
 #[cfg(test)]
@@ -852,6 +1178,7 @@ pub(crate) fn footer_mode_style(app: &App) -> (&'static str, ratatui::style::Col
     let label = app.mode.as_setting();
     let color = match app.mode {
         crate::tui::app::AppMode::Agent => app.ui_theme.mode_agent,
+        crate::tui::app::AppMode::Auto => app.ui_theme.mode_agent,
         crate::tui::app::AppMode::Yolo => app.ui_theme.mode_yolo,
         crate::tui::app::AppMode::Plan => app.ui_theme.mode_plan,
     };

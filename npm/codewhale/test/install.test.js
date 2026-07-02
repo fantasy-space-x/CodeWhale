@@ -10,6 +10,7 @@ const installScript = fs.readFileSync(
   "utf8",
 );
 const { installFailureHint, _internal } = require("../scripts/install");
+const { _internal: glibcInternal } = require("../scripts/preflight-glibc");
 
 function sha256(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
@@ -111,6 +112,50 @@ test("install failure hint checks configured release base when override is alrea
   }
 });
 
+test("glibc preflight message is CodeWhale-branded and actionable", () => {
+  const message = glibcInternal.glibcCompatibilityMessage([2, 39, 0], [2, 35, 0]);
+
+  assert.match(message, /Prebuilt CodeWhale Linux binaries require GLIBC_2\.39/);
+  assert.match(message, /this system has glibc 2\.35/);
+  assert.match(message, /cargo install codewhale-cli --locked/);
+  assert.match(message, /Linux x64 release asset is a static \(musl\) build/);
+  assert.match(message, /arm64 and riscv64 assets are GNU libc builds/);
+  assert.match(message, /CODEWHALE_SKIP_GLIBC_CHECK=1/);
+});
+
+test("glibc preflight accepts canonical and legacy skip env vars", () => {
+  const previousCodewhale = process.env.CODEWHALE_SKIP_GLIBC_CHECK;
+  const previousTui = process.env.DEEPSEEK_TUI_SKIP_GLIBC_CHECK;
+  const previousLegacy = process.env.DEEPSEEK_SKIP_GLIBC_CHECK;
+  delete process.env.CODEWHALE_SKIP_GLIBC_CHECK;
+  delete process.env.DEEPSEEK_TUI_SKIP_GLIBC_CHECK;
+  delete process.env.DEEPSEEK_SKIP_GLIBC_CHECK;
+  try {
+    assert.equal(glibcInternal.skipGlibcCheck(), false);
+    process.env.CODEWHALE_SKIP_GLIBC_CHECK = "1";
+    assert.equal(glibcInternal.skipGlibcCheck(), true);
+    delete process.env.CODEWHALE_SKIP_GLIBC_CHECK;
+    process.env.DEEPSEEK_TUI_SKIP_GLIBC_CHECK = "1";
+    assert.equal(glibcInternal.skipGlibcCheck(), true);
+  } finally {
+    if (previousCodewhale === undefined) {
+      delete process.env.CODEWHALE_SKIP_GLIBC_CHECK;
+    } else {
+      process.env.CODEWHALE_SKIP_GLIBC_CHECK = previousCodewhale;
+    }
+    if (previousTui === undefined) {
+      delete process.env.DEEPSEEK_TUI_SKIP_GLIBC_CHECK;
+    } else {
+      process.env.DEEPSEEK_TUI_SKIP_GLIBC_CHECK = previousTui;
+    }
+    if (previousLegacy === undefined) {
+      delete process.env.DEEPSEEK_SKIP_GLIBC_CHECK;
+    } else {
+      process.env.DEEPSEEK_SKIP_GLIBC_CHECK = previousLegacy;
+    }
+  }
+});
+
 test("ensureBinary adopts a manually placed target binary after checksum validation", async (t) => {
   const dir = await makeTempDir(t);
   const target = path.join(dir, process.platform === "win32" ? "codewhale.exe" : "codewhale");
@@ -177,4 +222,44 @@ test("manual binaries with mismatched checksums are not adopted", async (t) => {
 
   assert.equal(adopted, false);
   assert.equal(await exists(`${target}.version`), false);
+});
+
+test("resolvePackageVersion honors codewhaleBinaryVersion precedence (#3769)", () => {
+  const { resolvePackageVersion } = _internal;
+
+  // codewhaleBinaryVersion wins over deepseekBinaryVersion and pkg.version.
+  assert.equal(
+    resolvePackageVersion(
+      {
+        codewhaleBinaryVersion: "1.2.3",
+        deepseekBinaryVersion: "0.0.1",
+        version: "9.9.9",
+      },
+      {},
+    ),
+    "1.2.3",
+  );
+
+  // Falls back to deepseekBinaryVersion, then pkg.version.
+  assert.equal(
+    resolvePackageVersion({ deepseekBinaryVersion: "0.0.1", version: "9.9.9" }, {}),
+    "0.0.1",
+  );
+  assert.equal(resolvePackageVersion({ version: "9.9.9" }, {}), "9.9.9");
+
+  // Legacy env vars still take precedence over package fields, unchanged.
+  assert.equal(
+    resolvePackageVersion(
+      { codewhaleBinaryVersion: "1.2.3", version: "9.9.9" },
+      { DEEPSEEK_TUI_VERSION: "7.7.7" },
+    ),
+    "7.7.7",
+  );
+  assert.equal(
+    resolvePackageVersion(
+      { codewhaleBinaryVersion: "1.2.3" },
+      { DEEPSEEK_VERSION: "8.8.8" },
+    ),
+    "8.8.8",
+  );
 });

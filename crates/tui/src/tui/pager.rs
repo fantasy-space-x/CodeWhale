@@ -26,13 +26,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
-use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
-
-/// Footer hint shown along the bottom border of the pager. Kept short so it
-/// fits on narrow terminals; full reference lives in the module docs.
-const FOOTER_HINT_NAV: &str =
-    " j/k scroll  Space page  Ctrl+D/U half  g/G top/bottom  / search  c copy";
-const FOOTER_HINT_EXIT: &str = " q/Esc close ";
+use crate::tui::views::{
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
+};
 
 pub struct PagerView {
     title: String,
@@ -388,10 +384,33 @@ impl ModalView for PagerView {
 
         Clear.render(popup_area, buf);
 
-        // Borders eat 1 row top + 1 row bottom; the block's `Padding::uniform(1)`
-        // eats 1 more on each side. Net: 4 rows of overhead to subtract from
-        // `popup_area.height` before we know how many lines fit.
-        let mut visible_height = popup_area.height.saturating_sub(4) as usize;
+        let block = Block::default()
+            .title(self.title.clone())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .padding(Padding::uniform(1));
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        // The wrapping action footer is anchored to the bottom of the inner
+        // area; the body fills the rows above it.
+        let content = render_modal_footer(
+            inner,
+            buf,
+            &[
+                ActionHint::new("q/Esc", "close"),
+                ActionHint::new("j/k", "scroll"),
+                ActionHint::new("Space", "page"),
+                ActionHint::new("Ctrl+D/U", "half"),
+                ActionHint::new("g/G", "top/bottom"),
+                ActionHint::new("/", "search"),
+                ActionHint::new("c", "copy"),
+            ],
+        );
+
+        // `content` already excludes the border, padding, and footer rows.
+        let mut visible_height = content.height as usize;
         if self.search_mode {
             // Reserve a row for the search prompt that gets pushed below.
             visible_height = visible_height.saturating_sub(1);
@@ -467,26 +486,8 @@ impl ModalView for PagerView {
             )));
         }
 
-        let footer = Line::from(vec![
-            Span::styled(
-                FOOTER_HINT_EXIT,
-                Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(FOOTER_HINT_NAV, Style::default().fg(palette::TEXT_HINT)),
-        ]);
-        let block = Block::default()
-            .title(self.title.clone())
-            .title_bottom(footer)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .padding(Padding::uniform(1));
-
-        let paragraph = Paragraph::new(visible_lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
-        paragraph.render(popup_area, buf);
+        let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+        paragraph.render(content, buf);
     }
 }
 
@@ -764,22 +765,35 @@ mod tests {
 
     #[test]
     fn footer_hint_includes_new_bindings() {
-        // The rendered pager must surface the new vim-style bindings to
-        // the user; check the footer hint covers the headline keys.
+        // The rendered pager must surface the new vim-style bindings to the
+        // user. The footer is now a wrapping ActionHint row inside the modal
+        // body (not the bottom border), so assert against the rendered buffer.
+        let p = make_pager(5);
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
         for needle in &[
             "j/k",
+            "scroll",
             "g/G",
+            "top/bottom",
             "Space",
-            "Ctrl+D",
-            "/ search",
-            "c copy",
-            "q/Esc close",
+            "page",
+            "Ctrl+D/U",
+            "half",
+            "search",
+            "copy",
+            "q/Esc",
+            "close",
         ] {
-            let full_hint = format!("{FOOTER_HINT_EXIT}{FOOTER_HINT_NAV}");
-            assert!(
-                full_hint.contains(needle),
-                "footer hint missing {needle:?}: {full_hint}"
-            );
+            assert!(text.contains(needle), "footer hint missing {needle:?}");
         }
     }
 
@@ -830,17 +844,19 @@ mod tests {
         let area = Rect::new(0, 0, 100, 10);
         let mut buf = Buffer::empty(area);
         p.render(area, &mut buf);
-        // The pager renders into an inset popup_area = (1, 1, w-2, h-2),
-        // so the bottom border lives at y = popup_area.bottom() - 1, not
-        // at the outer area's last row.
-        let popup_bottom_y = (area.height as usize).saturating_sub(2);
-        let mut bottom = String::new();
-        for x in 1..area.right().saturating_sub(1) {
-            bottom.push_str(buf[(x, popup_bottom_y as u16)].symbol());
+        // The footer is now anchored to the bottom of the modal body (above the
+        // padding/border) rather than painted on the border, so scan the whole
+        // frame for the action labels.
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
         }
         assert!(
-            bottom.contains("close") || bottom.contains("scroll"),
-            "expected footer hint on bottom border row {popup_bottom_y}, got: {bottom:?}"
+            text.contains("close") || text.contains("scroll"),
+            "expected footer hint in rendered pager, got:\n{text}"
         );
     }
 
@@ -1011,6 +1027,59 @@ mod tests {
         }
 
         assert_eq!(p.scroll, bottom);
+    }
+
+    #[test]
+    fn pager_is_usable_and_opaque_at_blocker_sizes() {
+        use crate::tui::views::ViewStack;
+
+        const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
+        for (w, h) in BLOCKER_SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[(x, y)].set_symbol("X");
+                }
+            }
+            let mut stack = ViewStack::new();
+            stack.push(make_pager(60));
+            stack.render(area, &mut buf);
+
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let text = rows.join("\n");
+
+            // Footer keeps every action.
+            for label in [
+                "close",
+                "scroll",
+                "page",
+                "half",
+                "top/bottom",
+                "search",
+                "copy",
+            ] {
+                assert!(text.contains(label), "{w}x{h}: footer missing '{label}'");
+            }
+
+            // Composited frame is fully opaque.
+            assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
+            assert_eq!(
+                buf[(w / 2, h / 2)].bg,
+                palette::DEEPSEEK_INK,
+                "{w}x{h}: modal interior must be opaque"
+            );
+
+            // No horizontal overflow.
+            for (y, row) in rows.iter().enumerate() {
+                assert!(
+                    UnicodeWidthStr::width(row.trim_end()) <= w as usize,
+                    "{w}x{h}: row {y} overflows width: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

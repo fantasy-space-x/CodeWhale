@@ -20,6 +20,16 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Try to send an operation without blocking.
+    ///
+    /// Returns `Err` if the channel is full or closed.  Use this for
+    /// non-critical, refresh-type ops (e.g. `Op::ListSubAgents`) that can
+    /// safely be dropped and re-requested on the next drain cycle.
+    pub fn try_send(&self, op: Op) -> Result<()> {
+        self.tx_op.try_send(op)?;
+        Ok(())
+    }
+
     /// Cancel the current request (user-initiated path — keeps the
     /// public `cancel()` signature stable). Equivalent to
     /// `cancel_with_reason(CancelReason::User)`.
@@ -38,6 +48,7 @@ impl EngineHandle {
             Ok(token) => token.cancel(),
             Err(poisoned) => poisoned.into_inner().cancel(),
         }
+        crate::retry_status::clear();
     }
 
     /// Check if a request is currently cancelled
@@ -47,6 +58,24 @@ impl EngineHandle {
         match self.cancel_token.lock() {
             Ok(token) => token.is_cancelled(),
             Err(poisoned) => poisoned.into_inner().is_cancelled(),
+        }
+    }
+
+    /// Pause or resume the current pausable command.
+    pub fn set_paused(&self, paused: bool) {
+        match self.shared_paused.lock() {
+            Ok(mut slot) => *slot = paused,
+            Err(poisoned) => *poisoned.into_inner() = paused,
+        }
+    }
+
+    /// Check whether the engine pause gate is set.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        match self.shared_paused.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
         }
     }
 
@@ -108,5 +137,27 @@ impl EngineHandle {
     pub async fn steer(&self, content: impl Into<String>) -> Result<()> {
         self.tx_steer.send(content.into()).await?;
         Ok(())
+    }
+
+    /// Request a snapshot of the current session state.
+    /// Returns the snapshot directly via a oneshot channel, avoiding
+    /// competition with the SSE event stream on the mpsc receiver.
+    pub async fn get_session_snapshot(&self) -> Result<crate::core::ops::SessionSnapshot> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::GetSessionSnapshot { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped session snapshot oneshot"))
+    }
+
+    /// Request active provider request concurrency state.
+    pub async fn get_provider_runtime_status(
+        &self,
+    ) -> Result<crate::core::ops::ProviderRuntimeStatus> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::GetProviderRuntimeStatus { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped provider runtime status oneshot"))
     }
 }

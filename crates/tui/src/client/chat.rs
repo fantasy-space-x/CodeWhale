@@ -1,22 +1,20 @@
 //! Chat Completions API helpers for DeepSeek's OpenAI-compatible endpoint.
 //!
 //! This is the production code path. Streaming (`create_message_stream`),
-//! request building (`build_chat_messages*`), and SSE parsing (`parse_sse_chunk`)
-//! all live here.
+//! request building (`build_chat_messages*`), and SSE parsing
+//! (`parse_sse_chunk_with_reasoning_style`) all live here.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::time::timeout as tokio_timeout;
 
-/// Default idle timeout for SSE stream reads (300 seconds = 5 minutes).
-/// After this period with no data, the stream is considered stalled and
-/// yields a recoverable error so the caller can retry.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+use crate::config::wire_model_for_provider;
 
 /// Default timeout for the initial streaming response headers.
 ///
@@ -45,43 +43,117 @@ fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Reads the `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var, falling back to
-/// the default 300s. The parsed value is clamped to [1, 3600] seconds.
-fn stream_idle_timeout() -> Duration {
-    let secs = std::env::var("DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT.as_secs())
-        .clamp(1, 3600);
-    Duration::from_secs(secs)
-}
-
 use crate::config::ApiProvider;
 use crate::llm_client::StreamEventBox;
+use crate::llm_client::sanitize_http_error_body;
 use crate::logging;
 use crate::models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
-    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage,
+    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, model_is_openai_reasoning_family,
+    model_supports_reasoning,
 };
 
 use super::{
     DeepSeekClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
-    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url,
+    SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer, api_url_with_suffix,
     apply_reasoning_effort, bounded_error_text, from_api_tool_name, parse_usage,
     release_stream_buffer, system_to_instructions, to_api_tool_name,
 };
+
+fn apply_provider_token_limit(
+    body: &mut Value,
+    provider: ApiProvider,
+    model: &str,
+    max_tokens: u32,
+) {
+    let use_max_completion_tokens = provider == ApiProvider::XiaomiMimo
+        || (provider == ApiProvider::Openai && model_is_openai_reasoning_family(model));
+    if !use_max_completion_tokens {
+        return;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_tokens");
+    }
+    body["max_completion_tokens"] = json!(max_tokens);
+}
+
+fn apply_openai_reasoning_effort(
+    body: &mut Value,
+    provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) {
+    if provider != ApiProvider::Openai || !model_is_openai_reasoning_family(model) {
+        return;
+    }
+    let Some(effort) = effort.and_then(openai_chat_reasoning_effort) else {
+        return;
+    };
+    body["reasoning_effort"] = json!(effort);
+}
+
+fn openai_chat_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" => Some("none"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "mid" | "" => Some("medium"),
+        "high" => Some("high"),
+        "max" | "highest" | "xhigh" | "ultracode" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+fn mirror_minimax_reasoning_details_for_messages(messages: &mut [Value]) {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message.get("reasoning_details").is_some() {
+            continue;
+        }
+        let Some(reasoning) = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.trim().is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        message["reasoning_details"] = json!([
+            {
+                "type": "text",
+                "text": reasoning,
+            }
+        ]);
+    }
+}
+
+fn mirror_minimax_reasoning_details_for_body(body: &mut Value, provider: ApiProvider) {
+    if provider != ApiProvider::Minimax {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    mirror_minimax_reasoning_details_for_messages(messages);
+}
 
 impl DeepSeekClient {
     pub(super) async fn create_message_chat(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
+        let cacheable = crate::llm_response_cache::request_is_cacheable(request);
         let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
+        let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model.clone(),
             "messages": messages,
             "max_tokens": request.max_tokens,
         });
+        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -90,14 +162,27 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(
-                tools
-                    .iter()
-                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                    .collect::<Vec<_>>()
-            );
+            let mut chat_tools: Vec<_> = tools
+                .iter()
+                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                .collect();
+            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
+            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
+                for t in &mut chat_tools {
+                    if let Some(fn_obj) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.get_mut("parameters"))
+                    {
+                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
+                    }
+                }
+            }
+            body["tools"] = json!(chat_tools);
         }
-        if let Some(choice) = request.tool_choice.as_ref()
+        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
+            && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
         {
             body["tool_choice"] = mapped;
@@ -107,8 +192,37 @@ impl DeepSeekClient {
             request.reasoning_effort.as_deref(),
             self.api_provider,
         );
+        apply_openai_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &model,
+            request.reasoning_effort.as_deref(),
+        );
+        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
-        let url = api_url(&self.base_url, "chat/completions");
+        let response_cache_key = if cacheable {
+            let wire_body =
+                serde_json::to_vec(&body).context("Failed to serialize Chat API cache key")?;
+            let key = crate::llm_response_cache::ResponseCache::make_key(
+                self.api_provider.as_str(),
+                &self.base_url,
+                self.path_suffix.as_deref(),
+                &self.api_key,
+                &wire_body,
+            );
+            if let Some(cached) = crate::llm_response_cache::response_cache().get(&key) {
+                return Ok(cached);
+            }
+            Some(key)
+        } else {
+            None
+        };
+
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
         let open_timeout = stream_open_timeout();
         let response = match tokio_timeout(
             open_timeout,
@@ -129,14 +243,26 @@ impl DeepSeekClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             anyhow::bail!("Failed to call DeepSeek Chat API: HTTP {status}: {error_text}");
         }
 
-        let response_text = response.text().await.unwrap_or_default();
+        let response_text = response
+            .text()
+            .await
+            .context("Failed to read Chat API response body")?;
         let value: Value =
             serde_json::from_str(&response_text).context("Failed to parse Chat API JSON")?;
-        parse_chat_message(&value)
+        let parsed = parse_chat_message(&value)?;
+        if let Some(key) = response_cache_key {
+            crate::llm_response_cache::response_cache().put(key, parsed.clone());
+        }
+        Ok(parsed)
     }
 }
 
@@ -147,8 +273,9 @@ impl DeepSeekClient {
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
         let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
+        let model = wire_model_for_provider(self.api_provider, &request.model);
         let mut body = json!({
-            "model": request.model,
+            "model": model.clone(),
             "messages": messages,
             "max_tokens": request.max_tokens,
             "stream": true,
@@ -156,6 +283,7 @@ impl DeepSeekClient {
                 "include_usage": true
             },
         });
+        apply_provider_token_limit(&mut body, self.api_provider, &model, request.max_tokens);
 
         if let Some(temperature) = request.temperature {
             body["temperature"] = json!(temperature);
@@ -164,14 +292,27 @@ impl DeepSeekClient {
             body["top_p"] = json!(top_p);
         }
         if let Some(tools) = request.tools.as_ref() {
-            body["tools"] = json!(
-                tools
-                    .iter()
-                    .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
-                    .collect::<Vec<_>>()
-            );
+            let mut chat_tools: Vec<_> = tools
+                .iter()
+                .map(|tool| tool_to_chat_for_base_url(tool, &self.base_url))
+                .collect();
+            // Kimi / Moonshot enforces stricter JSON Schema: `type` must be
+            // inside `anyOf` / `oneOf` items, not on the parent (#2438).
+            if matches!(self.api_provider, crate::config::ApiProvider::Moonshot) {
+                for t in &mut chat_tools {
+                    if let Some(fn_obj) = t
+                        .as_object_mut()
+                        .and_then(|t| t.get_mut("function"))
+                        .and_then(|f| f.get_mut("parameters"))
+                    {
+                        crate::tools::schema_sanitize::sanitize_for_kimi_parameters(fn_obj);
+                    }
+                }
+            }
+            body["tools"] = json!(chat_tools);
         }
-        if let Some(choice) = request.tool_choice.as_ref()
+        if should_send_tool_choice_for_chat(self.api_provider, request.reasoning_effort.as_deref())
+            && let Some(choice) = request.tool_choice.as_ref()
             && let Some(mapped) = map_tool_choice_for_chat(choice)
         {
             body["tool_choice"] = mapped;
@@ -180,6 +321,12 @@ impl DeepSeekClient {
             &mut body,
             request.reasoning_effort.as_deref(),
             self.api_provider,
+        );
+        apply_openai_reasoning_effort(
+            &mut body,
+            self.api_provider,
+            &model,
+            request.reasoning_effort.as_deref(),
         );
 
         // Bulletproof final sanitizer: walk the wire payload and force
@@ -192,19 +339,29 @@ impl DeepSeekClient {
         // still produces a valid request.
         let replay_input_tokens = sanitize_thinking_mode_messages(
             &mut body,
-            &request.model,
+            &model,
             request.reasoning_effort.as_deref(),
             self.api_provider,
         );
+        mirror_minimax_reasoning_details_for_body(&mut body, self.api_provider);
 
-        let url = api_url(&self.base_url, "chat/completions");
+        let url = api_url_with_suffix(
+            &self.base_url,
+            "chat/completions",
+            self.path_suffix.as_deref(),
+        );
         let response = self
             .send_with_retry(|| self.http_client.post(&url).json(&body))
             .await?;
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let raw_error_text = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+            let error_text = sanitize_http_error_body(
+                Some(self.api_provider.display_name()),
+                status.as_u16(),
+                &raw_error_text,
+            );
             // If DeepSeek rejected for missing reasoning_content despite the
             // sanitizer, dump the offending indices so we can diagnose where
             // they came from on the next failure.
@@ -214,7 +371,6 @@ impl DeepSeekClient {
             anyhow::bail!("SSE stream request failed: HTTP {status}: {error_text}");
         }
 
-        let model = request.model.clone();
         let api_provider = self.api_provider;
 
         // Capture transport-shape headers before we consume `response` into
@@ -223,6 +379,8 @@ impl DeepSeekClient {
         // gzip-compressor failure when investigating #103.
         let response_headers = format_stream_headers(response.headers());
         let byte_stream = response.bytes_stream();
+        let stream_idle_timeout = self.stream_idle_timeout;
+        let configured_reasoning_stream_style = self.reasoning_stream_style.clone();
 
         let stream = async_stream::stream! {
             use futures_util::StreamExt;
@@ -252,10 +410,16 @@ impl DeepSeekClient {
             let mut text_started = false;
             let mut thinking_started = false;
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            let is_reasoning_model = is_reasoning_model_for_stream(api_provider, &model);
+            let mut reasoning_detail_buffers: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+            let mut inline_reasoning_tags = InlineReasoningTagState::default();
+            let reasoning_stream_style = reasoning_stream_style_for_stream(
+                api_provider,
+                &model,
+                configured_reasoning_stream_style.as_deref(),
+            );
 
             let mut byte_stream = std::pin::pin!(byte_stream);
-            let idle = stream_idle_timeout();
+            let idle = stream_idle_timeout;
 
             // Telemetry for #103 stream-decode diagnostics: bytes received
             // since the start of this stream and last successful event time.
@@ -266,7 +430,7 @@ impl DeepSeekClient {
             let mut last_event_at = std::time::Instant::now();
             let mut bytes_received: usize = 0;
 
-            loop {
+            'stream: loop {
                 let chunk_result = match tokio_timeout(idle, byte_stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
@@ -334,39 +498,41 @@ impl DeepSeekClient {
                         // Empty line = event boundary, process accumulated data
                         if !line_buf.is_empty() {
                             let data = std::mem::take(&mut line_buf);
-                            if data.trim() == "[DONE]" {
-                                // Stream complete
-                            } else if let Ok(chunk_json) = serde_json::from_str::<Value>(&data) {
-                                // Parse the SSE chunk into stream events
-                                for mut event in parse_sse_chunk(
-                                    &chunk_json,
-                                    &mut content_index,
-                                    &mut text_started,
-                                    &mut thinking_started,
-                                    &mut tool_indices,
-                                    is_reasoning_model,
-                                ) {
-                                    // Stamp the client-side replay-token estimate
-                                    // onto the final usage so the UI can surface
-                                    // it (#30). We compute it pre-request and
-                                    // overlay it on the server-reported usage at
-                                    // stream completion.
-                                    if let Some(tokens) = replay_input_tokens
-                                        && let StreamEvent::MessageDelta {
-                                            usage: Some(usage),
-                                            ..
-                                        } = &mut event
-                                    {
-                                        usage.reasoning_replay_tokens = Some(tokens);
+                            match parse_sse_data_frame(
+                                &data,
+                                &mut content_index,
+                                &mut text_started,
+                                &mut thinking_started,
+                                &mut tool_indices,
+                                &mut reasoning_detail_buffers,
+                                &mut inline_reasoning_tags,
+                                reasoning_stream_style,
+                            ) {
+                                SseDataFrame::Done => break 'stream,
+                                SseDataFrame::Events(events) => {
+                                    for mut event in events {
+                                        // Stamp the client-side replay-token estimate
+                                        // onto the final usage so the UI can surface
+                                        // it (#30). We compute it pre-request and
+                                        // overlay it on the server-reported usage at
+                                        // stream completion.
+                                        if let Some(tokens) = replay_input_tokens
+                                            && let StreamEvent::MessageDelta {
+                                                usage: Some(usage),
+                                                ..
+                                            } = &mut event
+                                        {
+                                            usage.reasoning_replay_tokens = Some(tokens);
+                                        }
+                                        yield Ok(event);
                                     }
-                                    yield Ok(event);
                                 }
                             }
                         }
                         continue;
                     }
 
-                    if let Some(data) = line.strip_prefix("data: ") {
+                    if let Some(data) = super::extract_sse_data_value(&line) {
                         line_buf.push_str(data);
                     }
                     // Ignore other SSE fields (event:, id:, retry:)
@@ -379,12 +545,11 @@ impl DeepSeekClient {
                 }
             }
 
-            // Close any open blocks
-            if thinking_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
-            }
-            if text_started {
-                yield Ok(StreamEvent::ContentBlockStop { index: content_index.saturating_sub(1) });
+            // Close any open blocks — content_index points to the
+            // currently active open block (it is only incremented
+            // *after* a block is closed, not when opened).
+            if thinking_started || text_started {
+                yield Ok(StreamEvent::ContentBlockStop { index: content_index });
             }
 
             release_stream_buffer(byte_buf);
@@ -466,7 +631,7 @@ impl<'a> PromptBuilder<'a> {
     }
 
     fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
-        build_chat_messages_with_reasoning(
+        let mut messages = build_chat_messages_with_reasoning(
             self.system,
             self.messages,
             self.model,
@@ -476,7 +641,15 @@ impl<'a> PromptBuilder<'a> {
                 self.reasoning_effort,
             ),
             false,
-        )
+        );
+        dump_system_prompt_if_requested(&messages);
+        if provider == ApiProvider::Arcee {
+            apply_arcee_waf_safe_message_encoding(&mut messages);
+        }
+        if provider == ApiProvider::Minimax {
+            mirror_minimax_reasoning_details_for_messages(&mut messages);
+        }
+        messages
     }
 
     fn inspect(self) -> PromptInspection {
@@ -523,6 +696,102 @@ impl<'a> PromptBuilder<'a> {
     }
 }
 
+const SYSTEM_PROMPT_DUMP_ENV: &str = "CODEWHALE_DUMP_SYSTEM_PROMPT";
+const SYSTEM_PROMPT_DUMP_BEGIN: &str = "<<<CODEWHALE_SYSTEM_PROMPT_BEGIN>>>";
+const SYSTEM_PROMPT_DUMP_END: &str = "<<<CODEWHALE_SYSTEM_PROMPT_END>>>";
+const ARCEE_WAF_TEXT_SPLIT_TRIGGERS: &[(&str, &str, &str)] = &[("python -c", "python ", "-c")];
+
+fn dump_system_prompt_if_requested(messages: &[Value]) {
+    let Ok(flag) = std::env::var(SYSTEM_PROMPT_DUMP_ENV) else {
+        return;
+    };
+    if !matches!(flag.trim(), "1" | "true" | "TRUE" | "yes" | "YES") {
+        return;
+    }
+    let Some(prompt) = messages.iter().find_map(system_message_text) else {
+        return;
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_BEGIN}");
+    let _ = writeln!(stderr, "{prompt}");
+    let _ = writeln!(stderr, "{SYSTEM_PROMPT_DUMP_END}");
+}
+
+fn system_message_text(message: &Value) -> Option<String> {
+    if message.get("role").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn apply_arcee_waf_safe_message_encoding(messages: &mut [Value]) {
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(parts) = arcee_waf_safe_text_parts(content) else {
+            continue;
+        };
+        message["content"] = json!(parts);
+    }
+}
+
+fn arcee_waf_safe_text_parts(content: &str) -> Option<Vec<Value>> {
+    let mut parts = Vec::new();
+    let mut cursor = 0usize;
+    let mut split_any = false;
+
+    while cursor < content.len() {
+        let Some((trigger_start, trigger, left, right)) = next_arcee_waf_trigger(content, cursor)
+        else {
+            push_text_part(&mut parts, &content[cursor..]);
+            break;
+        };
+
+        push_text_part(&mut parts, &content[cursor..trigger_start]);
+        push_text_part(&mut parts, left);
+        push_text_part(&mut parts, right);
+        cursor = trigger_start + trigger.len();
+        split_any = true;
+    }
+
+    split_any.then_some(parts)
+}
+
+fn next_arcee_waf_trigger(content: &str, cursor: usize) -> Option<(usize, &str, &str, &str)> {
+    ARCEE_WAF_TEXT_SPLIT_TRIGGERS
+        .iter()
+        .filter_map(|(trigger, left, right)| {
+            content[cursor..]
+                .find(trigger)
+                .map(|offset| (cursor + offset, *trigger, *left, *right))
+        })
+        .min_by_key(|(start, _, _, _)| *start)
+}
+
+fn push_text_part(parts: &mut Vec<Value>, text: &str) {
+    if !text.is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+}
+
 pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
 const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
 const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
@@ -538,24 +807,75 @@ const TOOL_RESULT_DEDUP_MIN_CHARS: usize = 1_024;
 /// up with tiny `gh auth status` and `cat package.json` files.
 const TOOL_RESULT_SHA_PERSIST_MIN_CHARS: usize = 1_024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptInspection {
     pub base_static_prefix_hash: String,
     pub full_request_prefix_hash: String,
+    /// Hash of the rendered tool catalog JSON, or empty when no tools were supplied.
+    pub tool_catalog_hash: String,
     pub layers: Vec<PromptLayerInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Identifies the stable prefix that a cache warmup primes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CacheWarmupKey {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub static_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub project_pack_hash: String,
+    pub skills_hash: String,
+}
+
+impl CacheWarmupKey {
+    pub(crate) fn from_inspection(
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        inspection: &PromptInspection,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            static_prefix_hash: inspection.base_static_prefix_hash.clone(),
+            tool_catalog_hash: inspection.tool_catalog_hash.clone(),
+            project_pack_hash: layer_hash(inspection, "Project context pack"),
+            skills_hash: layer_hash(inspection, "Skills"),
+        }
+    }
+
+    pub(crate) fn hash_short(&self) -> String {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let hash = sha256_hex(json.as_bytes());
+        hash[..hash.len().min(12)].to_string()
+    }
+}
+
+fn layer_hash(inspection: &PromptInspection, name: &str) -> String {
+    inspection
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map(|layer| layer.sha256.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptLayerInspection {
     pub name: String,
     pub stability: PromptLayerStability,
     pub char_len: usize,
+    pub byte_len: usize,
+    /// Rough token estimate for quick before/after cache-hit reports.
+    pub token_estimate: usize,
     pub sha256: String,
     pub tool_result: Option<ToolResultInspection>,
     pub turn_meta: Option<TurnMetaInspection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ToolResultInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -563,7 +883,7 @@ pub(crate) struct ToolResultInspection {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TurnMetaInspection {
     pub original_chars: usize,
     pub sent_chars: usize,
@@ -571,7 +891,7 @@ pub(crate) struct TurnMetaInspection {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PromptLayerStability {
     Static,
     History,
@@ -592,6 +912,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     let mut layers = Vec::new();
     let mut base_static_prefix_parts = Vec::new();
     let mut full_request_prefix_parts = Vec::new();
+    let mut tool_catalog_hash = String::new();
     let mut start_index = 0;
 
     if let Some(message) = messages.first() {
@@ -615,6 +936,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     }
 
     if let Some(tool_catalog) = tool_catalog_for_inspect(tools) {
+        tool_catalog_hash = sha256_hex(tool_catalog.as_bytes());
         base_static_prefix_parts.push(tool_catalog.clone());
         full_request_prefix_parts.push(tool_catalog.clone());
         layers.push(prompt_layer(
@@ -656,6 +978,7 @@ fn inspect_wire_request(tools: Option<&[Tool]>, messages: &[Value]) -> PromptIns
     PromptInspection {
         base_static_prefix_hash: sha256_hex(base_static_prefix.as_bytes()),
         full_request_prefix_hash: sha256_hex(full_request_prefix.as_bytes()),
+        tool_catalog_hash,
         layers,
     }
 }
@@ -672,6 +995,31 @@ fn message_content_for_inspect(message: &Value) -> String {
     {
         parts.push(content.to_string());
     }
+    if let Some(content) = message.get("content").and_then(Value::as_array) {
+        for part in content {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        parts.push(text.to_string());
+                    }
+                }
+                Some("image_url") => {
+                    let url = part
+                        .get("image_url")
+                        .and_then(|image_url| image_url.get("url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    parts.push(format!(
+                        "[image_url:{}]",
+                        summarize_image_url_for_inspect(url)
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
         && !reasoning.is_empty()
     {
@@ -681,6 +1029,13 @@ fn message_content_for_inspect(message: &Value) -> String {
         parts.push(tool_calls.to_string());
     }
     parts.join("\n")
+}
+
+fn summarize_image_url_for_inspect(url: &str) -> String {
+    let Some((prefix, encoded)) = url.split_once(";base64,") else {
+        return first_chars(url, 96);
+    };
+    format!("{prefix};base64,<{} chars>", encoded.len())
 }
 
 fn tool_result_inspection_for_message(message: &Value) -> Option<ToolResultInspection> {
@@ -827,10 +1182,20 @@ fn prompt_layer(
     stability: PromptLayerStability,
     content: &str,
 ) -> PromptLayerInspection {
+    let char_len = content.chars().count();
+    let token_estimate = if char_len == 0 {
+        0
+    } else if content.is_ascii() {
+        (char_len / 4).max(1)
+    } else {
+        char_len.max(1)
+    };
     PromptLayerInspection {
         name,
         stability,
-        char_len: content.chars().count(),
+        char_len,
+        byte_len: content.len(),
+        token_estimate,
         sha256: sha256_hex(content.as_bytes()),
         tool_result: None,
         turn_meta: None,
@@ -838,9 +1203,7 @@ fn prompt_layer(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    crate::hashing::sha256_hex(bytes)
 }
 
 /// Persist a SHA-addressed copy of `content` to
@@ -1066,6 +1429,7 @@ fn compact_tool_result_for_wire(
          exit_status: {}\n\
          original_chars: {original_chars}\n\
          sha256: {sha}\n\
+         retrieve: retrieve_tool_result ref=sha:{sha}\n\
          first_chars:\n\
          {head}\n\n\
          [... truncated {omitted} chars from middle ...]\n\n\
@@ -1159,6 +1523,7 @@ fn build_chat_messages_with_reasoning(
     for (message_index, message) in messages.iter().enumerate() {
         let role = message.role.as_str();
         let mut text_parts = Vec::new();
+        let mut image_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_infos = Vec::new();
@@ -1177,7 +1542,15 @@ fn build_chat_messages_with_reasoning(
                         text_parts.push(text.clone());
                     }
                 }
-                ContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
+                ContentBlock::ImageUrl { image_url } => {
+                    image_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url.url.clone(),
+                        },
+                    }));
+                }
+                ContentBlock::Thinking { thinking, .. } => thinking_parts.push(thinking.clone()),
                 ContentBlock::ToolUse {
                     id,
                     name,
@@ -1290,10 +1663,25 @@ fn build_chat_messages_with_reasoning(
             }
         } else if role == "user" {
             let content = text_parts.join("\n");
-            if !content.trim().is_empty() {
+            let has_text = !content.trim().is_empty();
+            let has_images = !image_parts.is_empty();
+            if has_text || has_images {
+                let wire_content = if has_images {
+                    let mut parts = Vec::new();
+                    if has_text {
+                        parts.push(json!({
+                            "type": "text",
+                            "text": content,
+                        }));
+                    }
+                    parts.extend(image_parts);
+                    json!(parts)
+                } else {
+                    json!(content)
+                };
                 let mut msg = json!({
                     "role": "user",
-                    "content": content,
+                    "content": wire_content,
                 });
                 if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
                     msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
@@ -1512,6 +1900,23 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
     }
 }
 
+fn should_send_tool_choice_for_chat(provider: ApiProvider, effort: Option<&str>) -> bool {
+    if !matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return true;
+    }
+    !reasoning_effort_enables_thinking(effort)
+}
+
+fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
+    let Some(effort) = effort else {
+        return false;
+    };
+    !matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "off" | "disabled" | "none" | "false"
+    )
+}
+
 /// Final-pass sanitizer over the outgoing chat-completions JSON payload.
 /// Forces a non-empty `reasoning_content` onto assistant messages that carry
 /// `tool_calls`, when the model + effort combination requires it. DeepSeek's
@@ -1690,7 +2095,23 @@ fn should_replay_reasoning_content_for_provider(
     model: &str,
     effort: Option<&str>,
 ) -> bool {
-    if !provider_accepts_reasoning_content(provider) && !requires_reasoning_content(model) {
+    if effort
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "disabled" | "none" | "false"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if requires_reasoning_content(model) {
+        return true;
+    }
+
+    if !provider_accepts_reasoning_content(provider) {
         // Generic non-DeepSeek model on a provider that rejects the field:
         // keep stripping it (preserves the #1542 fix). But a known DeepSeek
         // reasoning model pointed at a DeepSeek-compatible endpoint via the
@@ -1698,30 +2119,75 @@ fn should_replay_reasoning_content_for_provider(
         // or the thinking-mode API returns 400 (#1739 / #1694).
         return false;
     }
-    should_replay_reasoning_content(model, effort)
+
+    model_supports_reasoning(model)
 }
 
 /// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
 /// (vs. inlining them as answer text)?
 ///
-/// This is the streaming-path twin of `should_replay_reasoning_content_for_provider`:
-/// both must agree on whether a model is a DeepSeek-family reasoning model, or
-/// stream parsing stores reasoning tokens in `content` while the replay path
-/// expects them in `reasoning_content` (DeepSeek thinking-mode API 400s —
-/// #1739 / #1694). Like that predicate's model-aware gate, a known reasoning
-/// model is classified as such on ANY provider (including the generic `openai`
-/// provider used for DeepSeek-compatible endpoints); a genuine non-DeepSeek
-/// model is never reclassified, so #1542 is not regressed.
-///
-/// `provider_accepts_reasoning_content(provider) || requires_reasoning_content(model)`
-/// short-circuits to `requires_reasoning_content(model)` once the model gate
-/// already holds, so the effective rule is purely model-driven — kept explicit
-/// here to mirror the predicate above.
+/// DeepSeek-family models are classified on any provider because their API
+/// requires `reasoning_content` replay on later turns (#1739 / #1694). Other
+/// known reasoning-capable large models are classified only on providers whose
+/// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
+/// deltas become Thinking cells instead of leaking as normal answer text.
 fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
-    requires_reasoning_content(model)
-        && (provider_accepts_reasoning_content(provider) || requires_reasoning_content(model))
+    if requires_reasoning_content(model) {
+        return true;
+    }
+    provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReasoningStreamStyle {
+    SeparateField,
+    InlineTags,
+    None,
+}
+
+fn reasoning_stream_style_for_stream(
+    provider: ApiProvider,
+    model: &str,
+    configured: Option<&str>,
+) -> ReasoningStreamStyle {
+    if let Some(configured) = configured {
+        if let Some(style) = parse_reasoning_stream_style(configured) {
+            return style;
+        }
+        logging::warn(format!(
+            "Ignoring unrecognized reasoning_stream_style `{configured}`; expected separate_field, inline_tags, or none"
+        ));
+    }
+    if is_reasoning_model_for_stream(provider, model) {
+        ReasoningStreamStyle::SeparateField
+    } else {
+        ReasoningStreamStyle::None
+    }
+}
+
+fn parse_reasoning_stream_style(value: &str) -> Option<ReasoningStreamStyle> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "separate_field" | "separate" | "field" => Some(ReasoningStreamStyle::SeparateField),
+        "inline_tags" | "inline" | "think_tags" | "thinking_tags" => {
+            Some(ReasoningStreamStyle::InlineTags)
+        }
+        "none" | "text" | "disabled" | "off" => Some(ReasoningStreamStyle::None),
+        _ => None,
+    }
+}
+
+/// Providers whose chat-completions API both returns and accepts a dedicated
+/// `reasoning_content` field on assistant messages.
+///
+/// Arcee is intentionally included. Trinity-Large-Thinking natively emits
+/// `<think>...</think>` traces, but Arcee's hosted API serves it through vLLM
+/// with `--reasoning-parser deepseek_r1`, which parses those blocks into a
+/// `reasoning_content` field (verified live against `api.arcee.ai`: thinking
+/// streams as `delta.reasoning_content`, the answer as `delta.content`, with no
+/// `<think>` tags on the wire). Arcee's docs require replaying `reasoning_content`
+/// on assistant tool-call turns; dropping it makes the model emit tool calls as
+/// raw XML inside its thinking ("xml_in_reasoning" pitfall). Do not remove Arcee
+/// here without new live evidence — see docs.arcee.ai/capabilities/reasoning-traces.
 fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
     matches!(
         provider,
@@ -1729,9 +2195,17 @@ fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
             | ApiProvider::DeepseekCN
             | ApiProvider::NvidiaNim
             | ApiProvider::Openrouter
+            | ApiProvider::XiaomiMimo
             | ApiProvider::Novita
             | ApiProvider::Fireworks
+            | ApiProvider::Siliconflow
+            | ApiProvider::SiliconflowCn
+            | ApiProvider::Volcengine
+            | ApiProvider::Arcee
+            | ApiProvider::Minimax
             | ApiProvider::Sglang
+            | ApiProvider::Zai
+            | ApiProvider::Moonshot // #3016: Kimi thinking traces use reasoning_content
     )
 }
 
@@ -1745,11 +2219,54 @@ fn has_deepseek_r_series_marker(model_lower: &str) -> bool {
     })
 }
 
-fn reasoning_field(value: &Value) -> Option<&str> {
-    value
+fn reasoning_delta(
+    value: &Value,
+    choice_index: u32,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
+) -> Option<String> {
+    if let Some(reasoning) = value
         .get("reasoning_content")
         .or_else(|| value.get("reasoning"))
         .and_then(Value::as_str)
+    {
+        return Some(reasoning.to_string());
+    }
+
+    let details = value.get("reasoning_details").and_then(Value::as_array)?;
+    let full_text = details
+        .iter()
+        .filter_map(|detail| detail.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    if full_text.is_empty() {
+        return None;
+    }
+
+    let previous = reasoning_detail_buffers.entry(choice_index).or_default();
+    let delta = full_text
+        .strip_prefix(previous.as_str())
+        .unwrap_or(&full_text)
+        .to_string();
+    *previous = full_text;
+    Some(delta)
+}
+
+fn reasoning_message_text(value: &Value) -> Option<String> {
+    if let Some(reasoning) = value
+        .get("reasoning_content")
+        .or_else(|| value.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        return Some(reasoning.to_string());
+    }
+    value
+        .get("reasoning_details")
+        .and_then(Value::as_array)
+        .map(|details| {
+            details
+                .iter()
+                .filter_map(|detail| detail.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
 }
 
 pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
@@ -1777,9 +2294,10 @@ pub(super) fn parse_chat_message(payload: &Value) -> Result<MessageResponse> {
 
     let mut content_blocks = Vec::new();
     if let Some(reasoning) =
-        reasoning_field(message).filter(|reasoning| !reasoning.trim().is_empty())
+        reasoning_message_text(message).filter(|reasoning| !reasoning.trim().is_empty())
     {
         content_blocks.push(ContentBlock::Thinking {
+            signature: None,
             thinking: reasoning.to_string(),
         });
     }
@@ -1878,7 +2396,7 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
                 }
                 events.push(StreamEvent::ContentBlockStop { index });
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 events.push(StreamEvent::ContentBlockStart {
                     index,
                     content_block: ContentBlockStart::Thinking {
@@ -1910,6 +2428,7 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
                 events.push(StreamEvent::ContentBlockStop { index });
             }
             ContentBlock::ToolResult { .. } => {}
+            ContentBlock::ImageUrl { .. } => {}
             ContentBlock::ServerToolUse { id, name, input } => {
                 events.push(StreamEvent::ContentBlockStart {
                     index,
@@ -1939,17 +2458,246 @@ fn build_stream_events(response: &MessageResponse) -> Vec<StreamEvent> {
     events
 }
 
+#[derive(Debug, Default)]
+struct InlineReasoningTagState {
+    inside_think: bool,
+    pending: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReasoningSegment {
+    Text(String),
+    Thinking(String),
+}
+
+fn inline_reasoning_segments(
+    content: &str,
+    state: &mut InlineReasoningTagState,
+    flush: bool,
+) -> Vec<ReasoningSegment> {
+    state.pending.push_str(content);
+    let mut segments = Vec::new();
+
+    loop {
+        if state.pending.is_empty() {
+            break;
+        }
+
+        if state.inside_think {
+            if let Some(close_at) = state.pending.find("</think>") {
+                push_reasoning_segment(
+                    &mut segments,
+                    ReasoningSegment::Thinking(state.pending[..close_at].to_string()),
+                );
+                state.pending.drain(..close_at + "</think>".len());
+                state.inside_think = false;
+                continue;
+            }
+
+            let hold_len = if flush {
+                0
+            } else {
+                trailing_tag_prefix_len(&state.pending, "</think>")
+            };
+            let emit_len = state.pending.len().saturating_sub(hold_len);
+            if emit_len > 0 {
+                push_reasoning_segment(
+                    &mut segments,
+                    ReasoningSegment::Thinking(state.pending[..emit_len].to_string()),
+                );
+                state.pending.drain(..emit_len);
+            }
+            break;
+        }
+
+        if let Some(open_at) = state.pending.find("<think>") {
+            push_reasoning_segment(
+                &mut segments,
+                ReasoningSegment::Text(state.pending[..open_at].to_string()),
+            );
+            state.pending.drain(..open_at + "<think>".len());
+            state.inside_think = true;
+            continue;
+        }
+
+        let hold_len = if flush {
+            0
+        } else {
+            trailing_tag_prefix_len(&state.pending, "<think>")
+        };
+        let emit_len = state.pending.len().saturating_sub(hold_len);
+        if emit_len > 0 {
+            push_reasoning_segment(
+                &mut segments,
+                ReasoningSegment::Text(state.pending[..emit_len].to_string()),
+            );
+            state.pending.drain(..emit_len);
+        }
+        break;
+    }
+
+    segments
+}
+
+fn trailing_tag_prefix_len(content: &str, tag: &str) -> usize {
+    let max_len = tag.len().min(content.len());
+    for len in (1..=max_len).rev() {
+        let start = content.len() - len;
+        if content.is_char_boundary(start) && tag.starts_with(&content[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
+fn push_reasoning_segment(segments: &mut Vec<ReasoningSegment>, segment: ReasoningSegment) {
+    match &segment {
+        ReasoningSegment::Text(text) | ReasoningSegment::Thinking(text) if text.is_empty() => {}
+        _ => segments.push(segment),
+    }
+}
+
+fn push_text_delta(
+    events: &mut Vec<StreamEvent>,
+    content_index: &mut u32,
+    text_started: &mut bool,
+    thinking_started: &mut bool,
+    text: String,
+) {
+    if *thinking_started {
+        events.push(StreamEvent::ContentBlockStop {
+            index: *content_index,
+        });
+        *content_index += 1;
+        *thinking_started = false;
+    }
+    if !*text_started {
+        events.push(StreamEvent::ContentBlockStart {
+            index: *content_index,
+            content_block: ContentBlockStart::Text {
+                text: String::new(),
+            },
+        });
+        *text_started = true;
+    }
+    events.push(StreamEvent::ContentBlockDelta {
+        index: *content_index,
+        delta: Delta::TextDelta { text },
+    });
+}
+
+fn push_thinking_delta(
+    events: &mut Vec<StreamEvent>,
+    content_index: &mut u32,
+    text_started: &mut bool,
+    thinking_started: &mut bool,
+    thinking: String,
+) {
+    if *text_started {
+        events.push(StreamEvent::ContentBlockStop {
+            index: *content_index,
+        });
+        *content_index += 1;
+        *text_started = false;
+    }
+    if !*thinking_started {
+        events.push(StreamEvent::ContentBlockStart {
+            index: *content_index,
+            content_block: ContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        });
+        *thinking_started = true;
+    }
+    events.push(StreamEvent::ContentBlockDelta {
+        index: *content_index,
+        delta: Delta::ThinkingDelta { thinking },
+    });
+}
+
 // === SSE Chunk Parser ===
+
+enum SseDataFrame {
+    Done,
+    Events(Vec<StreamEvent>),
+}
+
+// The six `&mut` streaming-state fields plus the style flag are a deliberate,
+// shared parser-state set (mirrored by `parse_sse_chunk*`); bundling them into a
+// struct would only add reborrow noise on this hot SSE path.
+#[allow(clippy::too_many_arguments)]
+fn parse_sse_data_frame(
+    data: &str,
+    content_index: &mut u32,
+    text_started: &mut bool,
+    thinking_started: &mut bool,
+    tool_indices: &mut std::collections::HashMap<u32, u32>,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
+    inline_reasoning_tags: &mut InlineReasoningTagState,
+    reasoning_stream_style: ReasoningStreamStyle,
+) -> SseDataFrame {
+    if data.trim() == "[DONE]" {
+        return SseDataFrame::Done;
+    }
+    let events = serde_json::from_str::<Value>(data).map_or_else(
+        |_| Vec::new(),
+        |chunk_json| {
+            parse_sse_chunk_with_reasoning_style(
+                &chunk_json,
+                content_index,
+                text_started,
+                thinking_started,
+                tool_indices,
+                reasoning_detail_buffers,
+                inline_reasoning_tags,
+                reasoning_stream_style,
+            )
+        },
+    );
+    SseDataFrame::Events(events)
+}
 
 /// Parse a single SSE chunk from the Chat Completions streaming API into
 /// our internal `StreamEvent` representation.
+#[cfg(test)]
 pub(super) fn parse_sse_chunk(
     chunk: &Value,
     content_index: &mut u32,
     text_started: &mut bool,
     thinking_started: &mut bool,
     tool_indices: &mut std::collections::HashMap<u32, u32>,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
     is_reasoning_model: bool,
+) -> Vec<StreamEvent> {
+    let mut inline_reasoning_tags = InlineReasoningTagState::default();
+    let reasoning_stream_style = if is_reasoning_model {
+        ReasoningStreamStyle::SeparateField
+    } else {
+        ReasoningStreamStyle::None
+    };
+    parse_sse_chunk_with_reasoning_style(
+        chunk,
+        content_index,
+        text_started,
+        thinking_started,
+        tool_indices,
+        reasoning_detail_buffers,
+        &mut inline_reasoning_tags,
+        reasoning_stream_style,
+    )
+}
+
+// Same deliberate shared parser-state set as `parse_sse_data_frame`.
+#[allow(clippy::too_many_arguments)]
+fn parse_sse_chunk_with_reasoning_style(
+    chunk: &Value,
+    content_index: &mut u32,
+    text_started: &mut bool,
+    thinking_started: &mut bool,
+    tool_indices: &mut std::collections::HashMap<u32, u32>,
+    reasoning_detail_buffers: &mut std::collections::HashMap<u32, String>,
+    inline_reasoning_tags: &mut InlineReasoningTagState,
+    reasoning_stream_style: ReasoningStreamStyle,
 ) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
@@ -1983,6 +2731,7 @@ pub(super) fn parse_sse_chunk(
     }
 
     for choice in choices {
+        let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
         let delta = choice.get("delta");
         let finish_reason = choice
             .get("finish_reason")
@@ -1990,66 +2739,72 @@ pub(super) fn parse_sse_chunk(
             .map(str::to_string);
 
         if let Some(delta) = delta {
-            let reasoning_text = reasoning_field(delta).filter(|s| !s.is_empty());
+            let reasoning_text = reasoning_delta(delta, choice_index, reasoning_detail_buffers)
+                .filter(|s| !s.is_empty());
             let content_text = delta
                 .get("content")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             // Handle reasoning_content / reasoning thinking deltas.
-            if is_reasoning_model && let Some(reasoning) = reasoning_text {
-                if !*thinking_started {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index: *content_index,
-                        content_block: ContentBlockStart::Thinking {
-                            thinking: String::new(),
-                        },
-                    });
-                    *thinking_started = true;
-                }
-                events.push(StreamEvent::ContentBlockDelta {
-                    index: *content_index,
-                    delta: Delta::ThinkingDelta {
-                        thinking: reasoning.to_string(),
-                    },
-                });
+            if reasoning_stream_style == ReasoningStreamStyle::SeparateField
+                && let Some(reasoning) = reasoning_text.as_deref()
+            {
+                push_thinking_delta(
+                    &mut events,
+                    content_index,
+                    text_started,
+                    thinking_started,
+                    reasoning.to_string(),
+                );
             }
 
             // Generic OpenAI-compatible proxies sometimes stream answer text
-            // in `reasoning_content`. If this provider is not one whose
-            // reasoning-content semantics we support, render that field as
-            // normal text when no `content` delta is present.
-            let effective_content = match content_text {
-                Some(content) => Some(content),
-                None if !is_reasoning_model => reasoning_text,
-                None => None,
-            };
-
-            // Handle regular content
-            if let Some(content) = effective_content {
-                // Close thinking block if transitioning to text
-                if *thinking_started {
-                    events.push(StreamEvent::ContentBlockStop {
-                        index: *content_index,
-                    });
-                    *content_index += 1;
-                    *thinking_started = false;
+            // in `reasoning_content`. If this route is configured with no
+            // reasoning semantics, render that field as normal text when no
+            // `content` delta is present.
+            match (content_text, reasoning_stream_style) {
+                (Some(content), ReasoningStreamStyle::InlineTags) => {
+                    for segment in inline_reasoning_segments(&content, inline_reasoning_tags, false)
+                    {
+                        match segment {
+                            ReasoningSegment::Text(text) => push_text_delta(
+                                &mut events,
+                                content_index,
+                                text_started,
+                                thinking_started,
+                                text,
+                            ),
+                            ReasoningSegment::Thinking(thinking) => push_thinking_delta(
+                                &mut events,
+                                content_index,
+                                text_started,
+                                thinking_started,
+                                thinking,
+                            ),
+                        }
+                    }
                 }
-                if !*text_started {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index: *content_index,
-                        content_block: ContentBlockStart::Text {
-                            text: String::new(),
-                        },
-                    });
-                    *text_started = true;
+                (Some(content), _) => push_text_delta(
+                    &mut events,
+                    content_index,
+                    text_started,
+                    thinking_started,
+                    content,
+                ),
+                (None, ReasoningStreamStyle::None) => {
+                    if let Some(content) = reasoning_text {
+                        push_text_delta(
+                            &mut events,
+                            content_index,
+                            text_started,
+                            thinking_started,
+                            content,
+                        );
+                    }
                 }
-                events.push(StreamEvent::ContentBlockDelta {
-                    index: *content_index,
-                    delta: Delta::TextDelta {
-                        text: content.to_string(),
-                    },
-                });
+                (None, _) => {}
             }
 
             // Handle tool calls
@@ -2142,6 +2897,26 @@ pub(super) fn parse_sse_chunk(
 
         // Handle finish reason
         if let Some(reason) = finish_reason {
+            if reasoning_stream_style == ReasoningStreamStyle::InlineTags {
+                for segment in inline_reasoning_segments("", inline_reasoning_tags, true) {
+                    match segment {
+                        ReasoningSegment::Text(text) => push_text_delta(
+                            &mut events,
+                            content_index,
+                            text_started,
+                            thinking_started,
+                            text,
+                        ),
+                        ReasoningSegment::Thinking(thinking) => push_thinking_delta(
+                            &mut events,
+                            content_index,
+                            text_started,
+                            thinking_started,
+                            thinking,
+                        ),
+                    }
+                }
+            }
             // Close any open blocks
             if *text_started {
                 events.push(StreamEvent::ContentBlockStop {
@@ -2221,6 +2996,37 @@ mod stream_diagnostics_tests {
     }
 
     #[test]
+    fn deepseek_thinking_omits_tool_choice() {
+        for effort in [Some("high"), Some("max"), Some("medium"), Some("")] {
+            assert!(
+                !should_send_tool_choice_for_chat(ApiProvider::Deepseek, effort),
+                "DeepSeek thinking rejects explicit tool_choice for {effort:?}"
+            );
+            assert!(
+                !should_send_tool_choice_for_chat(ApiProvider::DeepseekCN, effort),
+                "DeepSeek CN thinking rejects explicit tool_choice for {effort:?}"
+            );
+        }
+
+        for effort in [
+            None,
+            Some("off"),
+            Some("disabled"),
+            Some("none"),
+            Some("false"),
+        ] {
+            assert!(should_send_tool_choice_for_chat(
+                ApiProvider::Deepseek,
+                effort
+            ));
+        }
+        assert!(should_send_tool_choice_for_chat(
+            ApiProvider::Openrouter,
+            Some("high")
+        ));
+    }
+
+    #[test]
     fn format_stream_headers_renders_all_fields_when_present() {
         let mut headers = HeaderMap::new();
         headers.insert("content-encoding", HeaderValue::from_static("gzip"));
@@ -2283,6 +3089,146 @@ mod stream_diagnostics_tests {
     }
 }
 
+#[cfg(test)]
+mod arcee_waf_message_encoding_tests {
+    use super::build_chat_messages_for_request_and_provider;
+    use crate::config::ApiProvider;
+    use crate::models::{MessageRequest, SystemPrompt};
+    use serde_json::Value;
+
+    fn request_with_system(system: &str) -> MessageRequest {
+        MessageRequest {
+            model: "trinity-large-thinking".to_string(),
+            messages: Vec::new(),
+            max_tokens: 16,
+            system: Some(SystemPrompt::Text(system.to_string())),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    fn decoded_content(content: &Value) -> String {
+        if let Some(text) = content.as_str() {
+            return text.to_string();
+        }
+        content
+            .as_array()
+            .expect("content parts")
+            .iter()
+            .map(|part| part.get("text").and_then(Value::as_str).expect("text part"))
+            .collect()
+    }
+
+    #[test]
+    fn arcee_splits_waf_trigger_without_changing_decoded_system_prompt() {
+        let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
+        let request = request_with_system(system);
+
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+        let content = &messages[0]["content"];
+
+        assert!(
+            content.is_array(),
+            "Arcee system content with a WAF trigger should be encoded as text parts"
+        );
+        assert_eq!(decoded_content(content), system);
+        let serialized = serde_json::to_string(&messages).expect("serialize messages");
+        assert!(
+            !serialized.contains("python -c"),
+            "wire JSON should not contain the Cloudflare trigger contiguously: {serialized}"
+        );
+    }
+
+    #[test]
+    fn non_arcee_providers_keep_system_prompt_as_string() {
+        let system = "Run calculations with `python -c 'print(1)'` when a tool is available.";
+        let request = request_with_system(system);
+
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Openai);
+
+        assert_eq!(messages[0]["content"].as_str(), Some(system));
+    }
+
+    #[test]
+    fn arcee_keeps_non_triggering_system_prompt_as_string() {
+        let system = "Use read-only tools to inspect files before reporting results.";
+        let request = request_with_system(system);
+
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Arcee);
+
+        assert_eq!(messages[0]["content"].as_str(), Some(system));
+    }
+}
+
+#[cfg(test)]
+mod minimax_reasoning_replay_tests {
+    use super::build_chat_messages_for_request_and_provider;
+    use crate::config::{ApiProvider, DEFAULT_MINIMAX_MODEL};
+    use crate::models::{ContentBlock, Message, MessageRequest};
+
+    fn request_with_assistant_thinking() -> MessageRequest {
+        MessageRequest {
+            model: DEFAULT_MINIMAX_MODEL.to_string(),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "Inspect tool state".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Done.".to_string(),
+                        cache_control: None,
+                    },
+                ],
+            }],
+            max_tokens: 16,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    #[test]
+    fn minimax_history_replays_thinking_as_reasoning_details() {
+        let request = request_with_assistant_thinking();
+
+        let messages = build_chat_messages_for_request_and_provider(&request, ApiProvider::Minimax);
+        let assistant = &messages[0];
+
+        assert_eq!(
+            assistant
+                .get("reasoning_content")
+                .and_then(|value| value.as_str()),
+            Some("Inspect tool state")
+        );
+        assert_eq!(
+            assistant
+                .pointer("/reasoning_details/0/type")
+                .and_then(|value| value.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            assistant
+                .pointer("/reasoning_details/0/text")
+                .and_then(|value| value.as_str()),
+            Some("Inspect tool state")
+        );
+    }
+}
+
 // === #103 Phase 4: SSE decoder behavior on canned chunk sequences ============
 
 #[cfg(test)]
@@ -2307,14 +3253,70 @@ mod stream_decoder_tests {
         let mut text_started = false;
         let mut thinking_started = false;
         let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
         parse_sse_chunk(
             &chunk,
             &mut content_index,
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
+            &mut reasoning_detail_buffers,
             is_reasoning_model,
         )
+    }
+
+    fn decode_chunks_with_style(
+        chunks: &[&str],
+        reasoning_stream_style: ReasoningStreamStyle,
+    ) -> Vec<StreamEvent> {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut inline_reasoning_tags = InlineReasoningTagState::default();
+        let mut events = Vec::new();
+
+        for chunk in chunks {
+            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
+            events.extend(parse_sse_chunk_with_reasoning_style(
+                &value,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_detail_buffers,
+                &mut inline_reasoning_tags,
+                reasoning_stream_style,
+            ));
+        }
+        events
+    }
+
+    fn text_delta_text(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn thinking_delta_text(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -2372,6 +3374,78 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn decoder_streams_moonshot_multi_chunk_reasoning_as_thinking() {
+        // #3016: recorded shape from Moonshot's native endpoint — kimi-k2.6
+        // streams `reasoning_content` deltas before the answer text. The
+        // thinking deltas must accumulate into ONE thinking block and the
+        // answer must arrive as text, not be glued into the trace.
+        let chunks = [
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let me check"}}]}"#,
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"reasoning_content":" the config."}}]}"#,
+            r#"{"id":"cmpl-kimi","model":"kimi-k2.6","choices":[{"index":0,"delta":{"content":"The answer is 42."}}]}"#,
+        ];
+
+        let is_reasoning =
+            is_reasoning_model_for_stream(crate::config::ApiProvider::Moonshot, "kimi-k2.6");
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
+            events.extend(parse_sse_chunk(
+                &value,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_detail_buffers,
+                is_reasoning,
+            ));
+        }
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "Let me check the config.");
+
+        let thinking_starts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ContentBlockStart {
+                        content_block: ContentBlockStart::Thinking { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(thinking_starts, 1, "one thinking block: {events:?}");
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "The answer is 42.");
+    }
+
+    #[test]
     fn decoder_accepts_openrouter_reasoning_delta_with_extra_fields() {
         let events = decode_chunk(
             r#"{"id":"or-1","choices":[{"delta":{"reasoning":"openrouter thought","reasoning_details":[{"type":"summary","text":"extra"}],"native_finish_reason":null}}],"usage":{"completion_tokens_details":{"reasoning_tokens":3}}}"#,
@@ -2387,6 +3461,99 @@ mod stream_decoder_tests {
             )),
             "OpenRouter-style reasoning deltas with extra fields should not crash decoding; got {events:?}"
         );
+    }
+
+    #[test]
+    fn decoder_streams_minimax_reasoning_details_as_incremental_thinking() {
+        // MiniMax's reasoning_split stream reports reasoning_details text as
+        // a cumulative buffer. Emit only the suffix so the Thinking cell does
+        // not duplicate earlier reasoning chunks.
+        let chunks = [
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect"}]}}]}"#,
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"text","text":"Inspect config"}]}}]}"#,
+            r#"{"id":"minimax-1","choices":[{"index":0,"delta":{"content":"Done."}}]}"#,
+        ];
+
+        let is_reasoning = is_reasoning_model_for_stream(ApiProvider::Minimax, "MiniMax-M3");
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            let value: Value = serde_json::from_str(chunk).expect("valid SSE JSON");
+            events.extend(parse_sse_chunk(
+                &value,
+                &mut content_index,
+                &mut text_started,
+                &mut thinking_started,
+                &mut tool_indices,
+                &mut reasoning_detail_buffers,
+                is_reasoning,
+            ));
+        }
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "Inspect config");
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            } if text == "Inspect" || text == "Inspect config"
+        )));
+    }
+
+    #[test]
+    fn decoder_does_not_render_reasoning_as_text_for_known_provider_models() {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let is_reasoning_model =
+            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro");
+        let events = parse_sse_chunk(
+            &serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "private plan"
+                    }
+                }]
+            }),
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            &mut reasoning_detail_buffers,
+            is_reasoning_model,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::ThinkingDelta { thinking },
+                ..
+            } if thinking == "private plan"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            } if text == "private plan"
+        )));
     }
 
     #[test]
@@ -2429,6 +3596,105 @@ mod stream_decoder_tests {
     }
 
     #[test]
+    fn reasoning_style_separate_field_routes_reasoning_to_thinking() {
+        let events = decode_chunks_with_style(
+            &[
+                r#"{"choices":[{"delta":{"reasoning_content":"private plan"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"Public answer."}}]}"#,
+            ],
+            ReasoningStreamStyle::SeparateField,
+        );
+
+        assert_eq!(thinking_delta_text(&events), "private plan");
+        assert_eq!(text_delta_text(&events), "Public answer.");
+    }
+
+    #[test]
+    fn reasoning_style_inline_tags_routes_think_blocks_to_thinking() {
+        let events = decode_chunks_with_style(
+            &[
+                r#"{"choices":[{"delta":{"content":"Before <thi"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"nk>private plan</thi"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"nk> after."}}]}"#,
+            ],
+            ReasoningStreamStyle::InlineTags,
+        );
+
+        assert_eq!(thinking_delta_text(&events), "private plan");
+        assert_eq!(text_delta_text(&events), "Before  after.");
+        assert!(
+            !text_delta_text(&events).contains("<think>"),
+            "inline reasoning tags must not leak into visible text: {events:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_style_inline_tags_flushes_unclosed_think_at_stream_end() {
+        let events = decode_chunks_with_style(
+            &[
+                r#"{"choices":[{"delta":{"content":"Before <think>partial reasoning"}}]}"#,
+                r#"{"choices":[{"finish_reason":"stop"}]}"#,
+            ],
+            ReasoningStreamStyle::InlineTags,
+        );
+
+        assert_eq!(thinking_delta_text(&events), "partial reasoning");
+        assert_eq!(text_delta_text(&events), "Before ");
+    }
+
+    #[test]
+    fn reasoning_style_inline_tags_ignores_separate_reasoning_field() {
+        let events = decode_chunks_with_style(
+            &[
+                r#"{"choices":[{"delta":{"reasoning_content":"metadata","content":"<think>tagged</think> answer"}}]}"#,
+            ],
+            ReasoningStreamStyle::InlineTags,
+        );
+
+        assert_eq!(thinking_delta_text(&events), "tagged");
+        assert_eq!(text_delta_text(&events), " answer");
+    }
+
+    #[test]
+    fn reasoning_style_none_keeps_inline_tags_visible_text() {
+        let events = decode_chunks_with_style(
+            &[r#"{"choices":[{"delta":{"content":"<think>visible</think> answer"}}]}"#],
+            ReasoningStreamStyle::None,
+        );
+
+        assert_eq!(thinking_delta_text(&events), "");
+        assert_eq!(text_delta_text(&events), "<think>visible</think> answer");
+    }
+
+    #[test]
+    fn configured_reasoning_style_overrides_route_default() {
+        assert_eq!(
+            reasoning_stream_style_for_stream(ApiProvider::Openai, "custom-minimax", None),
+            ReasoningStreamStyle::None
+        );
+        assert_eq!(
+            reasoning_stream_style_for_stream(
+                ApiProvider::Openai,
+                "custom-minimax",
+                Some("inline-tags")
+            ),
+            ReasoningStreamStyle::InlineTags
+        );
+        assert_eq!(
+            reasoning_stream_style_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro", None),
+            ReasoningStreamStyle::SeparateField
+        );
+        assert_eq!(
+            reasoning_stream_style_for_stream(
+                ApiProvider::XiaomiMimo,
+                "mimo-v2.5-pro",
+                Some("none")
+            ),
+            ReasoningStreamStyle::None
+        );
+    }
+
+    #[test]
     fn decoder_yields_no_events_for_keepalive_chunk() {
         // DeepSeek often sends `{"choices":[]}` keepalive chunks before
         // emitting real content. The engine MUST treat a stream error after
@@ -2439,6 +3705,36 @@ mod stream_decoder_tests {
             events.is_empty(),
             "empty-choices chunk must produce no events; got {events:?}"
         );
+    }
+
+    #[test]
+    fn decoder_treats_done_frame_as_terminal() {
+        let mut content_index = 0u32;
+        let mut text_started = false;
+        let mut thinking_started = false;
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut reasoning_detail_buffers = std::collections::HashMap::new();
+        let mut inline_reasoning_tags = InlineReasoningTagState::default();
+
+        let outcome = parse_sse_data_frame(
+            "  [DONE]  ",
+            &mut content_index,
+            &mut text_started,
+            &mut thinking_started,
+            &mut tool_indices,
+            &mut reasoning_detail_buffers,
+            &mut inline_reasoning_tags,
+            ReasoningStreamStyle::SeparateField,
+        );
+
+        assert!(
+            matches!(outcome, SseDataFrame::Done),
+            "`data: [DONE]` must terminate the stream instead of waiting for the HTTP connection to close"
+        );
+        assert_eq!(content_index, 0);
+        assert!(!text_started);
+        assert!(!thinking_started);
+        assert!(tool_indices.is_empty());
     }
 
     #[test]
@@ -2635,6 +3931,22 @@ mod stream_decoder_tests {
         }
     }
 
+    fn user_message_with_tail_turn_meta(task: &str, turn_meta: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: vec![
+                ContentBlock::Text {
+                    text: task.to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::Text {
+                    text: turn_meta.to_string(),
+                    cache_control: None,
+                },
+            ],
+        }
+    }
+
     fn tool_message_content(messages: &[Value], index: usize) -> &str {
         messages
             .iter()
@@ -2699,6 +4011,30 @@ mod stream_decoder_tests {
             format!("{expected_ref}\nsecond task"),
             "ref text must stay stable"
         );
+    }
+
+    #[test]
+    fn request_builder_keeps_tail_turn_meta_after_user_text_for_wire() {
+        let turn_meta = "<turn_meta>\nCurrent local date: 2026-05-09\n</turn_meta>";
+        let messages = vec![
+            user_message_with_tail_turn_meta("first task", turn_meta),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first answer".to_string(),
+                    cache_control: None,
+                }],
+            },
+            user_message_with_tail_turn_meta("second task", turn_meta),
+        ];
+
+        let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+        let first = user_message_content(&built, 0);
+        let second = user_message_content(&built, 1);
+        let expected_ref = "<turn_meta_unchanged />";
+
+        assert_eq!(first, format!("first task\n{turn_meta}"));
+        assert_eq!(second, format!("second task\n{expected_ref}"));
     }
 
     #[test]
@@ -2809,6 +4145,10 @@ mod stream_decoder_tests {
         assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
         assert!(sent.contains("original_chars: 14000"), "got: {sent}");
         assert!(sent.contains("sha256:"), "got: {sent}");
+        assert!(
+            sent.contains("retrieve: retrieve_tool_result ref=sha:"),
+            "got: {sent}"
+        );
         assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
         assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
         assert!(
@@ -2816,6 +4156,45 @@ mod stream_decoder_tests {
             "got: {sent}"
         );
         assert_ne!(sent, long_output);
+    }
+
+    #[test]
+    fn request_builder_keeps_extreme_tool_output_bounded_and_retrievable() {
+        with_tool_result_sha_spillover_root(|| {
+            let huge_output = format!(
+                "{}{}{}",
+                "DIFF_HEAD\n".repeat(10_000),
+                "MIDDLE_POISON\n".repeat(10_000),
+                "DIFF_TAIL\n".repeat(10_000)
+            );
+            let sha = sha256_hex(huge_output.as_bytes());
+            let messages = vec![
+                tool_use_message("tool-huge", "exec_shell", json!({"command": "git diff"})),
+                tool_result_message("tool-huge", &huge_output),
+            ];
+
+            let built = build_chat_messages(None, &messages, "deepseek-v4-flash");
+            let sent = tool_message_content(&built, 0);
+
+            assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
+            assert!(sent.contains("tool_name: exec_shell"), "got: {sent}");
+            assert!(sent.contains("command_or_query: git diff"), "got: {sent}");
+            assert!(sent.contains(&format!("sha256: {sha}")), "got: {sent}");
+            assert!(
+                sent.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
+                "got: {sent}"
+            );
+            assert!(
+                sent.chars().count() <= TOOL_RESULT_SENT_CHAR_BUDGET,
+                "truncated result should stay bounded, sent {} chars",
+                sent.chars().count()
+            );
+            assert!(
+                !sent.contains("MIDDLE_POISON"),
+                "omitted middle should not be sent to the next model turn"
+            );
+            assert_ne!(sent, huge_output);
+        });
     }
 
     #[test]
@@ -2838,8 +4217,12 @@ mod stream_decoder_tests {
     }
 
     #[test]
-    fn request_builder_deduplicates_large_identical_tool_results_with_retrieval_hint() {
+    fn request_builder_deduplicates_medium_identical_tool_results_with_retrieval_hint() {
         with_tool_result_sha_spillover_root(|| {
+            // 2,000 chars is intentionally above TOOL_RESULT_DEDUP_MIN_CHARS
+            // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
+            // verifies the cache-saving path for repeated medium outputs that
+            // do not otherwise need truncation.
             let output = "A".repeat(2_000);
             let messages = vec![
                 tool_use_message("tool-1", "read_file", json!({"path": "README.md"})),
@@ -2853,6 +4236,7 @@ mod stream_decoder_tests {
             let second = tool_message_content(&built, 1);
 
             assert_eq!(first, output);
+            assert!(!first.contains("[TOOL_RESULT_TRUNCATED]"), "got: {first}");
             assert!(
                 second.starts_with("<TOOL_RESULT_REF sha=\""),
                 "got: {second}"
@@ -2973,6 +4357,10 @@ mod stream_decoder_tests {
             first.contains(&format!("sha256: {sha}")),
             "truncation block should advertise the recovery SHA, got: {first}"
         );
+        assert!(
+            first.contains(&format!("retrieve: retrieve_tool_result ref=sha:{sha}")),
+            "truncation block should advertise the recovery command, got: {first}"
+        );
 
         // (b) The full content was persisted to the SHA store and is
         // retrievable — the seam `persist_tool_result_for_sha` writes
@@ -3092,11 +4480,12 @@ mod alias_thinking_detection_tests {
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
     use super::{
-        is_reasoning_model_for_stream, provider_accepts_reasoning_content,
-        requires_reasoning_content, should_replay_reasoning_content,
-        should_replay_reasoning_content_for_provider,
+        apply_openai_reasoning_effort, apply_provider_token_limit, is_reasoning_model_for_stream,
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
     };
     use crate::config::ApiProvider;
+    use serde_json::json;
 
     #[test]
     fn aliases_routed_to_v4_require_reasoning_content() {
@@ -3162,6 +4551,140 @@ mod alias_thinking_detection_tests {
         assert!(!provider_accepts_reasoning_content(ApiProvider::Openai));
         assert!(provider_accepts_reasoning_content(ApiProvider::Deepseek));
         assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
+        assert!(provider_accepts_reasoning_content(ApiProvider::XiaomiMimo));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Arcee));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Minimax));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Zai));
+        // #3016: Moonshot's native endpoint streams Kimi thinking as
+        // reasoning_content.
+        assert!(provider_accepts_reasoning_content(ApiProvider::Moonshot));
+    }
+
+    #[test]
+    fn stream_classifies_moonshot_kimi_as_reasoning() {
+        // #3016: without this, Kimi thinking leaked into answer text.
+        assert!(is_reasoning_model_for_stream(
+            ApiProvider::Moonshot,
+            "kimi-k2.6"
+        ));
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Moonshot, "kimi-for-coding"),
+            "Kimi Code's stable model id now maps to K2.7 Code and streams reasoning_content"
+        );
+    }
+
+    #[test]
+    fn moonshot_and_minimax_replay_reasoning_content_for_supported_models() {
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-k2.7-code",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-for-coding",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Minimax,
+            "MiniMax-M3",
+            None,
+        ));
+        assert!(should_replay_reasoning_content_for_provider(
+            ApiProvider::Zai,
+            "GLM-5.2",
+            None,
+        ));
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::Moonshot,
+            "kimi-for-coding",
+            Some("off"),
+        ));
+    }
+
+    #[test]
+    fn xiaomi_mimo_uses_max_completion_tokens_payload_key() {
+        let mut body = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [],
+            "max_tokens": 8192,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::XiaomiMimo, "mimo-v2.5-pro", 8192);
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_model_uses_completion_token_limit_and_effort_field() {
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.5", 4096);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.5", Some("high"));
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(
+            body.get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert_eq!(
+            body.get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn openai_non_reasoning_model_omits_reasoning_only_fields() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-4o", 4096);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-4o", Some("high"));
+
+        assert_eq!(
+            body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_provider_deepseek_compatible_model_keeps_chat_token_field() {
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [],
+            "max_tokens": 4096,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "deepseek-v4-pro", 4096);
+        apply_openai_reasoning_effort(
+            &mut body,
+            ApiProvider::Openai,
+            "deepseek-v4-pro",
+            Some("high"),
+        );
+
+        assert_eq!(
+            body.get("max_tokens").and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -3232,6 +4755,36 @@ mod alias_thinking_detection_tests {
             ApiProvider::Deepseek,
             "deepseek-v4-pro"
         ));
+    }
+
+    #[test]
+    fn stream_classifies_known_large_reasoning_models_as_reasoning() {
+        // Xiaomi MiMo and OpenRouter/Qwen/Trinity can stream private reasoning through a
+        // `reasoning` delta without using a DeepSeek-looking model name. The
+        // renderer must still route that field into Thinking cells instead
+        // of plain assistant prose.
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::XiaomiMimo, "mimo-v2.5-pro"),
+            "mimo-v2.5-pro should stream reasoning as thinking on Xiaomi MiMo"
+        );
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Arcee, "trinity-large-thinking"),
+            "trinity-large-thinking should stream reasoning as thinking on direct Arcee"
+        );
+        assert!(
+            is_reasoning_model_for_stream(ApiProvider::Zai, "GLM-5.2"),
+            "GLM-5.2 should stream reasoning_content as thinking on direct Z.ai"
+        );
+        for model in [
+            "arcee-ai/trinity-large-thinking",
+            "minimax/minimax-m3",
+            "xiaomi/mimo-v2.5-pro",
+        ] {
+            assert!(
+                is_reasoning_model_for_stream(ApiProvider::Openrouter, model),
+                "{model} should stream reasoning as thinking on OpenRouter"
+            );
+        }
     }
 
     #[test]

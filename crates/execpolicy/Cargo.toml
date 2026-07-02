@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Execution policy and approval model parity for DeepSeek workspace architecture"
+description = "Execution policy and approval model for CodeWhale"
 
 [dependencies]
 anyhow.workspace = true
-codewhale-protocol = { path = "../protocol", version = "0.8.46" }
+codewhale-protocol = { path = "../protocol", version = "0.8.66" }
 serde.workspace = true

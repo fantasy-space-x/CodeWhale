@@ -1,6 +1,6 @@
 //! `image_analyze` tool — analyze images using a dedicated vision model.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,10 +8,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 use crate::config::VisionModelConfig;
-use crate::llm_client::{LlmError, RetryConfig, with_retry};
+use crate::llm_client::{LlmError, RetryConfig, sanitize_http_error_body, with_retry};
 use crate::tools::spec::{
     ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
 };
+
+const DEFAULT_VISION_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 pub struct ImageAnalyzeTool {
     config: VisionModelConfig,
@@ -21,7 +23,7 @@ pub struct ImageAnalyzeTool {
 impl ImageAnalyzeTool {
     #[must_use]
     pub fn new(config: VisionModelConfig) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("Failed to build HTTP client");
@@ -36,6 +38,34 @@ impl ImageAnalyzeTool {
         let mime_type = Self::detect_mime_type(path)?;
         let base64_data = BASE64.encode(&bytes);
         Ok((base64_data, mime_type))
+    }
+
+    fn resolve_image_path(workspace: &Path, image_path: &str) -> Result<PathBuf, ToolError> {
+        let image_path_buf = Path::new(image_path);
+        if image_path_buf.components().any(|c| {
+            matches!(
+                c,
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            )
+        }) {
+            return Err(ToolError::execution_failed(
+                "image_path must be a relative path within the workspace and cannot escape it.",
+            ));
+        }
+
+        let workspace = workspace.canonicalize().map_err(|e| {
+            ToolError::execution_failed(format!("Failed to resolve workspace path: {e}"))
+        })?;
+        let candidate = workspace.join(image_path_buf);
+        let resolved = candidate.canonicalize().map_err(|e| {
+            ToolError::execution_failed(format!("Failed to resolve image file: {e}"))
+        })?;
+        if !resolved.starts_with(&workspace) {
+            return Err(ToolError::execution_failed(
+                "image_path must resolve within the workspace and cannot escape it.",
+            ));
+        }
+        Ok(resolved)
     }
 
     fn detect_mime_type(path: &Path) -> Result<String, ToolError> {
@@ -66,6 +96,59 @@ impl ImageAnalyzeTool {
 
     fn api_key(&self) -> String {
         self.config.api_key.clone().unwrap_or_default()
+    }
+
+    fn is_xiaomi_mimo_model(model: &str) -> bool {
+        let normalized = model.trim().to_ascii_lowercase();
+        let normalized = normalized.strip_prefix("xiaomi/").unwrap_or(&normalized);
+        normalized.starts_with("mimo-")
+    }
+
+    fn uses_max_completion_tokens(config: &VisionModelConfig) -> bool {
+        if Self::is_xiaomi_mimo_model(&config.model) {
+            return true;
+        }
+
+        let base_url = config.base_url.as_deref().unwrap_or_default();
+        let Ok(url) = reqwest::Url::parse(base_url) else {
+            return false;
+        };
+        let Some(domain) = url.domain() else {
+            return false;
+        };
+
+        domain.eq_ignore_ascii_case("xiaomimimo.com")
+            || domain.to_ascii_lowercase().ends_with(".xiaomimimo.com")
+    }
+
+    fn request_payload(&self, prompt: &str, image_data: &str, mime_type: &str) -> Value {
+        let mut payload = json!({
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", mime_type, image_data)
+                            }
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0.7
+        });
+
+        let token_limit_field = if Self::uses_max_completion_tokens(&self.config) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        payload[token_limit_field] = json!(DEFAULT_VISION_MAX_OUTPUT_TOKENS);
+
+        payload
     }
 }
 
@@ -108,39 +191,10 @@ impl ToolSpec for ImageAnalyzeTool {
             .and_then(|v| v.as_str())
             .unwrap_or("Describe this image in detail.");
 
-        let image_path_buf = Path::new(image_path);
-        if image_path_buf.components().any(|c| {
-            matches!(
-                c,
-                Component::Prefix(_) | Component::RootDir | Component::ParentDir
-            )
-        }) {
-            return Err(ToolError::execution_failed(
-                "image_path must be a relative path within the workspace and cannot escape it.",
-            ));
-        }
-        let resolved_path = context.workspace.join(image_path_buf);
+        let resolved_path = Self::resolve_image_path(&context.workspace, image_path)?;
         let (image_data, mime_type) = Self::read_image_file(&resolved_path).await?;
 
-        let payload = json!({
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{};base64,{}", mime_type, image_data)
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 4096,
-            "temperature": 0.7
-        });
+        let payload = self.request_payload(prompt, &image_data, &mime_type);
 
         let url = format!("{}/chat/completions", self.base_url());
         let api_key = self.api_key();
@@ -176,6 +230,11 @@ impl ToolSpec for ImageAnalyzeTool {
                             .text()
                             .await
                             .unwrap_or_else(|_| "Unknown error".to_string());
+                        let error_text = sanitize_http_error_body(
+                            Some("Vision provider"),
+                            status.as_u16(),
+                            &error_text,
+                        );
                         return Err(LlmError::from_http_response(status.as_u16(), &error_text));
                     }
                     Ok(response)
@@ -221,6 +280,22 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn create_file_symlink(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
     fn fake_config() -> VisionModelConfig {
         VisionModelConfig {
             model: "test-vision-model".to_string(),
@@ -262,6 +337,51 @@ mod tests {
         assert!(err.to_string().contains("Unsupported image format"));
     }
 
+    #[test]
+    fn generic_vision_payload_uses_max_tokens() {
+        let tool = ImageAnalyzeTool::new(fake_config());
+
+        let payload = tool.request_payload("describe", "abc123", "image/png");
+
+        assert_eq!(
+            payload.get("max_tokens").and_then(Value::as_u64),
+            Some(u64::from(DEFAULT_VISION_MAX_OUTPUT_TOKENS))
+        );
+        assert!(payload.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn xiaomi_mimo_vision_payload_uses_max_completion_tokens() {
+        let mut config = fake_config();
+        config.model = "mimo-v2.5".to_string();
+        config.base_url = Some("https://api.xiaomimimo.com/v1".to_string());
+        let tool = ImageAnalyzeTool::new(config);
+
+        let payload = tool.request_payload("describe", "abc123", "image/png");
+
+        assert_eq!(
+            payload.get("max_completion_tokens").and_then(Value::as_u64),
+            Some(u64::from(DEFAULT_VISION_MAX_OUTPUT_TOKENS))
+        );
+        assert!(payload.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn xiaomi_mimo_vision_payload_uses_max_completion_tokens_with_custom_proxy() {
+        let mut config = fake_config();
+        config.model = "mimo-v2.5".to_string();
+        config.base_url = Some("https://vision-proxy.example.invalid/v1".to_string());
+        let tool = ImageAnalyzeTool::new(config);
+
+        let payload = tool.request_payload("describe", "abc123", "image/png");
+
+        assert_eq!(
+            payload.get("max_completion_tokens").and_then(Value::as_u64),
+            Some(u64::from(DEFAULT_VISION_MAX_OUTPUT_TOKENS))
+        );
+        assert!(payload.get("max_tokens").is_none());
+    }
+
     #[tokio::test]
     async fn execute_rejects_absolute_path() {
         // Trust-boundary pin: image_path must stay inside the workspace
@@ -299,6 +419,30 @@ mod tests {
             err.to_string()
                 .contains("relative path within the workspace"),
             "error must call out the workspace boundary; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_symlink_that_resolves_outside_workspace() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let outside_image = outside.path().join("outside.png");
+        std::fs::write(&outside_image, b"not a real png").expect("write outside image");
+        let link = workspace.path().join("linked.png");
+        if let Err(err) = create_file_symlink(&outside_image, &link) {
+            eprintln!("skipping symlink assertion: {err}");
+            return;
+        }
+
+        let ctx = ToolContext::new(workspace.path().to_path_buf());
+        let tool = ImageAnalyzeTool::new(fake_config());
+        let err = tool
+            .execute(json!({"image_path": "linked.png"}), &ctx)
+            .await
+            .expect_err("symlink target outside workspace must reject before reading");
+        assert!(
+            err.to_string().contains("resolve within the workspace"),
+            "error must call out the canonical workspace boundary; got {err}"
         );
     }
 }

@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -14,6 +14,7 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
 };
+use crate::dependencies::ExternalTool;
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_MAX_COUNT: u64 = 20;
@@ -203,6 +204,7 @@ impl ToolSpec for GitShowTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let rev = required_str(&input, "rev")?;
+        validate_git_rev(rev)?;
         let git_ctx = resolve_git_context(context, optional_str(&input, "path"))?;
         let patch = optional_bool(&input, "patch", true);
         let stat = optional_bool(&input, "stat", true);
@@ -338,6 +340,7 @@ impl ToolSpec for GitBlameTool {
         })?;
         let pathspec = pathspec_from(working_dir, &resolved_path);
         let rev = optional_str(&input, "rev").unwrap_or("HEAD");
+        validate_git_rev(rev)?;
         let start_line = optional_u64(&input, "start_line", DEFAULT_BLAME_START_LINE).max(1);
         let max_lines = optional_u64(&input, "max_lines", DEFAULT_BLAME_MAX_LINES)
             .clamp(1, MAX_BLAME_MAX_LINES);
@@ -430,6 +433,34 @@ fn resolve_git_context(context: &ToolContext, path: Option<&str>) -> Result<GitC
     })
 }
 
+fn validate_git_rev(rev: &str) -> Result<(), ToolError> {
+    let trimmed = rev.trim();
+    if trimmed.is_empty() {
+        return Err(ToolError::invalid_input(
+            "git revision must not be empty".to_string(),
+        ));
+    }
+    if trimmed.starts_with('-') {
+        return Err(ToolError::invalid_input(
+            "git revision must not start with '-'".to_string(),
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(ToolError::invalid_input(
+            "git revision must not contain whitespace".to_string(),
+        ));
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch == '\0' || ch.is_ascii_control())
+    {
+        return Err(ToolError::invalid_input(
+            "git revision must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn canonical_or_workspace(workspace: &Path) -> PathBuf {
     workspace
         .canonicalize()
@@ -445,7 +476,11 @@ fn pathspec_from(working_dir: &Path, resolved: &Path) -> PathBuf {
 }
 
 fn run_git_command(working_dir: &Path, args: &[String]) -> Result<Output, ToolError> {
-    let mut cmd = Command::new("git");
+    let Some(mut cmd) = crate::dependencies::Git::command() else {
+        return Err(ToolError::not_available(
+            "git is not installed or not in PATH",
+        ));
+    };
     cmd.args(args).current_dir(working_dir);
     cmd.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -500,28 +535,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
     use tempfile::tempdir;
 
     fn git_available() -> bool {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::dependencies::Git::available()
     }
 
     fn run_git(root: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .status()
-            .expect("git should spawn");
+        let status = crate::dependencies::Git::status(args, root).expect("git should spawn");
         assert!(status.success(), "git {args:?} failed");
     }
 
     fn init_git_repo(root: &Path) {
         run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "core.autocrlf", "false"]);
         run_git(root, &["config", "user.email", "test@example.com"]);
         run_git(root, &["config", "user.name", "Test User"]);
     }
@@ -577,6 +604,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_show_rejects_option_like_revision() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        let err = GitShowTool
+            .execute(json!({ "rev": "--stat" }), &ctx)
+            .await
+            .expect_err("option-shaped rev should fail before git runs");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[tokio::test]
+    async fn git_show_rejects_whitespace_revision_payload() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+        let err = GitShowTool
+            .execute(
+                json!({ "rev": "HEAD --output=/tmp/codewhale-git-show" }),
+                &ctx,
+            )
+            .await
+            .expect_err("whitespace rev payload should fail before git runs");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+        assert!(err.to_string().contains("must not contain whitespace"));
+    }
+
+    #[tokio::test]
     async fn git_blame_reports_author_for_range() {
         if !git_available() {
             return;
@@ -606,6 +660,40 @@ mod tests {
             .expect("execute");
         assert!(result.success);
         assert!(result.content.contains("Test User"));
+    }
+
+    #[tokio::test]
+    async fn git_blame_rejects_option_like_revision() {
+        let tmp = tempdir().expect("tempdir");
+        let file = tmp.path().join("file.txt");
+        fs::write(&file, "one\n").expect("write");
+        let ctx = ToolContext::new(tmp.path());
+        let err = GitBlameTool
+            .execute(
+                json!({ "path": "file.txt", "rev": "--contents=/tmp/x" }),
+                &ctx,
+            )
+            .await
+            .expect_err("option-shaped rev should fail before git runs");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[tokio::test]
+    async fn git_blame_rejects_whitespace_revision_payload() {
+        let tmp = tempdir().expect("tempdir");
+        let file = tmp.path().join("file.txt");
+        fs::write(&file, "one\n").expect("write");
+        let ctx = ToolContext::new(tmp.path());
+        let err = GitBlameTool
+            .execute(
+                json!({ "path": "file.txt", "rev": "HEAD --contents=/tmp/codewhale-git-blame" }),
+                &ctx,
+            )
+            .await
+            .expect_err("whitespace rev payload should fail before git runs");
+        assert!(matches!(err, ToolError::InvalidInput { .. }));
+        assert!(err.to_string().contains("must not contain whitespace"));
     }
 
     #[tokio::test]

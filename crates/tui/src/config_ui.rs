@@ -1,8 +1,6 @@
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
 #[cfg(feature = "web")]
-use std::process::Command;
-#[cfg(feature = "web")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -68,6 +66,11 @@ pub struct SettingsSection {
     pub composer_density: ComposerDensityValue,
     pub composer_border: bool,
     pub composer_vim_mode: ComposerVimModeValue,
+    #[schemars(range(min = 0))]
+    pub mention_menu_limit: usize,
+    pub mention_menu_behavior: MentionMenuBehaviorValue,
+    #[schemars(range(min = 0))]
+    pub mention_walk_depth: usize,
     pub transcript_spacing: TranscriptSpacingValue,
     pub status_indicator: StatusIndicatorValue,
     pub synchronized_output: SynchronizedOutputValue,
@@ -80,6 +83,11 @@ pub struct SettingsSection {
     pub max_history: usize,
     pub cost_currency: CostCurrencyValue,
     pub prefer_external_pdftotext: bool,
+    #[schemars(
+        title = "Follow symlinks",
+        description = "Follow symbolic links during workspace file discovery walks. Enable for symlink-based multi-project workspaces."
+    )]
+    pub workspace_follow_symlinks: bool,
     pub default_model: Option<String>,
 }
 
@@ -147,6 +155,7 @@ pub enum WebConfigSessionEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalModeValue {
     Auto,
+    Bypass,
     Suggest,
     Never,
 }
@@ -184,6 +193,7 @@ pub enum UiThemeValue {
     TokyoNight,
     Dracula,
     GruvboxDark,
+    Matrix,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -199,6 +209,13 @@ pub enum ComposerDensityValue {
 pub enum ComposerVimModeValue {
     Normal,
     Vim,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionMenuBehaviorValue {
+    Fuzzy,
+    Browser,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -228,7 +245,7 @@ pub enum CostCurrencyValue {
 #[serde(rename_all = "snake_case")]
 pub enum SidebarFocusValue {
     Auto,
-    Work,
+    Pinned,
     Tasks,
     Agents,
     Context,
@@ -269,7 +286,6 @@ pub enum StatusItemValue {
     Model,
     Cost,
     Status,
-    Coherence,
     Agents,
     ReasoningReplay,
     PrefixStability,
@@ -279,6 +295,7 @@ pub enum StatusItemValue {
     LastToolElapsed,
     RateLimit,
     Tokens,
+    Balance,
 }
 
 pub fn parse_mode(arg: Option<&str>) -> Result<ConfigUiMode, String> {
@@ -313,7 +330,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             approval_mode: app.approval_mode.into(),
         },
         settings: SettingsSection {
-            auto_compact: settings.auto_compact,
+            auto_compact: app.auto_compact,
             calm_mode: settings.calm_mode,
             low_motion: settings.low_motion,
             fancy_animations: settings.fancy_animations,
@@ -327,6 +344,9 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             composer_density: settings.composer_density.as_str().into(),
             composer_border: settings.composer_border,
             composer_vim_mode: settings.composer_vim_mode.as_str().into(),
+            mention_menu_limit: settings.mention_menu_limit,
+            mention_menu_behavior: settings.mention_menu_behavior.as_str().into(),
+            mention_walk_depth: settings.mention_walk_depth,
             transcript_spacing: settings.transcript_spacing.as_str().into(),
             status_indicator: settings.status_indicator.as_str().into(),
             synchronized_output: settings.synchronized_output.as_str().into(),
@@ -337,6 +357,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             max_history: settings.max_input_history,
             cost_currency: CostCurrencyValue::from_setting(&settings.cost_currency)?,
             prefer_external_pdftotext: settings.prefer_external_pdftotext,
+            workspace_follow_symlinks: settings.workspace_follow_symlinks,
             default_model,
         },
         config: ConfigSection {
@@ -390,7 +411,7 @@ pub async fn start_web_editor(app: &App, config: &Config) -> Result<WebConfigSes
         let poll_tx = tx.clone();
         let poll_url = format!("{url}/api/session");
         let poll_task = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = crate::tls::reqwest_client();
             let mut last: Option<ConfigUiDocument> = Some(app_snapshot);
             loop {
                 tokio::time::sleep(Duration::from_millis(750)).await;
@@ -504,6 +525,18 @@ pub fn apply_document(
             doc.settings.composer_vim_mode.as_setting(),
         ),
         (
+            "mention_menu_limit",
+            &doc.settings.mention_menu_limit.to_string(),
+        ),
+        (
+            "mention_menu_behavior",
+            doc.settings.mention_menu_behavior.as_setting(),
+        ),
+        (
+            "mention_walk_depth",
+            &doc.settings.mention_walk_depth.to_string(),
+        ),
+        (
             "transcript_spacing",
             doc.settings.transcript_spacing.as_setting(),
         ),
@@ -524,6 +557,10 @@ pub fn apply_document(
         (
             "prefer_external_pdftotext",
             bool_str(doc.settings.prefer_external_pdftotext),
+        ),
+        (
+            "workspace_follow_symlinks",
+            bool_str(doc.settings.workspace_follow_symlinks),
         ),
         ("mcp_config_path", doc.config.mcp_config_path.as_str()),
     ] {
@@ -569,7 +606,7 @@ pub fn apply_document(
         app.status_items = new_status_items.clone();
         app.needs_redraw = true;
         if persist {
-            let path = commands::persist_status_items(&new_status_items)?;
+            let path = crate::config_persistence::persist_status_items(&new_status_items)?;
             notes.push(format!("status_items saved to {}", path.display()));
         } else {
             notes.push("status_items updated for this session".to_string());
@@ -603,36 +640,7 @@ pub fn parse_document(value: Value) -> Result<ConfigUiDocument> {
 
 #[cfg(feature = "web")]
 pub fn open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    return Err(anyhow::anyhow!(
-        "browser opening is unsupported on this platform"
-    ));
-
-    let status = command
-        .status()
-        .context("failed to launch browser command")?;
-    if !status.success() {
-        bail!("browser command exited with status {status}");
-    }
-    Ok(())
+    crate::utils::open_url(url)
 }
 
 fn validate_document(doc: &ConfigUiDocument) -> Result<()> {
@@ -651,11 +659,12 @@ fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
     let reloaded = Config::load(app.config_path.clone(), app.config_profile.as_deref())?;
     *config = reloaded.clone();
     app.api_provider = reloaded.api_provider();
-    app.reasoning_effort = ReasoningEffort::from_setting(
-        reloaded
-            .reasoning_effort()
-            .unwrap_or_else(|| app.reasoning_effort.as_setting()),
-    );
+    app.reasoning_effort =
+        ReasoningEffort::from_setting(reloaded.reasoning_effort().unwrap_or_else(|| {
+            app.reasoning_effort
+                .as_setting_for_provider(app.api_provider)
+        }))
+        .normalize_for_provider(app.api_provider);
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
     app.mcp_config_path = reloaded.mcp_config_path();
@@ -682,18 +691,19 @@ fn apply_reasoning_effort(
     value: ReasoningEffortValue,
     persist: bool,
 ) -> Result<()> {
-    let effort: ReasoningEffort = value.into();
+    let effort: ReasoningEffort =
+        ReasoningEffort::from(value).normalize_for_provider(app.api_provider);
     app.reasoning_effort = effort;
     app.last_effective_reasoning_effort = None;
     app.update_model_compaction_budget();
     if persist {
-        commands::persist_root_string_key(
+        crate::config_persistence::persist_root_string_key(
             app.config_path.as_deref(),
             "reasoning_effort",
-            effort.as_setting(),
+            effort.as_setting_for_provider(app.api_provider),
         )?;
     }
-    config.reasoning_effort = Some(effort.as_setting().to_string());
+    config.reasoning_effort = Some(effort.as_setting_for_provider(app.api_provider).to_string());
     Ok(())
 }
 
@@ -705,6 +715,7 @@ impl ApprovalModeValue {
     fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Bypass => "bypass",
             Self::Suggest => "suggest",
             Self::Never => "never",
         }
@@ -748,6 +759,7 @@ impl UiThemeValue {
             Self::TokyoNight => "tokyo-night",
             Self::Dracula => "dracula",
             Self::GruvboxDark => "gruvbox-dark",
+            Self::Matrix => "matrix",
         }
     }
 
@@ -761,6 +773,7 @@ impl UiThemeValue {
             Some("tokyo-night") => Ok(Self::TokyoNight),
             Some("dracula") => Ok(Self::Dracula),
             Some("gruvbox-dark") => Ok(Self::GruvboxDark),
+            Some("matrix") => Ok(Self::Matrix),
             Some(other) => bail!("unsupported theme '{other}'"),
             None => bail!("invalid theme '{value}'"),
         }
@@ -791,6 +804,24 @@ impl From<&str> for ComposerVimModeValue {
         match value.trim().to_ascii_lowercase().as_str() {
             "vim" => Self::Vim,
             _ => Self::Normal,
+        }
+    }
+}
+
+impl MentionMenuBehaviorValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Fuzzy => "fuzzy",
+            Self::Browser => "browser",
+        }
+    }
+}
+
+impl From<&str> for MentionMenuBehaviorValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "browser" => Self::Browser,
+            _ => Self::Fuzzy,
         }
     }
 }
@@ -838,7 +869,7 @@ impl SidebarFocusValue {
     fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Work => "work",
+            Self::Pinned => "pinned",
             Self::Tasks => "tasks",
             Self::Agents => "agents",
             Self::Context => "context",
@@ -851,6 +882,7 @@ impl From<ApprovalMode> for ApprovalModeValue {
     fn from(value: ApprovalMode) -> Self {
         match value {
             ApprovalMode::Auto => Self::Auto,
+            ApprovalMode::Bypass => Self::Bypass,
             ApprovalMode::Suggest => Self::Suggest,
             ApprovalMode::Never => Self::Never,
         }
@@ -921,6 +953,7 @@ impl From<&str> for DefaultModeValue {
         match AppMode::from_setting(value) {
             AppMode::Agent => Self::Agent,
             AppMode::Plan => Self::Plan,
+            AppMode::Auto => Self::Agent,
             AppMode::Yolo => Self::Yolo,
         }
     }
@@ -976,7 +1009,7 @@ impl From<&str> for SidebarFocusValue {
     fn from(value: &str) -> Self {
         match SidebarFocus::from_setting(value) {
             SidebarFocus::Auto => Self::Auto,
-            SidebarFocus::Work => Self::Work,
+            SidebarFocus::Pinned => Self::Pinned,
             SidebarFocus::Tasks => Self::Tasks,
             SidebarFocus::Agents => Self::Agents,
             SidebarFocus::Context => Self::Context,
@@ -992,7 +1025,6 @@ impl From<StatusItem> for StatusItemValue {
             StatusItem::Model => Self::Model,
             StatusItem::Cost => Self::Cost,
             StatusItem::Status => Self::Status,
-            StatusItem::Coherence => Self::Coherence,
             StatusItem::Agents => Self::Agents,
             StatusItem::ReasoningReplay => Self::ReasoningReplay,
             StatusItem::PrefixStability => Self::PrefixStability,
@@ -1002,6 +1034,7 @@ impl From<StatusItem> for StatusItemValue {
             StatusItem::LastToolElapsed => Self::LastToolElapsed,
             StatusItem::RateLimit => Self::RateLimit,
             StatusItem::Tokens => Self::Tokens,
+            StatusItem::Balance => Self::Balance,
         }
     }
 }
@@ -1013,7 +1046,6 @@ impl From<StatusItemValue> for StatusItem {
             StatusItemValue::Model => Self::Model,
             StatusItemValue::Cost => Self::Cost,
             StatusItemValue::Status => Self::Status,
-            StatusItemValue::Coherence => Self::Coherence,
             StatusItemValue::Agents => Self::Agents,
             StatusItemValue::ReasoningReplay => Self::ReasoningReplay,
             StatusItemValue::PrefixStability => Self::PrefixStability,
@@ -1023,6 +1055,7 @@ impl From<StatusItemValue> for StatusItem {
             StatusItemValue::LastToolElapsed => Self::LastToolElapsed,
             StatusItemValue::RateLimit => Self::RateLimit,
             StatusItemValue::Tokens => Self::Tokens,
+            StatusItemValue::Balance => Self::Balance,
         }
     }
 }
@@ -1034,7 +1067,7 @@ fn bool_str(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{ApiProvider, Config};
     use crate::test_support::lock_test_env;
     use crate::tui::app::{App, TuiOptions};
     use std::fs;
@@ -1065,7 +1098,16 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        let mut app = App::new(options, &Config::default());
+        // App::new merges developer-local settings, which can include a saved
+        // provider/model from the interactive TUI. Keep these config UI tests
+        // pinned to DeepSeek defaults so they only exercise document apply
+        // semantics.
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+        app.api_provider = ApiProvider::Deepseek;
+        app.model_ids_passthrough = false;
+        app
     }
 
     #[test]
@@ -1173,7 +1215,7 @@ background_color = "#1A1B26"
         let approval_mode = &schema["$defs"]["ApprovalModeValue"]["enum"];
         assert_eq!(
             approval_mode,
-            &serde_json::json!(["auto", "suggest", "never"])
+            &serde_json::json!(["auto", "bypass", "suggest", "never"])
         );
         let locale = &schema["$defs"]["UiLocale"]["enum"];
         assert_eq!(
@@ -1191,7 +1233,8 @@ background_color = "#1A1B26"
                 "catppuccin-mocha",
                 "tokyo-night",
                 "dracula",
-                "gruvbox-dark"
+                "gruvbox-dark",
+                "matrix"
             ])
         );
     }

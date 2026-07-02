@@ -21,7 +21,20 @@ use wait_timeout::ChildExt;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+#[cfg(windows)]
+use windows::core::PCWSTR;
 
+#[cfg(not(target_env = "ohos"))]
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::shell_output::{summarize_output, truncate_with_meta};
@@ -33,6 +46,7 @@ use crate::sandbox::{
     SandboxPolicy as ExecutionSandboxPolicy, // Rename to avoid conflict with spec::SandboxPolicy
     SandboxType,
 };
+use crate::worker_profile::ShellPolicy;
 
 /// Status of a shell process
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,7 +112,37 @@ pub struct ShellJobSnapshot {
     pub stderr_len: usize,
     pub stdin_available: bool,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_since_output_ms: Option<u64>,
     pub linked_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+}
+
+/// Once-only completion event for a tracked background shell job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellCompletionEvent {
+    pub task_id: String,
+    pub command: String,
+    pub status: ShellStatus,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub linked_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+}
+
+/// Optional owner attribution for background shell work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellJobOwner {
+    pub agent_id: String,
+    pub agent_name: String,
 }
 
 /// Full output view used by `/jobs show <id>`.
@@ -118,6 +162,7 @@ pub struct ShellDeltaResult {
 
 enum ShellChild {
     Process(Child),
+    #[cfg(not(target_env = "ohos"))]
     Pty(Box<dyn portable_pty::Child + Send>),
 }
 
@@ -153,7 +198,7 @@ fn kill_child_process_group(child: &mut Child) -> std::io::Result<()> {
 /// path (`kill_child_process_group` from the cancellation token) still
 /// handles normal shutdown; abnormal exit can leak children — tracked as a
 /// follow-up watchdog item per the original issue's acceptance criteria.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn install_parent_death_signal(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
@@ -215,12 +260,126 @@ fn push_shell_args(cmd: &mut Command, _program: &str, args: &[String]) {
     cmd.args(args);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn install_parent_death_signal(_cmd: &mut Command) {
     // No kernel-level equivalent on macOS / Windows. The cooperative
     // cancellation + process_group SIGKILL path covers normal shutdown;
     // abnormal exit (panic without unwind, SIGKILL of the TUI) can still
     // leak children on those platforms — tracked as a follow-up.
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsJob {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+// SAFETY: Windows job handles are process-wide kernel handles. Moving the
+// wrapper between threads does not invalidate the handle, and access is
+// externally synchronized by ShellManager's mutex.
+unsafe impl Send for WindowsJob {}
+#[cfg(windows)]
+// SAFETY: The wrapper exposes only terminate/drop operations around a kernel
+// handle; concurrent use is guarded by ShellManager.
+unsafe impl Sync for WindowsJob {}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach_to_child(child: &Child) -> std::io::Result<Self> {
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(windows_io_error)? };
+        let job = Self { handle };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(windows_io_error)?;
+
+            let process_handle = HANDLE(child.as_raw_handle());
+            AssignProcessToJobObject(job.handle, process_handle).map_err(windows_io_error)?;
+        }
+
+        Ok(job)
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        unsafe { TerminateJobObject(self.handle, 1).map_err(windows_io_error) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_io_error(error: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
+#[cfg(windows)]
+fn terminate_windows_job(job: Option<&WindowsJob>, child: &mut Child) -> std::io::Result<()> {
+    if let Some(job) = job {
+        match job.terminate() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "failed to terminate Windows job object; falling back to immediate child kill"
+                );
+            }
+        }
+    }
+    child.kill()
+}
+
+#[cfg(windows)]
+fn terminate_and_close_windows_job(windows_job: Option<WindowsJob>) {
+    if let Some(job) = windows_job.as_ref()
+        && let Err(err) = job.terminate()
+    {
+        tracing::warn!(
+            ?err,
+            "failed to terminate Windows shell job before closing job handle"
+        );
+    }
+    drop(windows_job);
+}
+
+#[cfg(windows)]
+fn terminate_child_and_close_windows_job(
+    windows_job: Option<WindowsJob>,
+    child: &mut Child,
+) -> std::io::Result<()> {
+    let result = terminate_windows_job(windows_job.as_ref(), child);
+    drop(windows_job);
+    result
+}
+
+#[cfg(windows)]
+fn attach_windows_job(child: &Child, command: &str) -> Option<WindowsJob> {
+    match WindowsJob::attach_to_child(child) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                command,
+                "failed to attach Windows shell process to job object; descendant cleanup degraded"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -237,6 +396,7 @@ impl ShellExitStatus {
         }
     }
 
+    #[cfg(not(target_env = "ohos"))]
     fn from_pty(status: portable_pty::ExitStatus) -> Self {
         let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
         Self {
@@ -252,6 +412,7 @@ impl ShellChild {
             ShellChild::Process(child) => child
                 .try_wait()
                 .map(|status| status.map(ShellExitStatus::from_std)),
+            #[cfg(not(target_env = "ohos"))]
             ShellChild::Pty(child) => child
                 .try_wait()
                 .map(|status| status.map(ShellExitStatus::from_pty)),
@@ -261,16 +422,19 @@ impl ShellChild {
     fn wait(&mut self) -> std::io::Result<ShellExitStatus> {
         match self {
             ShellChild::Process(child) => child.wait().map(ShellExitStatus::from_std),
+            #[cfg(not(target_env = "ohos"))]
             ShellChild::Pty(child) => child.wait().map(ShellExitStatus::from_pty),
         }
     }
 
+    #[cfg(not(windows))]
     fn kill(&mut self) -> std::io::Result<()> {
         match self {
             #[cfg(unix)]
             ShellChild::Process(child) => kill_child_process_group(child),
             #[cfg(not(unix))]
             ShellChild::Process(child) => child.kill(),
+            #[cfg(not(target_env = "ohos"))]
             ShellChild::Pty(child) => child.kill(),
         }
     }
@@ -278,6 +442,7 @@ impl ShellChild {
 
 enum StdinWriter {
     Pipe(ChildStdin),
+    #[cfg(not(target_env = "ohos"))]
     Pty(Box<dyn Write + Send>),
 }
 
@@ -285,6 +450,7 @@ impl StdinWriter {
     fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
         match self {
             StdinWriter::Pipe(stdin) => stdin.write_all(data),
+            #[cfg(not(target_env = "ohos"))]
             StdinWriter::Pty(writer) => writer.write_all(data),
         }
     }
@@ -292,6 +458,7 @@ impl StdinWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             StdinWriter::Pipe(stdin) => stdin.flush(),
+            #[cfg(not(target_env = "ohos"))]
             StdinWriter::Pty(writer) => writer.flush(),
         }
     }
@@ -317,6 +484,26 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
     })
 }
 
+const SYNC_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const STALE_NO_OUTPUT_AFTER: Duration = Duration::from_secs(60);
+
+fn spawn_sync_reader_thread<R: Read + Send + 'static>(
+    mut reader: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        tx.send(buf).ok();
+    });
+    rx
+}
+
+fn recv_sync_reader_output(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(SYNC_READER_DRAIN_TIMEOUT)
+        .unwrap_or_default()
+}
+
 /// A background shell process being tracked
 pub struct BackgroundShell {
     pub id: String,
@@ -325,14 +512,20 @@ pub struct BackgroundShell {
     pub status: ShellStatus,
     pub exit_code: Option<i32>,
     pub started_at: Instant,
+    last_output_at: Instant,
+    last_observed_output_len: usize,
     pub sandbox_type: SandboxType,
     pub linked_task_id: Option<String>,
+    pub owner_agent: Option<ShellJobOwner>,
     stdout_buffer: Arc<Mutex<Vec<u8>>>,
     stderr_buffer: Option<Arc<Mutex<Vec<u8>>>>,
     stdout_cursor: usize,
     stderr_cursor: usize,
+    completion_reported: bool,
     stdin: Option<StdinWriter>,
     child: Option<ShellChild>,
+    #[cfg(windows)]
+    windows_job: Option<WindowsJob>,
     stdout_thread: Option<std::thread::JoinHandle<()>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -340,6 +533,7 @@ pub struct BackgroundShell {
 impl BackgroundShell {
     /// Check if the process has completed and update status
     fn poll(&mut self) -> bool {
+        self.refresh_output_activity();
         if self.status != ShellStatus::Running {
             return true;
         }
@@ -368,6 +562,28 @@ impl BackgroundShell {
         }
     }
 
+    fn refresh_output_activity(&mut self) {
+        let observed_len = self.observed_output_len();
+        if observed_len != self.last_observed_output_len {
+            self.last_observed_output_len = observed_len;
+            self.last_output_at = Instant::now();
+        }
+    }
+
+    fn observed_output_len(&self) -> usize {
+        let stdout_len = self
+            .stdout_buffer
+            .lock()
+            .map(|data| data.len())
+            .unwrap_or(0);
+        let stderr_len = self
+            .stderr_buffer
+            .as_ref()
+            .and_then(|buffer| buffer.lock().ok().map(|data| data.len()))
+            .unwrap_or(0);
+        stdout_len.saturating_add(stderr_len)
+    }
+
     /// Collect output from the background threads
     fn collect_output(&mut self) {
         // Kill the whole process group before joining reader threads.
@@ -376,9 +592,17 @@ impl BackgroundShell {
         // Without this kill, handle.join() blocks indefinitely, freezing the UI
         // event loop that calls list_jobs() → poll() → collect_output().
         #[cfg(unix)]
-        if let Some(ShellChild::Process(ref mut proc)) = self.child {
-            let _ = kill_child_process_group(proc);
+        if let Some(child) = self.child.as_mut() {
+            match child {
+                ShellChild::Process(proc) => {
+                    let _ = kill_child_process_group(proc);
+                }
+                #[cfg(not(target_env = "ohos"))]
+                ShellChild::Pty(_) => {}
+            }
         }
+        #[cfg(windows)]
+        terminate_and_close_windows_job(self.windows_job.take());
         if let Some(handle) = self.stdout_thread.take() {
             let _ = handle.join();
         }
@@ -445,6 +669,11 @@ impl BackgroundShell {
         let stdout_delta_len = stdout_delta.len();
         let stderr_delta_len = stderr_delta.len();
 
+        if stdout_delta_len > 0 || stderr_delta_len > 0 {
+            self.last_output_at = Instant::now();
+            self.last_observed_output_len = stdout_total.saturating_add(stderr_total);
+        }
+
         (
             String::from_utf8_lossy(&stdout_delta).to_string(),
             String::from_utf8_lossy(&stderr_delta).to_string(),
@@ -470,8 +699,26 @@ impl BackgroundShell {
     /// Kill the process
     fn kill(&mut self) -> Result<()> {
         if let Some(ref mut child) = self.child {
-            child.kill().context("Failed to kill process")?;
-            let _ = child.wait();
+            match child {
+                ShellChild::Process(proc) => {
+                    #[cfg(windows)]
+                    {
+                        terminate_windows_job(self.windows_job.as_ref(), proc)
+                            .context("Failed to kill process tree")?;
+                        let _ = proc.wait();
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        proc.kill().context("Failed to kill process")?;
+                        let _ = proc.wait();
+                    }
+                }
+                #[cfg(not(target_env = "ohos"))]
+                ShellChild::Pty(child) => {
+                    child.kill().context("Failed to kill process")?;
+                    let _ = child.wait();
+                }
+            }
         }
         self.status = ShellStatus::Killed;
         self.collect_output();
@@ -520,6 +767,11 @@ impl BackgroundShell {
             .as_ref()
             .map(|buf| tail_from_buffer(buf, 1200))
             .unwrap_or((0, String::new()));
+        let elapsed_since_output_ms = (self.status == ShellStatus::Running)
+            .then(|| u64::try_from(self.last_output_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let stale = elapsed_since_output_ms.is_some_and(|elapsed| {
+            elapsed >= u64::try_from(STALE_NO_OUTPUT_AFTER.as_millis()).unwrap_or(u64::MAX)
+        });
         ShellJobSnapshot {
             id: self.id.clone(),
             job_id: self.id.clone(),
@@ -533,8 +785,33 @@ impl BackgroundShell {
             stdout_len,
             stderr_len,
             stdin_available: self.stdin.is_some() && self.status == ShellStatus::Running,
-            stale: false,
+            stale,
+            elapsed_since_output_ms,
             linked_task_id: self.linked_task_id.clone(),
+            owner_agent_id: self
+                .owner_agent
+                .as_ref()
+                .map(|owner| owner.agent_id.clone()),
+            owner_agent_name: self
+                .owner_agent
+                .as_ref()
+                .map(|owner| owner.agent_name.clone()),
+        }
+    }
+
+    fn completion_event(&self) -> ShellCompletionEvent {
+        let snapshot = self.job_snapshot();
+        ShellCompletionEvent {
+            task_id: snapshot.id,
+            command: snapshot.command,
+            status: snapshot.status,
+            exit_code: snapshot.exit_code,
+            duration_ms: snapshot.elapsed_ms,
+            stdout_tail: snapshot.stdout_tail,
+            stderr_tail: snapshot.stderr_tail,
+            linked_task_id: snapshot.linked_task_id,
+            owner_agent_id: snapshot.owner_agent_id,
+            owner_agent_name: snapshot.owner_agent_name,
         }
     }
 
@@ -553,6 +830,17 @@ impl Drop for BackgroundShell {
         if self.status == ShellStatus::Running
             && let Some(ref mut child) = self.child
         {
+            #[cfg(windows)]
+            match child {
+                ShellChild::Process(proc) => {
+                    let _ = terminate_windows_job(self.windows_job.as_ref(), proc);
+                }
+                #[cfg(not(target_env = "ohos"))]
+                ShellChild::Pty(child) => {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(windows))]
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -731,6 +1019,37 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
     ) -> Result<ShellResult> {
+        self.execute_with_options_env_for_owner(
+            command,
+            working_dir,
+            timeout_ms,
+            background,
+            stdin_data,
+            tty,
+            policy_override,
+            extra_env,
+            None,
+        )
+    }
+
+    /// Same as `execute_with_options_env`, with optional background-job owner
+    /// attribution for sub-agent launched jobs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_options_env_for_owner(
+        &mut self,
+        command: &str,
+        working_dir: Option<&str>,
+        timeout_ms: u64,
+        background: bool,
+        stdin_data: Option<&str>,
+        tty: bool,
+        policy_override: Option<ExecutionSandboxPolicy>,
+        extra_env: HashMap<String, String>,
+        owner_agent: Option<ShellJobOwner>,
+    ) -> Result<ShellResult> {
+        // Log execution via ShellDispatcher when SHELL_DISPATCHER_LOG is set.
+        crate::shell_dispatcher::ShellDispatcher::log_exec(command);
+
         let work_dir = working_dir.map_or_else(|| self.default_workspace.clone(), PathBuf::from);
 
         // Clamp timeout to max 10 minutes (600000ms)
@@ -746,7 +1065,14 @@ impl ShellManager {
         let exec_env = self.sandbox_manager.prepare(&spec);
 
         if background {
-            self.spawn_background_sandboxed(command, &work_dir, &exec_env, stdin_data, tty)
+            self.spawn_background_sandboxed(
+                command,
+                &work_dir,
+                &exec_env,
+                stdin_data,
+                tty,
+                owner_agent,
+            )
         } else {
             if tty {
                 return Err(anyhow!(
@@ -794,6 +1120,8 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
     ) -> Result<ShellResult> {
+        crate::shell_dispatcher::ShellDispatcher::log_exec(command);
+
         let work_dir = working_dir.map_or_else(|| self.default_workspace.clone(), PathBuf::from);
 
         let timeout_ms = timeout_ms.clamp(1000, 600_000);
@@ -825,6 +1153,7 @@ impl ShellManager {
         let args = exec_env.args();
 
         let mut cmd = Command::new(program);
+        crate::utils::suppress_console_window(&mut cmd);
         push_shell_args(&mut cmd, program, args);
         cmd.current_dir(working_dir)
             .stdout(Stdio::piped())
@@ -841,9 +1170,31 @@ impl ShellManager {
 
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
 
+        // Disable raw mode before spawn; restore only if raw mode was active
+        // on entry (issue #1690).
+        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        if raw_mode_was_enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        struct SyncRawModeGuard {
+            restore: bool,
+        }
+        impl Drop for SyncRawModeGuard {
+            fn drop(&mut self) {
+                if self.restore {
+                    let _ = crossterm::terminal::enable_raw_mode();
+                }
+            }
+        }
+        let _guard = SyncRawModeGuard {
+            restore: raw_mode_was_enabled,
+        };
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to execute: {original_command}"))?;
+        #[cfg(windows)]
+        let windows_job = attach_windows_job(&child, original_command);
 
         if let Some(input) = stdin_data
             && let Some(mut stdin) = child.stdin.take()
@@ -857,25 +1208,20 @@ impl ShellManager {
         let stdout_handle = child.stdout.take().context("Failed to capture stdout")?;
         let stderr_handle = child.stderr.take().context("Failed to capture stderr")?;
 
-        // Spawn threads to read output
-        let stdout_thread = std::thread::spawn(move || {
-            let mut reader = stdout_handle;
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            let mut reader = stderr_handle;
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        // Spawn threads to read output. Use bounded receives below so a killed
+        // or detached descendant that keeps pipe handles open cannot wedge the
+        // foreground shell path while the global tool lock is held (#2571).
+        let stdout_rx = spawn_sync_reader_thread(stdout_handle);
+        let stderr_rx = spawn_sync_reader_thread(stderr_handle);
 
         // Wait with timeout
         if let Some(status) = child.wait_timeout(timeout)? {
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
+            #[cfg(unix)]
+            let _ = kill_child_process_group(&mut child);
+            #[cfg(windows)]
+            terminate_and_close_windows_job(windows_job);
+            let stdout = recv_sync_reader_output(&stdout_rx);
+            let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
             let exit_code = status.code().unwrap_or(-1);
@@ -914,11 +1260,13 @@ impl ShellManager {
             // Timeout - kill the process
             #[cfg(unix)]
             let _ = kill_child_process_group(&mut child);
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let _ = terminate_child_and_close_windows_job(windows_job, &mut child);
+            #[cfg(all(not(unix), not(windows)))]
             let _ = child.kill();
             let status = child.wait().ok();
-            let stdout = stdout_thread.join().unwrap_or_default();
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let stdout = recv_sync_reader_output(&stdout_rx);
+            let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
             let (stdout, stdout_meta) = truncate_with_meta(&stdout_str);
@@ -964,6 +1312,7 @@ impl ShellManager {
         let args = exec_env.args();
 
         let mut cmd = Command::new(program);
+        crate::utils::suppress_console_window(&mut cmd);
         push_shell_args(&mut cmd, program, args);
         cmd.current_dir(working_dir)
             .stdin(Stdio::inherit())
@@ -975,13 +1324,37 @@ impl ShellManager {
         }
         install_parent_death_signal(&mut cmd);
 
+        // Disable raw mode before spawn; restore only if raw mode was active
+        // on entry (issue #1690).
+        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        if raw_mode_was_enabled {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        struct InteractiveRawModeGuard {
+            restore: bool,
+        }
+        impl Drop for InteractiveRawModeGuard {
+            fn drop(&mut self) {
+                if self.restore {
+                    let _ = crossterm::terminal::enable_raw_mode();
+                }
+            }
+        }
+        let _guard = InteractiveRawModeGuard {
+            restore: raw_mode_was_enabled,
+        };
+
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
 
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to execute: {original_command}"))?;
+        #[cfg(windows)]
+        let windows_job = attach_windows_job(&child, original_command);
 
         if let Some(status) = child.wait_timeout(timeout)? {
+            #[cfg(windows)]
+            terminate_and_close_windows_job(windows_job);
             Ok(ShellResult {
                 task_id: None,
                 status: if status.success() {
@@ -1010,7 +1383,9 @@ impl ShellManager {
         } else {
             #[cfg(unix)]
             let _ = kill_child_process_group(&mut child);
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let _ = terminate_child_and_close_windows_job(windows_job, &mut child);
+            #[cfg(all(not(unix), not(windows)))]
             let _ = child.kill();
             let status = child.wait().ok();
 
@@ -1046,6 +1421,7 @@ impl ShellManager {
         exec_env: &ExecEnv,
         stdin_data: Option<&str>,
         tty: bool,
+        owner_agent: Option<ShellJobOwner>,
     ) -> Result<ShellResult> {
         let task_id = format!("shell_{}", &Uuid::new_v4().to_string()[..8]);
         let started = Instant::now();
@@ -1056,6 +1432,13 @@ impl ShellManager {
         let program = exec_env.program();
         let args = exec_env.args();
 
+        #[cfg(target_env = "ohos")]
+        if tty {
+            return Err(anyhow!(
+                "TTY shell mode is not supported on HarmonyOS/OpenHarmony yet."
+            ));
+        }
+
         let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
         let stderr_buffer = if tty {
             None
@@ -1063,48 +1446,58 @@ impl ShellManager {
             Some(Arc::new(Mutex::new(Vec::new())))
         };
 
+        #[cfg(windows)]
+        let mut windows_job = None;
+
         let (child, stdin, stdout_thread, stderr_thread) = if tty {
-            let pty_system = native_pty_system();
-            let pair = pty_system
-                .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("Failed to open PTY")?;
+            #[cfg(target_env = "ohos")]
+            unreachable!("OHOS TTY mode returns before PTY setup");
 
-            let mut cmd = CommandBuilder::new(program);
-            for arg in args {
-                cmd.arg(arg);
+            #[cfg(not(target_env = "ohos"))]
+            {
+                let pty_system = native_pty_system();
+                let pair = pty_system
+                    .openpty(PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .context("Failed to open PTY")?;
+
+                let mut cmd = CommandBuilder::new(program);
+                for arg in args {
+                    cmd.arg(arg);
+                }
+                cmd.cwd(working_dir);
+                child_env::apply_to_pty_command(&mut cmd, child_env::string_map_env(&exec_env.env));
+
+                let child = pair
+                    .slave
+                    .spawn_command(cmd)
+                    .with_context(|| format!("Failed to spawn PTY command: {original_command}"))?;
+                drop(pair.slave);
+
+                let reader = pair
+                    .master
+                    .try_clone_reader()
+                    .context("Failed to clone PTY reader")?;
+                let stdout_thread = Some(spawn_reader_thread(reader, Arc::clone(&stdout_buffer)));
+                let writer = pair
+                    .master
+                    .take_writer()
+                    .context("Failed to take PTY writer")?;
+
+                (
+                    ShellChild::Pty(child),
+                    Some(StdinWriter::Pty(writer)),
+                    stdout_thread,
+                    None,
+                )
             }
-            cmd.cwd(working_dir);
-            child_env::apply_to_pty_command(&mut cmd, child_env::string_map_env(&exec_env.env));
-
-            let child = pair
-                .slave
-                .spawn_command(cmd)
-                .with_context(|| format!("Failed to spawn PTY command: {original_command}"))?;
-            drop(pair.slave);
-
-            let reader = pair
-                .master
-                .try_clone_reader()
-                .context("Failed to clone PTY reader")?;
-            let stdout_thread = Some(spawn_reader_thread(reader, Arc::clone(&stdout_buffer)));
-            let writer = pair
-                .master
-                .take_writer()
-                .context("Failed to take PTY writer")?;
-
-            (
-                ShellChild::Pty(child),
-                Some(StdinWriter::Pty(writer)),
-                stdout_thread,
-                None,
-            )
         } else {
             let mut cmd = Command::new(program);
+            crate::utils::suppress_console_window(&mut cmd);
             push_shell_args(&mut cmd, program, args);
             cmd.current_dir(working_dir)
                 .stdin(Stdio::piped())
@@ -1120,6 +1513,10 @@ impl ShellManager {
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("Failed to spawn background: {original_command}"))?;
+            #[cfg(windows)]
+            {
+                windows_job = attach_windows_job(&child, original_command);
+            }
 
             let stdout_handle = child.stdout.take().context("Failed to capture stdout")?;
             let stderr_handle = child.stderr.take().context("Failed to capture stderr")?;
@@ -1148,14 +1545,20 @@ impl ShellManager {
             status: ShellStatus::Running,
             exit_code: None,
             started_at: started,
+            last_output_at: started,
+            last_observed_output_len: 0,
             sandbox_type,
             linked_task_id: None,
+            owner_agent,
             stdout_buffer,
             stderr_buffer,
             stdout_cursor: 0,
             stderr_cursor: 0,
+            completion_reported: false,
             stdin,
             child: Some(child),
+            #[cfg(windows)]
+            windows_job,
             stdout_thread,
             stderr_thread,
         };
@@ -1388,6 +1791,21 @@ impl ShellManager {
         jobs
     }
 
+    /// Drain finished background shell jobs that have not yet been reported to
+    /// runtime status.
+    pub fn drain_finished_jobs(&mut self) -> Vec<ShellCompletionEvent> {
+        let mut events = Vec::new();
+        for shell in self.processes.values_mut() {
+            shell.poll();
+            if shell.status != ShellStatus::Running && !shell.completion_reported {
+                shell.completion_reported = true;
+                events.push(shell.completion_event());
+            }
+        }
+        events.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        events
+    }
+
     /// Remember a restart-stale job so the UI can show it instead of hiding it.
     #[allow(dead_code)]
     pub fn remember_stale_job(
@@ -1414,7 +1832,10 @@ impl ShellManager {
                 stderr_len: 0,
                 stdin_available: false,
                 stale: true,
+                elapsed_since_output_ms: None,
                 linked_task_id,
+                owner_agent_id: None,
+                owner_agent_name: None,
             },
         );
     }
@@ -1502,7 +1923,9 @@ pub fn new_shared_shell_manager(workspace: PathBuf) -> SharedShellManager {
 
 // === ToolSpec Implementations ===
 
-use crate::command_safety::{SafetyLevel, analyze_command, extract_primary_command};
+use crate::command_safety::{
+    SafetyLevel, analyze_command, extract_primary_command, is_parallel_readonly_command,
+};
 use crate::execpolicy::{ExecPolicyDecision, load_default_policy};
 use crate::features::Feature;
 use crate::tools::cargo_failure_summary::summarize_cargo_failure;
@@ -1524,6 +1947,10 @@ shell sandbox). Workarounds: (1) run the Docker build from a regular terminal ou
 TUI, or (2) disable BuildKit with DOCKER_BUILDKIT=0 (only works if your Dockerfiles do not \
 use RUN --mount directives).";
 
+const PYTHON_BUILD_DEPENDENCY_HINT: &str = "Python build dependency missing: setuptools is not \
+available in the active environment. Install the declared build requirements first, for example \
+`python -m pip install -U pip setuptools wheel build`, then rerun the build command.";
+
 fn attach_cargo_failure_summary(
     metadata: &mut serde_json::Value,
     command: &str,
@@ -1533,6 +1960,19 @@ fn attach_cargo_failure_summary(
         summarize_cargo_failure(command, &result.stdout, &result.stderr, result.exit_code)
     {
         metadata["cargo_failure_summary"] = summary.to_metadata_value();
+    }
+}
+
+fn attach_python_build_dependency_hint(
+    metadata: &mut serde_json::Value,
+    hint: Option<&'static str>,
+) {
+    if let Some(hint) = hint {
+        metadata["python_build_dependency_hint"] = json!({
+            "kind": "missing_setuptools",
+            "hint": hint,
+            "recommended_first_step": "python -m pip install -U pip setuptools wheel build",
+        });
     }
 }
 
@@ -1549,6 +1989,58 @@ pub(crate) fn looks_like_macos_provenance_failure(result: &ShellResult) -> bool 
 fn macos_provenance_hint(result: &ShellResult) -> Option<&'static str> {
     if looks_like_macos_provenance_failure(result) {
         Some(MACOS_PROVENANCE_HINT)
+    } else {
+        None
+    }
+}
+
+fn python_build_dependency_hint(command: &str, result: &ShellResult) -> Option<&'static str> {
+    if matches!(result.status, ShellStatus::Completed) && result.exit_code == Some(0) {
+        return None;
+    }
+
+    let command = command.to_ascii_lowercase();
+    let combined = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
+    let mentions_missing_setuptools = [
+        "no module named 'setuptools'",
+        "no module named \"setuptools\"",
+        "setuptools is not available",
+        "cannot import 'setuptools",
+        "cannot import \"setuptools",
+        "missing dependencies",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+        && combined.contains("setuptools");
+    if !mentions_missing_setuptools {
+        return None;
+    }
+
+    let pythonish_command = [
+        "python",
+        "pip",
+        "pytest",
+        "tox",
+        "nox",
+        "cython",
+        "setup.py",
+        "build_ext",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    let pythonish_output = [
+        "setup.py",
+        "pyproject.toml",
+        "build_meta",
+        "build_ext",
+        "pep 517",
+        "cython",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle));
+
+    if pythonish_command || pythonish_output {
+        Some(PYTHON_BUILD_DEPENDENCY_HINT)
     } else {
         None
     }
@@ -1647,6 +2139,65 @@ fn shell_network_restricted_hint<'a>(
     }
 }
 
+fn shell_job_owner_from_context(context: &ToolContext) -> Option<ShellJobOwner> {
+    let agent_id = context
+        .owner_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let agent_name = context
+        .owner_agent_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(agent_id);
+    Some(ShellJobOwner {
+        agent_id: agent_id.to_string(),
+        agent_name: agent_name.to_string(),
+    })
+}
+
+fn attach_shell_owner_metadata(metadata: &mut serde_json::Value, context: &ToolContext) {
+    let Some(owner) = shell_job_owner_from_context(context) else {
+        return;
+    };
+    metadata["owner_agent_id"] = json!(owner.agent_id);
+    metadata["owner_agent_name"] = json!(owner.agent_name);
+}
+
+fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
+    let Some(command) = input.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if ["background", "interactive", "tty", "combined_output"]
+        .iter()
+        .any(|key| input.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        return false;
+    }
+    if ["stdin", "input", "data"]
+        .iter()
+        .any(|key| input.get(*key).is_some())
+    {
+        return false;
+    }
+
+    is_parallel_readonly_command(command)
+}
+
+fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
+    input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && input
+            .get("interactive")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && (input.get("background").and_then(serde_json::Value::as_bool) == Some(true)
+            || input.get("tty").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
 async fn execute_foreground_via_background(
     context: &ToolContext,
     command: &str,
@@ -1739,7 +2290,7 @@ impl ToolSpec for ExecShellTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command in the workspace directory. Foreground mode is for bounded commands; use background=true or task_shell_start for long-running work, then poll/wait."
+        "Execute a shell command in the workspace directory. Foreground mode is for bounded commands; use background=true or task_shell_start for work expected to take >5 seconds. Background jobs return immediately and report completion through task/status state instead of resuming the model."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -1756,7 +2307,7 @@ impl ToolSpec for ExecShellTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Run in background and return task_id (default: false). Prefer true for commands that may run for minutes; poll with exec_shell_wait or task_shell_wait."
+                    "description": "Run in background and return task_id (default: false). Returns immediately; completion is tracked in task/status state. Prefer this for commands expected to take >5 seconds, including builds, test suites, servers, CI polling, sleep, or other long-running work. Use exec_shell_wait only when you need early output, final output, or a true dependency barrier."
                 },
                 "interactive": {
                     "type": "boolean",
@@ -1795,12 +2346,45 @@ impl ToolSpec for ExecShellTool {
         ApprovalRequirement::Required
     }
 
+    fn approval_requirement_for(&self, input: &serde_json::Value) -> ApprovalRequirement {
+        if exec_shell_input_is_parallel_readonly(input) {
+            ApprovalRequirement::Auto
+        } else {
+            self.approval_requirement()
+        }
+    }
+
+    fn is_read_only_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_is_parallel_readonly(input)
+    }
+
+    fn supports_parallel_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_is_parallel_readonly(input)
+    }
+
+    fn starts_detached_for(&self, input: &serde_json::Value) -> bool {
+        exec_shell_input_starts_detached(input)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let command = required_str(&input, "command")?;
+        match context.shell_policy {
+            ShellPolicy::None => {
+                return Ok(ToolResult::error(
+                    "Shell tools are disabled by the active permission profile.",
+                ));
+            }
+            ShellPolicy::ReadOnly if !exec_shell_input_is_parallel_readonly(&input) => {
+                return Ok(ToolResult::error(
+                    "Shell command blocked by read-only shell policy. Use a non-mutating, non-background inspection command, or switch to Agent/YOLO for write-capable shell work.",
+                ));
+            }
+            ShellPolicy::ReadOnly | ShellPolicy::Full => {}
+        }
         let timeout_ms = optional_u64(&input, "timeout_ms", 120_000).min(600_000);
         let background = optional_bool(&input, "background", false);
         let interactive = optional_bool(&input, "interactive", false);
@@ -1865,7 +2449,7 @@ impl ToolSpec for ExecShellTool {
                     };
                     return Ok(ToolResult {
                         content: format!(
-                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}"
+                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
                         ),
                         success: false,
                         metadata: Some(json!({
@@ -1970,13 +2554,17 @@ impl ToolSpec for ExecShellTool {
             } else {
                 stdout_summary.clone()
             };
-            let output = if result.stdout.is_empty() && result.stderr.is_empty() {
+            let python_dependency_hint = python_build_dependency_hint(command, &result);
+            let mut output = if result.stdout.is_empty() && result.stderr.is_empty() {
                 "(no output)".to_string()
             } else if result.stderr.is_empty() {
                 result.stdout.clone()
             } else {
                 format!("{}\n\nSTDERR:\n{}", result.stdout, result.stderr)
             };
+            if let Some(hint) = python_dependency_hint {
+                output = format!("{hint}\n\n{output}");
+            }
 
             let mut metadata = json!({
                 "exit_code": result.exit_code,
@@ -2000,7 +2588,9 @@ impl ToolSpec for ExecShellTool {
                 "canceled": false,
                 "sandbox_backend": "opensandbox",
             });
+            attach_shell_owner_metadata(&mut metadata, context);
             attach_cargo_failure_summary(&mut metadata, command, &result);
+            attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
             return Ok(ToolResult {
                 content: output,
@@ -2026,7 +2616,7 @@ impl ToolSpec for ExecShellTool {
                 .shell_manager
                 .lock()
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            manager.execute_with_options_env(
+            manager.execute_with_options_env_for_owner(
                 command,
                 working_dir.as_deref(),
                 timeout_ms,
@@ -2035,6 +2625,7 @@ impl ToolSpec for ExecShellTool {
                 tty,
                 policy_override,
                 extra_env,
+                shell_job_owner_from_context(context),
             )
         } else {
             execute_foreground_via_background(
@@ -2078,6 +2669,7 @@ impl ToolSpec for ExecShellTool {
                 let network_restricted_hint =
                     shell_network_restricted_hint(context, command, &result).map(str::to_string);
                 let provenance_hint = macos_provenance_hint(&result);
+                let python_dependency_hint = python_build_dependency_hint(command, &result);
                 let mut output = if interactive {
                     format!(
                         "Interactive command completed (exit code: {:?})",
@@ -2094,10 +2686,12 @@ impl ToolSpec for ExecShellTool {
                 } else if result.status == ShellStatus::Running {
                     if backgrounded_foreground {
                         format!(
-                            "Command moved to background: {task_id_str}\n\nPoll with exec_shell_wait or cancel with exec_shell_cancel."
+                            "Command moved to background: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
                         )
                     } else {
-                        format!("Background task started: {task_id_str}")
+                        format!(
+                            "Background task started: {task_id_str}\n\nReturns immediately; completion is tracked in task/status state. Keep working; call exec_shell_wait only if you need early output, final output, or wait=true at a true dependency."
+                        )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
                     format!(
@@ -2119,6 +2713,9 @@ impl ToolSpec for ExecShellTool {
                     output = format!("{hint}\n\n{output}");
                 }
                 if let Some(hint) = provenance_hint {
+                    output = format!("{hint}\n\n{output}");
+                }
+                if let Some(hint) = python_dependency_hint {
                     output = format!("{hint}\n\n{output}");
                 }
 
@@ -2158,6 +2755,11 @@ impl ToolSpec for ExecShellTool {
                     }),
                 });
                 metadata["backgrounded"] = json!(background || backgrounded_foreground);
+                if background || backgrounded_foreground {
+                    metadata["auto_resume_on_completion"] = json!(false);
+                    metadata["completion_surface"] = json!("task_status");
+                    metadata["background_policy"] = json!("nonblocking");
+                }
                 if result.status == ShellStatus::TimedOut && !background && !interactive {
                     metadata["foreground_timeout_recovery"] = json!({
                         "process_killed": true,
@@ -2179,7 +2781,9 @@ impl ToolSpec for ExecShellTool {
                 if provenance_hint.is_some() {
                     metadata["macos_provenance_restricted"] = json!(true);
                 }
+                attach_shell_owner_metadata(&mut metadata, context);
                 attach_cargo_failure_summary(&mut metadata, command, &result);
+                attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
                 Ok(ToolResult {
                     content: output,
@@ -2226,6 +2830,7 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
     let network_restricted_hint =
         shell_network_restricted_hint(context, &delta.command, &result).map(str::to_string);
     let provenance_hint = macos_provenance_hint(&result);
+    let python_dependency_hint = python_build_dependency_hint(&delta.command, &result);
     let stdout_summary = summarize_output(&result.stdout);
     let stderr_summary = summarize_output(&result.stderr);
     let summary = if !stderr_summary.is_empty() {
@@ -2253,6 +2858,9 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
     if let Some(hint) = provenance_hint {
         output = format!("{hint}\n\n{output}");
     }
+    if let Some(hint) = python_dependency_hint {
+        output = format!("{hint}\n\n{output}");
+    }
 
     let mut metadata = json!({
         "exit_code": result.exit_code,
@@ -2276,7 +2884,9 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
         "command": delta.command,
         "stream_delta": true,
     });
+    attach_shell_owner_metadata(&mut metadata, context);
     attach_cargo_failure_summary(&mut metadata, &delta.command, &result);
+    attach_python_build_dependency_hint(&mut metadata, python_dependency_hint);
 
     let mut tool_result = ToolResult {
         content: output,
@@ -2526,8 +3136,13 @@ impl ToolSpec for ShellWaitTool {
         self.name
     }
 
+    fn model_visible(&self) -> bool {
+        // `exec_wait` is a legacy alias; only `exec_shell_wait` is model-visible.
+        self.name == "exec_shell_wait"
+    }
+
     fn description(&self) -> &'static str {
-        "Wait for a background shell task and return incremental output. Turn cancellation stops waiting but leaves the background task running."
+        "Inspect a background shell task and return incremental output without blocking by default. Set wait=true only for a deliberate dependency barrier. Turn cancellation stops waiting but leaves the background task running."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -2544,7 +3159,8 @@ impl ToolSpec for ShellWaitTool {
                 },
                 "wait": {
                     "type": "boolean",
-                    "description": "Wait for completion before returning (default: true)"
+                    "default": false,
+                    "description": "Snapshot the latest background output and return immediately (default). Background job completions are tracked in task/status state, so normally do not wait. Set wait=true only for a deliberate barrier at a true dependency or final gate."
                 }
             },
             "required": ["task_id"]
@@ -2565,7 +3181,7 @@ impl ToolSpec for ShellWaitTool {
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let task_id = required_task_id(&input)?;
-        let wait = optional_bool(&input, "wait", true);
+        let wait = optional_bool(&input, "wait", false);
         let timeout_ms = optional_u64(&input, "timeout_ms", 30_000);
 
         let (delta, wait_canceled) = if wait {
@@ -2607,6 +3223,11 @@ impl ToolSpec for ShellInteractTool {
         self.name
     }
 
+    fn model_visible(&self) -> bool {
+        // `exec_interact` is a legacy alias; only `exec_shell_interact` is model-visible.
+        self.name == "exec_shell_interact"
+    }
+
     fn description(&self) -> &'static str {
         "Send input to a background shell task and return incremental output."
     }
@@ -2645,11 +3266,14 @@ impl ToolSpec for ShellInteractTool {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ExecutesCode]
+        vec![
+            ToolCapability::ExecutesCode,
+            ToolCapability::RequiresApproval,
+        ]
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+        ApprovalRequirement::Required
     }
 
     async fn execute(

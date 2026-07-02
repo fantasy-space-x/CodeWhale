@@ -7,20 +7,24 @@ mode, so the first version does not need a public webhook URL.
 Security model:
 
 - `codewhale serve --http` stays bound to `127.0.0.1`.
-- `/v1/*` runtime calls use `DEEPSEEK_RUNTIME_TOKEN`.
-- Feishu/Lark chats must be allowlisted unless `DEEPSEEK_ALLOW_UNLISTED=true`
+- `/v1/*` runtime calls use `CODEWHALE_RUNTIME_TOKEN`.
+- Feishu/Lark chats must be allowlisted in `CODEWHALE_CHAT_ALLOWLIST` unless
+  `CODEWHALE_ALLOW_UNLISTED=true`
   is set for first pairing.
 - Direct messages are the intended MVP control surface. Group chat control is
   disabled unless `FEISHU_ALLOW_GROUPS=true`.
 - Tool approvals are text commands: `/allow <approval_id>` or `/deny <approval_id>`.
+- Feishu/Lark only sees the prompts, status, thread summaries, and approval
+  messages the bridge sends. The workspace, shell, and runtime HTTP listener
+  stay local behind the CodeWhale runtime token.
 
 ## Setup
 
 ```bash
-cd /opt/codewhale/bridge
+cd /opt/codewhale/feishu-bridge
 npm install --omit=dev
-cp .env.example /etc/deepseek/feishu-bridge.env
-sudoedit /etc/deepseek/feishu-bridge.env
+cp .env.example /etc/codewhale/feishu-bridge.env
+sudoedit /etc/codewhale/feishu-bridge.env
 node src/index.mjs
 ```
 
@@ -28,11 +32,15 @@ Validate the env files before starting the service:
 
 ```bash
 npm run validate:config -- \
-  --env /etc/deepseek/feishu-bridge.env \
-  --runtime-env /etc/deepseek/runtime.env \
+  --env /etc/codewhale/feishu-bridge.env \
+  --runtime-env /etc/codewhale/runtime.env \
   --workspace-root /opt/whalebro \
   --check-filesystem
 ```
+
+For first pairing, temporarily set `CODEWHALE_ALLOW_UNLISTED=true`, send the
+bot `/status`, copy the returned `chat_id`, `open_id`, or `union_id` into
+`CODEWHALE_CHAT_ALLOWLIST`, then turn `CODEWHALE_ALLOW_UNLISTED=false`.
 
 For a Tencent Lighthouse deployment, use:
 
@@ -47,14 +55,15 @@ sudo journalctl -u codewhale-feishu-bridge -f
 - `/threads`
 - `/new`
 - `/resume <thread_id>`
+- `/model <name|default>`
 - `/interrupt`
 - `/compact`
 - `/allow <approval_id> [remember]`
 - `/deny <approval_id>`
 
 Anything else is sent as a prompt. If group control is explicitly enabled,
-messages must start with `/ds` by default, for example:
+messages should start with the CodeWhale prefix `/cw`, for example:
 
 ```text
-/ds check git status and tell me what is dirty
+/cw check git status and tell me what is dirty
 ```

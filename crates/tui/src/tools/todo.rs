@@ -174,6 +174,24 @@ pub fn new_shared_todo_list() -> SharedTodoList {
     Arc::new(Mutex::new(TodoList::new()))
 }
 
+const TODO_ALIAS_FIRST_DEPRECATED_VERSION: &str = "0.8.53";
+const TODO_ALIAS_REMOVAL_VERSION: &str = "0.9.0";
+const CANONICAL_WORK_SURFACE: &str = "checklist";
+const DURABLE_WORK_OWNER: &str = "fleet_whaleflow_ledger";
+
+fn is_compat_alias(tool_name: &str) -> bool {
+    tool_name.starts_with("todo_")
+}
+
+fn checklist_replacement_tool_name(tool_name: &str) -> &'static str {
+    match tool_name {
+        "todo_add" | "checklist_add" => "checklist_add",
+        "todo_update" | "checklist_update" => "checklist_update",
+        "todo_list" | "checklist_list" => "checklist_list",
+        _ => "checklist_write",
+    }
+}
+
 /// Tool for writing and updating the todo list
 pub struct TodoWriteTool {
     todo_list: SharedTodoList,
@@ -256,6 +274,10 @@ impl ToolSpec for TodoAddTool {
 
     fn approval_requirement(&self) -> ApprovalRequirement {
         ApprovalRequirement::Auto
+    }
+
+    fn model_visible(&self) -> bool {
+        !is_compat_alias(self.tool_name)
     }
 
     async fn execute(
@@ -350,6 +372,10 @@ impl ToolSpec for TodoUpdateTool {
         ApprovalRequirement::Auto
     }
 
+    fn model_visible(&self) -> bool {
+        !is_compat_alias(self.tool_name)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -435,6 +461,10 @@ impl ToolSpec for TodoListTool {
         ApprovalRequirement::Auto
     }
 
+    fn model_visible(&self) -> bool {
+        !is_compat_alias(self.tool_name)
+    }
+
     async fn execute(
         &self,
         _input: serde_json::Value,
@@ -448,7 +478,8 @@ impl ToolSpec for TodoListTool {
             snapshot.items.len(),
             snapshot.completion_pct,
             result
-        )))
+        ))
+        .with_metadata(checklist_metadata(&snapshot, self.tool_name)))
     }
 }
 
@@ -502,6 +533,10 @@ impl ToolSpec for TodoWriteTool {
         ApprovalRequirement::Auto
     }
 
+    fn model_visible(&self) -> bool {
+        !is_compat_alias(self.tool_name)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -547,6 +582,8 @@ impl ToolSpec for TodoWriteTool {
 }
 
 fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_json::Value {
+    let canonical_tool = checklist_replacement_tool_name(tool_name);
+    let compat_alias = is_compat_alias(tool_name);
     let items = snapshot
         .items
         .iter()
@@ -558,9 +595,15 @@ fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_jso
             })
         })
         .collect::<Vec<_>>();
-    json!({
-        "canonical_tool": "checklist_write",
-        "compat_alias": tool_name.starts_with("todo_"),
+    let mut metadata = json!({
+        "canonical_tool": canonical_tool,
+        "compat_alias": compat_alias,
+        "work_surface": {
+            "canonical": CANONICAL_WORK_SURFACE,
+            "model_visible": !compat_alias,
+            "durable_owner": DURABLE_WORK_OWNER,
+            "progress_key": "task_updates.checklist"
+        },
         "task_updates": {
             "checklist": {
                 "items": items,
@@ -569,7 +612,22 @@ fn checklist_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_jso
                 "updated_at": null
             }
         }
-    })
+    });
+    if compat_alias && let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "_deprecation".to_string(),
+            json!({
+                "this_tool": tool_name,
+                "use_instead": canonical_tool,
+                "first_deprecated": TODO_ALIAS_FIRST_DEPRECATED_VERSION,
+                "removed_in": TODO_ALIAS_REMOVAL_VERSION,
+                "message": format!(
+                    "Tool '{tool_name}' is a hidden compatibility alias; use '{canonical_tool}' before v{TODO_ALIAS_REMOVAL_VERSION}."
+                ),
+            }),
+        );
+    }
+    metadata
 }
 
 #[cfg(test)]
@@ -596,6 +654,16 @@ mod tests {
         let metadata = result.metadata.expect("metadata");
         assert_eq!(metadata["canonical_tool"], "checklist_write");
         assert_eq!(metadata["compat_alias"], false);
+        assert_eq!(metadata["work_surface"]["canonical"], "checklist");
+        assert_eq!(metadata["work_surface"]["model_visible"], true);
+        assert_eq!(
+            metadata["work_surface"]["durable_owner"],
+            "fleet_whaleflow_ledger"
+        );
+        assert_eq!(
+            metadata["work_surface"]["progress_key"],
+            "task_updates.checklist"
+        );
         assert_eq!(
             metadata["task_updates"]["checklist"]["in_progress_id"],
             json!(1)
@@ -626,5 +694,66 @@ mod tests {
         assert_eq!(tool.name(), "todo_write");
         assert_eq!(metadata["canonical_tool"], "checklist_write");
         assert_eq!(metadata["compat_alias"], true);
+        assert_eq!(metadata["work_surface"]["canonical"], "checklist");
+        assert_eq!(
+            metadata["work_surface"]["progress_key"],
+            "task_updates.checklist"
+        );
+        assert_eq!(
+            metadata["task_updates"]["checklist"]["items"][0]["content"],
+            "legacy caller"
+        );
+        assert_eq!(metadata["_deprecation"]["this_tool"], "todo_write");
+        assert_eq!(metadata["_deprecation"]["use_instead"], "checklist_write");
+        assert_eq!(metadata["_deprecation"]["removed_in"], "0.9.0");
+        assert!(!tool.model_visible());
+    }
+
+    #[tokio::test]
+    async fn todo_item_aliases_return_replacement_metadata() {
+        let list = new_shared_todo_list();
+        let context = ToolContext::new(std::env::temp_dir());
+
+        let add = TodoAddTool::new(list.clone());
+        let add_result = add
+            .execute(
+                json!({"content": "legacy add", "status": "in_progress"}),
+                &context,
+            )
+            .await
+            .expect("todo add succeeds");
+        let add_metadata = add_result.metadata.expect("add metadata");
+        assert_eq!(add_metadata["canonical_tool"], "checklist_add");
+        assert_eq!(add_metadata["work_surface"]["canonical"], "checklist");
+        assert_eq!(add_metadata["_deprecation"]["use_instead"], "checklist_add");
+        assert!(!add.model_visible());
+
+        let update = TodoUpdateTool::new(list.clone());
+        let update_result = update
+            .execute(json!({"id": 1, "status": "completed"}), &context)
+            .await
+            .expect("todo update succeeds");
+        let update_metadata = update_result.metadata.expect("update metadata");
+        assert_eq!(update_metadata["canonical_tool"], "checklist_update");
+        assert_eq!(update_metadata["work_surface"]["canonical"], "checklist");
+        assert_eq!(
+            update_metadata["_deprecation"]["use_instead"],
+            "checklist_update"
+        );
+        assert!(!update.model_visible());
+
+        let list_tool = TodoListTool::new(list);
+        let list_result = list_tool
+            .execute(json!({}), &context)
+            .await
+            .expect("todo list succeeds");
+        let list_metadata = list_result.metadata.expect("list metadata");
+        assert_eq!(list_metadata["canonical_tool"], "checklist_list");
+        assert_eq!(list_metadata["work_surface"]["canonical"], "checklist");
+        assert_eq!(
+            list_metadata["_deprecation"]["use_instead"],
+            "checklist_list"
+        );
+        assert!(!list_tool.model_visible());
     }
 }

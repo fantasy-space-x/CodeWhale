@@ -32,6 +32,10 @@
 //! * No `+x` is granted on extracted files. The optional `/skill trust <name>`
 //!   command writes a `.trusted` marker; tool-execution gating is a separate
 //!   concern that lives next to the tool registry.
+//! * Claude Code plugin archives that contain multiple skills are rejected with
+//!   an explicit migration message. CodeWhale can install individual
+//!   `SKILL.md` bundles, including `.claude/skills/<name>/SKILL.md`, but it
+//!   does not execute `plugin.json` plugin runtimes or custom command bundles.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -39,15 +43,21 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::network_policy::{Decision, NetworkPolicy, host_from_url};
 
+fn reqwest_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 /// Cache directory for registry-synced skills.
 ///
-/// Lives at `~/.deepseek/cache/skills/` so it's separate from user-installed
+/// Lives at `~/.codewhale/cache/skills/` so it's separate from user-installed
 /// skills and can be blown away without losing anything irreplaceable.
 pub fn default_cache_skills_dir() -> PathBuf {
     dirs::home_dir().map_or_else(
@@ -64,6 +74,7 @@ pub const DEFAULT_REGISTRY_URL: &str =
 /// Default per-skill size cap (5 MiB). Honored at unpack time so a malicious
 /// gzip bomb can't blow up RAM.
 pub const DEFAULT_MAX_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+const SYNC_REGISTRY_CONCURRENCY: usize = 8;
 
 /// File written under each installed skill so [`update`] / [`uninstall`] can
 /// recover the original [`InstallSource`] without re-parsing user input.
@@ -221,6 +232,10 @@ pub enum InstallError {
     MissingFrontmatterField(&'static str),
     #[error("symlinks are not allowed in skill tarballs")]
     SymlinkRejected,
+    #[error(
+        "Claude Code plugin archive contains multiple SKILL.md entries; CodeWhale installs one SKILL.md bundle at a time and does not run plugin.json/custom-command runtimes. Install or migrate an individual skills/<name> directory instead"
+    )]
+    ClaudePluginBundle,
     #[error("skill '{0}' is already installed; use update or remove it first")]
     AlreadyInstalled(String),
     #[error("skill '{0}' was not installed via /skill install (no .installed-from marker)")]
@@ -300,9 +315,7 @@ pub async fn install_with_registry(
 
     // Compute a checksum before unpacking so [`update`] can detect upstream
     // no-op changes without redoing the extract.
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let checksum = format!("{:x}", hasher.finalize());
+    let checksum = sha256_hex(&bytes);
 
     let staged = stage_tarball(&bytes, skills_dir, max_size)?;
 
@@ -419,9 +432,7 @@ pub async fn update_with_registry(
         DownloadOutcome::Denied(host) => return Ok(UpdateResult::NetworkDenied(host)),
     };
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let checksum = format!("{:x}", hasher.finalize());
+    let checksum = sha256_hex(&bytes);
     if checksum == marker.checksum {
         return Ok(UpdateResult::NoChange);
     }
@@ -497,7 +508,9 @@ pub async fn fetch_registry(
         Decision::Deny => return Ok(RegistryFetchResult::Denied(host)),
         Decision::Prompt => return Ok(RegistryFetchResult::NeedsApproval(host)),
     }
-    let body = reqwest::get(registry_url)
+    let body = reqwest_client()
+        .get(registry_url)
+        .send()
         .await
         .with_context(|| format!("failed to fetch registry {registry_url}"))?
         .error_for_status()
@@ -580,12 +593,11 @@ pub async fn sync_registry(
         }
     };
 
-    let mut outcomes = Vec::new();
-
-    for (name, entry) in &doc.skills {
-        let outcome = sync_one_skill(name, entry, network, cache_dir, max_size).await;
-        outcomes.push(outcome);
-    }
+    let outcomes = stream::iter(doc.skills.iter())
+        .map(|(name, entry)| sync_one_skill(name, entry, network, cache_dir, max_size))
+        .buffered(SYNC_REGISTRY_CONCURRENCY)
+        .collect()
+        .await;
 
     Ok(SyncResult::Done { outcomes })
 }
@@ -665,7 +677,7 @@ async fn sync_one_skill(
             .flatten();
 
         // Build the request — add If-None-Match if we have a cached ETag.
-        let client = reqwest::Client::new();
+        let client = reqwest_client();
         let mut req = client.get(url);
         if let Some(ref meta) = existing_meta
             && let Some(ref etag) = meta.etag
@@ -730,9 +742,7 @@ async fn sync_one_skill(
         }
 
         // Compute SHA-256 of the downloaded bytes.
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = sha256_hex(&bytes);
 
         // Short-circuit: if the hash matches the cached one, we're fresh even
         // without a 304 (some CDNs strip ETags on redirects).
@@ -981,7 +991,9 @@ enum DownloadAttempt {
 /// would push the buffer over `max_size * 4` (the *4 accounts for compression;
 /// the unpack step still enforces `max_size` on the *uncompressed* bytes).
 async fn download_with_cap(url: &str, max_size: u64) -> Result<DownloadAttempt> {
-    let resp = reqwest::get(url)
+    let resp = reqwest_client()
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("failed to GET {url}"))?;
     let status = resp.status();
@@ -1071,6 +1083,8 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
     let mut total_size: u64 = 0;
     let mut prefix: Option<String> = None;
     let mut skill_md_relative: Option<(SkillMdCandidate, Vec<u8>)> = None;
+    let mut skill_md_candidate_count: usize = 0;
+    let mut has_claude_plugin_manifest = false;
     let mut link_paths: Vec<String> = Vec::new();
 
     for entry in archive
@@ -1087,6 +1101,9 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
         let path_str = path.to_string_lossy().into_owned();
         if !is_safe_path(&path) {
             return Err(InstallError::PathTraversal(path_str).into());
+        }
+        if is_claude_plugin_manifest_path(&path) {
+            has_claude_plugin_manifest = true;
         }
 
         // Track total size against `max_size` (uncompressed). We honor `header
@@ -1134,6 +1151,7 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
         if entry_type.is_file() {
             let stripped = strip_prefix(&path_str, prefix.as_deref().unwrap_or(""));
             if let Some(candidate) = skill_md_candidate(&stripped) {
+                skill_md_candidate_count += 1;
                 let mut buf = Vec::new();
                 entry
                     .read_to_end(&mut buf)
@@ -1152,6 +1170,9 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
     }
 
     let prefix = prefix.unwrap_or_default();
+    if has_claude_plugin_manifest && skill_md_candidate_count > 1 {
+        return Err(InstallError::ClaudePluginBundle.into());
+    }
     let (skill_md, skill_md_bytes) = skill_md_relative
         .ok_or(InstallError::MissingSkillMd)
         .map_err(anyhow::Error::from)?;
@@ -1220,6 +1241,21 @@ fn skill_md_candidate(stripped_path: &str) -> Option<SkillMdCandidate> {
     }
 
     None
+}
+
+fn is_claude_plugin_manifest_path(path: &Path) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    parts.windows(2).any(|window| {
+        window[0].eq_ignore_ascii_case(".claude-plugin")
+            && window[1].eq_ignore_ascii_case("plugin.json")
+    })
 }
 
 fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) -> Result<()> {
@@ -1445,6 +1481,20 @@ fn source_spec_string(source: &InstallSource) -> String {
         InstallSource::DirectUrl(url) => url.clone(),
         InstallSource::Registry(name) => name.clone(),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_bytes(Sha256::digest(bytes))
+}
+
+fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

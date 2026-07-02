@@ -4,12 +4,14 @@
 //! The TUI calls `resolve_auto_model_selection` once per user turn when
 //! `app.auto_model` is set. The async function builds a recent-context
 //! summary from `api_messages` (capped to six rows of up to 900 chars
-//! each), passes it through `commands::resolve_auto_route_with_flash`,
+//! each), passes it through `model_routing::resolve_auto_route_with_inventory`,
 //! and returns the selection (model + reasoning effort). The remaining
 //! helpers are pure transforms used to build that summary.
 
-use crate::commands;
+use anyhow::Result;
+
 use crate::config::Config;
+use crate::model_routing;
 use crate::models::{ContentBlock, Message};
 use crate::tui::app::{App, QueuedMessage, ReasoningEffort};
 
@@ -25,25 +27,27 @@ pub(super) async fn resolve_auto_model_selection(
     config: &Config,
     message: &QueuedMessage,
     latest_content: &str,
-) -> commands::AutoRouteSelection {
+) -> Result<model_routing::AutoRouteSelection> {
     let latest_request = if latest_content.trim().is_empty() {
         message.display.as_str()
     } else {
         latest_content
     };
-    commands::resolve_auto_route_with_flash(
+    model_routing::resolve_auto_route_with_inventory_for_session(
         config,
         latest_request,
         &recent_auto_router_context(&app.api_messages),
+        app.mode.as_setting(),
         if app.auto_model { "auto" } else { "fixed" },
-        app.reasoning_effort.as_setting(),
+        app.reasoning_effort
+            .as_setting_for_provider(app.api_provider),
     )
     .await
 }
 
 /// Normalize the heuristic effort to the canonical auto-route effort.
 pub(super) fn normalize_auto_routed_effort(effort: ReasoningEffort) -> ReasoningEffort {
-    commands::normalize_auto_route_effort(effort)
+    model_routing::normalize_auto_route_effort(effort)
 }
 
 /// Build a compact recent-context summary for the auto-route prompt.
@@ -171,6 +175,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: vec![
                     ContentBlock::Thinking {
+                        signature: None,
                         thinking: "The user seems to be asking me to classify myself.".to_string(),
                     },
                     ContentBlock::Text {

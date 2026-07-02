@@ -1,4 +1,7 @@
+#![allow(clippy::uninlined_format_args)]
+
 mod metrics;
+#[cfg(not(target_env = "ohos"))]
 mod update;
 
 use std::io::{self, Read, Write};
@@ -21,20 +24,46 @@ use codewhale_mcp::{McpServerDefinition, run_stdio_server};
 use codewhale_secrets::Secrets;
 use codewhale_state::{StateStore, ThreadListFilters};
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProviderArg {
     Deepseek,
     NvidiaNim,
     Openai,
     Atlascloud,
     WanjieArk,
+    Volcengine,
     Openrouter,
+    XiaomiMimo,
     Novita,
     Fireworks,
+    Siliconflow,
+    #[value(
+        alias = "silicon-flow-cn",
+        alias = "siliconflow-CN",
+        alias = "silicon_flow_cn",
+        alias = "siliconflow_cn",
+        alias = "siliconflow-china",
+        alias = "siliconflow_china"
+    )]
+    SiliconflowCn,
+    Arcee,
     Moonshot,
     Sglang,
     Vllm,
     Ollama,
+    Huggingface,
+    Together,
+    OpenaiCodex,
+    Anthropic,
+    #[value(alias = "open-model", alias = "open_model")]
+    Openmodel,
+    Zai,
+    Stepfun,
+    Minimax,
+    #[value(alias = "deep-infra", alias = "deep_infra")]
+    Deepinfra,
+    #[value(alias = "fugu", alias = "sakana-ai", alias = "sakana_ai")]
+    Sakana,
 }
 
 impl From<ProviderArg> for ProviderKind {
@@ -45,13 +74,28 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Openai => ProviderKind::Openai,
             ProviderArg::Atlascloud => ProviderKind::Atlascloud,
             ProviderArg::WanjieArk => ProviderKind::WanjieArk,
+            ProviderArg::Volcengine => ProviderKind::Volcengine,
             ProviderArg::Openrouter => ProviderKind::Openrouter,
+            ProviderArg::XiaomiMimo => ProviderKind::XiaomiMimo,
             ProviderArg::Novita => ProviderKind::Novita,
             ProviderArg::Fireworks => ProviderKind::Fireworks,
+            ProviderArg::Siliconflow => ProviderKind::Siliconflow,
+            ProviderArg::SiliconflowCn => ProviderKind::SiliconflowCN,
+            ProviderArg::Arcee => ProviderKind::Arcee,
             ProviderArg::Moonshot => ProviderKind::Moonshot,
             ProviderArg::Sglang => ProviderKind::Sglang,
             ProviderArg::Vllm => ProviderKind::Vllm,
             ProviderArg::Ollama => ProviderKind::Ollama,
+            ProviderArg::Huggingface => ProviderKind::Huggingface,
+            ProviderArg::Together => ProviderKind::Together,
+            ProviderArg::OpenaiCodex => ProviderKind::OpenaiCodex,
+            ProviderArg::Anthropic => ProviderKind::Anthropic,
+            ProviderArg::Openmodel => ProviderKind::Openmodel,
+            ProviderArg::Zai => ProviderKind::Zai,
+            ProviderArg::Stepfun => ProviderKind::Stepfun,
+            ProviderArg::Minimax => ProviderKind::Minimax,
+            ProviderArg::Deepinfra => ProviderKind::Deepinfra,
+            ProviderArg::Sakana => ProviderKind::Sakana,
         }
     }
 }
@@ -78,6 +122,12 @@ struct Cli {
     model: Option<String>,
     #[arg(long = "output-mode")]
     output_mode: Option<String>,
+    #[arg(
+        long = "verbosity",
+        value_name = "LEVEL",
+        help = "Controls transcript and output verbosity (normal, concise)"
+    )]
+    verbosity: Option<String>,
     #[arg(long = "log-level")]
     log_level: Option<String>,
     #[arg(long)]
@@ -125,8 +175,11 @@ enum Commands {
     Run(RunArgs),
     /// Run CodeWhale diagnostics.
     Doctor(TuiPassthroughArgs),
-    /// List live DeepSeek API models via the TUI binary.
+    /// List live provider API models via the TUI binary.
     Models(TuiPassthroughArgs),
+    /// Generate speech audio with Xiaomi MiMo TTS models via the TUI binary.
+    #[command(visible_alias = "tts")]
+    Speech(TuiPassthroughArgs),
     /// List saved TUI sessions.
     Sessions(TuiPassthroughArgs),
     /// Resume a saved TUI session.
@@ -137,6 +190,8 @@ enum Commands {
     Init(TuiPassthroughArgs),
     /// Bootstrap MCP config and/or skills directories.
     Setup(TuiPassthroughArgs),
+    /// Generate a remote CodeWhale agent deploy bundle (cloud + chat bridge).
+    RemoteSetup(RemoteSetupArgs),
     /// Run a non-interactive prompt through the TUI runtime.
     #[command(after_help = "\
 Examples:
@@ -157,17 +212,8 @@ non-interactive filesystem/shell tool use, matching the supported automation
 path used by stream-json wrappers.
 ")]
     Exec(TuiPassthroughArgs),
-    /// Generate SWE-bench prediction rows from CodeWhale runs.
-    #[command(after_help = "\
-Examples:
-  codewhale swebench run --instance-id django__django-12345 --issue-file issue.md
-  codewhale swebench export --instance-id django__django-12345 --predictions-path all_preds.jsonl
-
-This command forwards to the TUI runtime. `run` invokes tool-backed agent mode
-and writes a SWE-bench-compatible JSONL prediction row from the resulting
-working-tree diff. `export` only writes the current diff.
-")]
-    Swebench(TuiPassthroughArgs),
+    /// Manage durable Agent Fleet runs via the TUI runtime.
+    Fleet(TuiPassthroughArgs),
     /// Run a CodeWhale-powered code review over a git diff.
     Review(TuiPassthroughArgs),
     /// Apply a patch file or stdin to the working tree.
@@ -179,6 +225,23 @@ working-tree diff. `export` only writes the current diff.
     /// Inspect TUI feature flags.
     Features(TuiPassthroughArgs),
     /// Run a local TUI server.
+    #[command(after_help = "\
+Forwarded serve options:
+      --mcp                 Start MCP server over stdio
+      --http                Start runtime HTTP/SSE API server
+      --mobile              Start runtime HTTP/SSE API server with the mobile control page
+      --qr                  Show a QR code for the mobile URL (requires --mobile)
+      --acp                 Start ACP server over stdio for editor clients
+      --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
+      --port <PORT>         Bind port [default: 7878]
+      --workers <WORKERS>   Background task worker count (1-8)
+      --cors-origin <URL>   Additional CORS origin to allow (repeatable)
+      --auth-token <TOKEN>  Require this bearer token for /v1/* runtime API routes
+      --insecure            Disable runtime API auth when no token is configured
+
+`codewhale serve --http` and `codewhale serve --mobile` remain compatibility
+aliases for `codewhale app-server --http` and `codewhale app-server --mobile`.
+New integrations should prefer `codewhale app-server`.")]
     Serve(TuiPassthroughArgs),
     /// Generate shell completions for the TUI binary.
     Completions(TuiPassthroughArgs),
@@ -198,7 +261,19 @@ working-tree diff. `export` only writes the current diff.
     Thread(ThreadArgs),
     /// Evaluate sandbox/approval policy decisions.
     Sandbox(SandboxArgs),
-    /// Run the app-server transport.
+    /// Run the canonical runtime API / control plane (HTTP/SSE, mobile, stdio).
+    #[command(after_help = "\
+Transports:
+  codewhale app-server --http              Full HTTP/SSE runtime API (/v1/*) on 127.0.0.1:7878
+  codewhale app-server --mobile            Runtime API + phone control page (binds 0.0.0.0)
+  codewhale app-server --stdio             JSON-RPC control transport over stdio (no listener)
+  codewhale app-server                     Legacy in-process app-server HTTP on 127.0.0.1:8787
+
+`--http` and `--mobile` serve the same mature runtime API as `codewhale serve
+--http`/`--mobile`, which remain as compatibility aliases. The runtime API token
+is read from --auth-token, CODEWHALE_RUNTIME_TOKEN, or DEEPSEEK_RUNTIME_TOKEN.
+
+See docs/RUNTIME_API.md.")]
     AppServer(AppServerArgs),
     /// Generate shell completions.
     #[command(after_help = r#"Examples:
@@ -240,6 +315,12 @@ struct UpdateArgs {
     /// Update to the latest beta release instead of the latest stable release.
     #[arg(long)]
     beta: bool,
+    /// Only check the latest release; do not download or replace binaries.
+    #[arg(long)]
+    check: bool,
+    /// Proxy URL to use for update HTTP requests.
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +345,72 @@ struct TuiPassthroughArgs {
     args: Vec<String>,
 }
 
+/// Flags for `codewhale remote-setup`. Forwarded to the TUI binary, which owns
+/// the interactive wizard and bundle generation.
+#[derive(Debug, Args, Clone, Default)]
+struct RemoteSetupArgs {
+    /// Cloud target slug (lighthouse, azure, digitalocean). Skips the prompt.
+    #[arg(long)]
+    cloud: Option<String>,
+    /// Chat bridge slug (feishu, telegram). Skips the prompt.
+    #[arg(long)]
+    bridge: Option<String>,
+    /// Provider slug; validated against the provider registry. Skips the prompt.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Bundle output directory (default `./codewhale-deploy/<cloud>-<bridge>`).
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+    /// Emit the bundle, do not provision (default).
+    #[arg(long, default_value_t = false)]
+    generate_only: bool,
+    /// Run the cloud CLI to auto-provision (not yet implemented).
+    #[arg(long, default_value_t = false, conflicts_with = "generate_only")]
+    apply: bool,
+    /// Skip the final confirmation gate (CI / non-interactive).
+    #[arg(long, default_value_t = false)]
+    yes: bool,
+    /// Fail instead of prompting if any required value is missing.
+    #[arg(long, default_value_t = false)]
+    non_interactive: bool,
+}
+
+/// Build the forwarded argv for the TUI `remote-setup` subcommand from the
+/// structured CLI flags. Mirrors the named flags exactly so the TUI clap parser
+/// re-derives the same `RemoteSetupArgs`.
+fn remote_setup_tui_args(args: RemoteSetupArgs) -> Vec<String> {
+    let mut forwarded = vec!["remote-setup".to_string()];
+    if let Some(cloud) = args.cloud {
+        forwarded.push("--cloud".to_string());
+        forwarded.push(cloud);
+    }
+    if let Some(bridge) = args.bridge {
+        forwarded.push("--bridge".to_string());
+        forwarded.push(bridge);
+    }
+    if let Some(provider) = args.provider {
+        forwarded.push("--provider".to_string());
+        forwarded.push(provider);
+    }
+    if let Some(out) = args.out {
+        forwarded.push("--out".to_string());
+        forwarded.push(out.to_string_lossy().into_owned());
+    }
+    if args.generate_only {
+        forwarded.push("--generate-only".to_string());
+    }
+    if args.apply {
+        forwarded.push("--apply".to_string());
+    }
+    if args.yes {
+        forwarded.push("--yes".to_string());
+    }
+    if args.non_interactive {
+        forwarded.push("--non-interactive".to_string());
+    }
+    forwarded
+}
+
 #[derive(Debug, Args)]
 struct LoginArgs {
     #[arg(long, value_enum, hide = true)]
@@ -281,7 +428,13 @@ struct AuthArgs {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     /// Show current provider and credential source state.
-    Status,
+    /// Without `--provider`, shows all known providers.
+    /// With `--provider`, shows detailed status for that provider.
+    Status {
+        /// Show status for a specific provider only.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderArg>,
+    },
     /// Save an API key to the shared user config file. Reads from
     /// `--api-key`, `--api-key-stdin`, or prompts on stdin when
     /// neither is given. Does not echo the key.
@@ -350,6 +503,8 @@ enum ModelCommand {
         #[arg(long, value_enum)]
         provider: Option<ProviderArg>,
     },
+    /// Set the default model (e.g. "pro", "flash", "deepseek-v4-pro").
+    Set { model: String },
 }
 
 #[derive(Debug, Args)]
@@ -428,10 +583,33 @@ impl From<ApprovalModeArg> for AskForApproval {
 
 #[derive(Debug, Args)]
 struct AppServerArgs {
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    #[arg(long, default_value_t = 8787)]
-    port: u16,
+    /// Serve the full HTTP/SSE runtime API (`/v1/*`: sessions, threads, turns,
+    /// approvals, events, usage, fleet, tasks). This is the canonical runtime
+    /// API surface; it delegates to the same server as `codewhale serve --http`.
+    #[arg(long, conflicts_with_all = ["stdio", "mobile"])]
+    http: bool,
+    /// Serve the runtime API plus the phone-friendly mobile control page.
+    /// Equivalent to the legacy `codewhale serve --mobile`.
+    #[arg(long, conflicts_with = "stdio")]
+    mobile: bool,
+    /// Run the app-server JSON-RPC control transport over stdio (no listener).
+    /// Used by local SDKs and JSON-RPC integrations.
+    #[arg(long, default_value_t = false)]
+    stdio: bool,
+    /// Show a QR code for the mobile URL in the terminal (requires --mobile).
+    #[arg(long, requires = "mobile")]
+    qr: bool,
+    /// Bind host. Defaults to 127.0.0.1; with --mobile and no host, binds
+    /// 0.0.0.0 so LAN devices can reach the mobile page.
+    #[arg(long)]
+    host: Option<String>,
+    /// Bind port. Defaults to 7878 for --http/--mobile (the runtime API) and
+    /// 8787 for the legacy in-process app-server HTTP transport.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Background task worker count (1-8). Only used with --http/--mobile.
+    #[arg(long)]
+    workers: Option<usize>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long = "auth-token")]
@@ -440,13 +618,17 @@ struct AppServerArgs {
     insecure_no_auth: bool,
     #[arg(long = "cors-origin")]
     cors_origin: Vec<String>,
-    #[arg(long, default_value_t = false)]
-    stdio: bool,
 }
 
 const MCP_SERVER_DEFINITIONS_KEY: &str = "mcp.server_definitions";
 
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub fn run_cli() -> std::process::ExitCode {
+    install_rustls_crypto_provider();
+
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -482,6 +664,7 @@ fn run() -> Result<()> {
         approval_policy: cli.approval_policy.clone(),
         sandbox_mode: cli.sandbox_mode.clone(),
         yolo: Some(cli.yolo),
+        verbosity: cli.verbosity.clone(),
     };
     let command = cli.command.take();
 
@@ -497,6 +680,10 @@ fn run() -> Result<()> {
         Some(Commands::Models(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("models", args))
+        }
+        Some(Commands::Speech(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("speech", args))
         }
         Some(Commands::Sessions(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -518,13 +705,18 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("setup", args))
         }
+        Some(Commands::RemoteSetup(args)) => {
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            delegate_to_tui(&cli, &resolved_runtime, remote_setup_tui_args(args))
+        }
         Some(Commands::Exec(args)) => {
+            reject_exec_global_flags(&args.args)?;
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             delegate_to_tui(&cli, &resolved_runtime, tui_args("exec", args))
         }
-        Some(Commands::Swebench(args)) => {
+        Some(Commands::Fleet(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
-            delegate_to_tui(&cli, &resolved_runtime, tui_args("swebench", args))
+            delegate_to_tui(&cli, &resolved_runtime, tui_args("fleet", args))
         }
         Some(Commands::Review(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -548,7 +740,9 @@ fn run() -> Result<()> {
         }
         Some(Commands::Serve(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
-            delegate_to_tui(&cli, &resolved_runtime, tui_args("serve", args))
+            // `serve` starts a long-running runtime API listener; supervise the
+            // delegated child so it is torn down with the dispatcher (#3259).
+            delegate_server_to_tui(&cli, &resolved_runtime, tui_args("serve", args))
         }
         Some(Commands::Completions(args)) => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -559,17 +753,40 @@ fn run() -> Result<()> {
         Some(Commands::Auth(args)) => run_auth_command(&mut store, args.command),
         Some(Commands::McpServer) => run_mcp_server_command(&mut store),
         Some(Commands::Config(args)) => run_config_command(&mut store, args.command),
-        Some(Commands::Model(args)) => run_model_command(args.command),
+        Some(Commands::Model(args)) => {
+            run_model_command(&mut store, args.command, runtime_overrides.provider)
+        }
         Some(Commands::Thread(args)) => run_thread_command(args.command),
         Some(Commands::Sandbox(args)) => run_sandbox_command(args.command),
-        Some(Commands::AppServer(args)) => run_app_server_command(args),
+        Some(Commands::AppServer(args)) => {
+            // The HTTP/mobile runtime API is delegated to the mature `serve` path
+            // in the TUI binary, which reads the *global* --config. app-server has
+            // historically taken a subcommand-level --config, so bridge it before
+            // resolving runtime options (provider/keyring) for the delegated run.
+            if (args.http || args.mobile) && cli.config.is_none() && args.config.is_some() {
+                cli.config = args.config.clone();
+                store = ConfigStore::load(cli.config.clone())?;
+            }
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            run_app_server_command(&cli, &resolved_runtime, args)
+        }
         Some(Commands::Completion { shell }) => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "codewhale", &mut io::stdout());
             Ok(())
         }
         Some(Commands::Metrics(args)) => run_metrics_command(args),
-        Some(Commands::Update(args)) => update::run_update(args.beta),
+        Some(Commands::Update(args)) => {
+            #[cfg(not(target_env = "ohos"))]
+            {
+                update::run_update(args.beta, args.check, args.proxy)
+            }
+            #[cfg(target_env = "ohos")]
+            {
+                let _ = args;
+                bail!("self-update is not supported on HarmonyOS/OpenHarmony yet");
+            }
+        }
         None => {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             let forwarded = root_tui_passthrough(&cli)?;
@@ -657,6 +874,24 @@ fn tui_args(command: &str, args: TuiPassthroughArgs) -> Vec<String> {
     forwarded
 }
 
+fn reject_exec_global_flags(args: &[String]) -> Result<()> {
+    const GLOBAL_ONLY_FLAGS: &[&str] = &["--provider", "--model", "--api-key", "--base-url"];
+
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if GLOBAL_ONLY_FLAGS.contains(&flag) {
+            bail!(
+                "{flag} must be placed before `exec`.\n\nUse:\n  codewhale {flag} <value> exec \"<prompt>\""
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn run_login_command(store: &mut ConfigStore, args: LoginArgs) -> Result<()> {
     run_login_command_with_secrets(store, args, &Secrets::auto_detect())
 }
@@ -699,7 +934,7 @@ fn run_logout_command(store: &mut ConfigStore) -> Result<()> {
 fn run_logout_command_with_secrets(store: &mut ConfigStore, secrets: &Secrets) -> Result<()> {
     let active_provider = store.config.provider;
     store.config.api_key = None;
-    for provider in PROVIDER_LIST {
+    for provider in ProviderKind::ALL {
         clear_provider_api_key_from_config(store, provider);
     }
     clear_provider_api_key_from_keyring(secrets, active_provider);
@@ -712,36 +947,11 @@ fn run_logout_command_with_secrets(store: &mut ConfigStore, secrets: &Secrets) -
 /// Map [`ProviderKind`] to the canonical provider credential slot.
 fn provider_slot(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Deepseek => "deepseek",
-        ProviderKind::NvidiaNim => "nvidia-nim",
-        ProviderKind::Openai => "openai",
-        ProviderKind::Atlascloud => "atlascloud",
-        ProviderKind::WanjieArk => "wanjie-ark",
-        ProviderKind::Openrouter => "openrouter",
-        ProviderKind::Novita => "novita",
-        ProviderKind::Fireworks => "fireworks",
-        ProviderKind::Moonshot => "moonshot",
-        ProviderKind::Sglang => "sglang",
-        ProviderKind::Vllm => "vllm",
-        ProviderKind::Ollama => "ollama",
+        // Keep the historical shared credential slot for the China endpoint.
+        ProviderKind::SiliconflowCN => "siliconflow",
+        _ => provider.provider().id(),
     }
 }
-
-/// Provider order used by the `auth list` and `auth status` outputs.
-const PROVIDER_LIST: [ProviderKind; 12] = [
-    ProviderKind::Deepseek,
-    ProviderKind::NvidiaNim,
-    ProviderKind::Openai,
-    ProviderKind::Atlascloud,
-    ProviderKind::WanjieArk,
-    ProviderKind::Openrouter,
-    ProviderKind::Novita,
-    ProviderKind::Fireworks,
-    ProviderKind::Moonshot,
-    ProviderKind::Sglang,
-    ProviderKind::Vllm,
-    ProviderKind::Ollama,
-];
 
 #[cfg(test)]
 fn no_keyring_secrets() -> Secrets {
@@ -755,7 +965,6 @@ fn write_provider_api_key_to_config(
     provider: ProviderKind,
     api_key: &str,
 ) {
-    store.config.provider = provider;
     store.config.auth_mode = Some("api_key".to_string());
     store.config.providers.for_provider_mut(provider).api_key = Some(api_key.to_string());
     if provider == ProviderKind::Deepseek {
@@ -786,24 +995,7 @@ fn provider_env_set(provider: ProviderKind) -> bool {
 }
 
 fn provider_env_vars(provider: ProviderKind) -> &'static [&'static str] {
-    match provider {
-        ProviderKind::Deepseek => &["DEEPSEEK_API_KEY"],
-        ProviderKind::Openrouter => &["OPENROUTER_API_KEY"],
-        ProviderKind::Novita => &["NOVITA_API_KEY"],
-        ProviderKind::NvidiaNim => &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY", "DEEPSEEK_API_KEY"],
-        ProviderKind::Fireworks => &["FIREWORKS_API_KEY"],
-        ProviderKind::Moonshot => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        ProviderKind::Sglang => &["SGLANG_API_KEY"],
-        ProviderKind::Vllm => &["VLLM_API_KEY"],
-        ProviderKind::Ollama => &["OLLAMA_API_KEY"],
-        ProviderKind::Openai => &["OPENAI_API_KEY"],
-        ProviderKind::Atlascloud => &["ATLASCLOUD_API_KEY"],
-        ProviderKind::WanjieArk => &[
-            "WANJIE_ARK_API_KEY",
-            "WANJIE_API_KEY",
-            "WANJIE_MAAS_API_KEY",
-        ],
-    }
+    provider.provider().env_vars()
 }
 
 fn provider_env_value(provider: ProviderKind) -> Option<(&'static str, String)> {
@@ -813,6 +1005,28 @@ fn provider_env_value(provider: ProviderKind) -> Option<(&'static str, String)> 
             .filter(|value| !value.trim().is_empty())
             .map(|value| (*var, value))
     })
+}
+
+fn openai_codex_auth_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENAI_CODEX_AUTH_FILE") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    let codex_home = std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codex")
+        });
+    codex_home.join("auth.json")
+}
+
+fn provider_oauth_file_path(provider: ProviderKind) -> Option<PathBuf> {
+    (provider == ProviderKind::OpenaiCodex).then(openai_codex_auth_file_path)
 }
 
 fn provider_config_api_key(store: &ConfigStore, provider: ProviderKind) -> Option<&str> {
@@ -856,13 +1070,96 @@ fn clear_provider_api_key_from_keyring(secrets: &Secrets, provider: ProviderKind
     let _ = secrets.delete(provider_slot(provider));
 }
 
-fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
-    let provider = store.config.provider;
+fn auth_status_all_providers(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
+    let active_provider = store.config.provider;
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "active provider: {} (set via config or CODEWHALE_PROVIDER)",
+        active_provider.as_str()
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "{:<14} {:<8} {:<10} {:<8} {}",
+        "provider", "config", "keyring", "env", "status"
+    ));
+    lines.push("-".repeat(70));
+
+    for provider in ProviderKind::ALL {
+        let config_key = provider_config_api_key(store, provider);
+        let keyring_key = provider_keyring_api_key(secrets, provider);
+        let env_key = provider_env_value(provider);
+        let oauth_file_present = provider_oauth_file_path(provider).is_some_and(|p| p.exists());
+
+        let config_status = config_key.map(|_| "set").unwrap_or("-");
+        let keyring_status = keyring_key.as_ref().map(|_| "set").unwrap_or("-");
+        let env_status = env_key.as_ref().map(|_| "set").unwrap_or("-");
+
+        let source = if provider == ProviderKind::OpenaiCodex {
+            // Keep the summary consistent with `auth status`: Codex auth is
+            // OAuth-file (or env token) based — config/keyring keys are not
+            // consulted for it.
+            if env_key.is_some() {
+                "env"
+            } else if oauth_file_present {
+                "oauth file"
+            } else {
+                "unset"
+            }
+        } else if config_key.is_some() {
+            "config"
+        } else if keyring_key.is_some() {
+            "keyring"
+        } else if env_key.is_some() {
+            "env"
+        } else if oauth_file_present {
+            "oauth file"
+        } else {
+            "unset"
+        };
+
+        let active_marker = if provider == active_provider {
+            " *"
+        } else {
+            ""
+        };
+
+        lines.push(format!(
+            "{:<14} {:<8} {:<10} {:<8} {}{}",
+            provider.as_str(),
+            config_status,
+            keyring_status,
+            env_status,
+            source,
+            active_marker
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("* = active provider (from config or CODEWHALE_PROVIDER)".to_string());
+    lines.push("Run `codewhale auth status --provider <id>` for detailed info.".to_string());
+    lines
+}
+
+fn auth_status_lines_for_provider(
+    store: &ConfigStore,
+    secrets: &Secrets,
+    provider: ProviderKind,
+) -> Vec<String> {
     let config_key = provider_config_api_key(store, provider);
     let keyring_key = provider_keyring_api_key(secrets, provider);
     let env_key = provider_env_value(provider);
+    let oauth_file = provider_oauth_file_path(provider);
+    let oauth_file_present = oauth_file.as_ref().is_some_and(|path| path.exists());
 
-    let active_source = if config_key.is_some() {
+    let active_source = if provider == ProviderKind::OpenaiCodex {
+        if env_key.is_some() {
+            "env"
+        } else if oauth_file_present {
+            "Codex OAuth file"
+        } else {
+            "missing"
+        }
+    } else if config_key.is_some() {
         "config"
     } else if keyring_key.is_some() {
         "secret store"
@@ -871,10 +1168,14 @@ fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     } else {
         "missing"
     };
-    let active_last4 = config_key
-        .map(last4_label)
-        .or_else(|| keyring_key.as_deref().map(last4_label))
-        .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)));
+    let active_last4 = if provider == ProviderKind::OpenaiCodex {
+        env_key.as_ref().map(|(_, value)| last4_label(value))
+    } else {
+        config_key
+            .map(last4_label)
+            .or_else(|| keyring_key.as_deref().map(last4_label))
+            .or_else(|| env_key.as_ref().map(|(_, value)| last4_label(value)))
+    };
     let active_label = active_last4
         .map(|last4| format!("{active_source} (last4: {last4})"))
         .unwrap_or_else(|| active_source.to_string());
@@ -888,14 +1189,31 @@ fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
         .map(|(_, value)| format!("set, last4: {}", last4_label(value)))
         .unwrap_or_else(|| "unset".to_string());
 
-    vec![
-        format!("provider: {}", provider.as_str()),
-        format!(
-            "auth mode: {}",
-            store.config.auth_mode.as_deref().unwrap_or("api_key")
-        ),
+    let is_active = provider == store.config.provider;
+    let active_marker = if is_active { " (active provider)" } else { "" };
+
+    let provider_cfg = store.config.providers.for_provider(provider);
+    let base_url = provider_cfg.base_url.as_deref().unwrap_or("(default)");
+    let model = provider_cfg.model.as_deref().unwrap_or("(default)");
+
+    let lookup_order = if provider == ProviderKind::OpenaiCodex {
+        "lookup order: env -> Codex OAuth file".to_string()
+    } else {
+        "lookup order: config -> secret store -> env".to_string()
+    };
+    let auth_mode = if provider == ProviderKind::OpenaiCodex {
+        "codex_oauth"
+    } else {
+        store.config.auth_mode.as_deref().unwrap_or("api_key")
+    };
+
+    let mut lines = vec![
+        format!("provider: {}{}", provider.as_str(), active_marker),
+        format!("route: {}", base_url),
+        format!("model: {}", model),
+        format!("auth mode: {auth_mode}"),
         format!("active source: {active_label}"),
-        "lookup order: config -> secret store -> env".to_string(),
+        lookup_order,
         format!(
             "config file: {} ({})",
             store.path().display(),
@@ -907,7 +1225,12 @@ fn auth_status_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
             source_status(keyring_key.as_deref(), "missing")
         ),
         format!("env var: {env_var_label} ({env_status})"),
-    ]
+    ];
+    if let Some(path) = oauth_file {
+        let status = if path.exists() { "present" } else { "missing" };
+        lines.push(format!("Codex OAuth file: {} ({status})", path.display()));
+    }
+    lines
 }
 
 fn source_status(value: Option<&str>, missing_label: &str) -> String {
@@ -936,9 +1259,19 @@ fn run_auth_command_with_secrets(
     secrets: &Secrets,
 ) -> Result<()> {
     match command {
-        AuthCommand::Status => {
-            for line in auth_status_lines(store, secrets) {
-                println!("{line}");
+        AuthCommand::Status { provider } => {
+            match provider {
+                Some(p) => {
+                    let provider: ProviderKind = p.into();
+                    for line in auth_status_lines_for_provider(store, secrets, provider) {
+                        println!("{line}");
+                    }
+                }
+                None => {
+                    for line in auth_status_all_providers(store, secrets) {
+                        println!("{line}");
+                    }
+                }
             }
             Ok(())
         }
@@ -950,7 +1283,6 @@ fn run_auth_command_with_secrets(
             let provider: ProviderKind = provider.into();
             let slot = provider_slot(provider);
             if provider == ProviderKind::Ollama && api_key.is_none() && !api_key_stdin {
-                store.config.provider = provider;
                 let provider_cfg = store.config.providers.for_provider_mut(provider);
                 if provider_cfg.base_url.is_none() {
                     provider_cfg.base_url = Some("http://localhost:11434/v1".to_string());
@@ -1015,12 +1347,10 @@ fn run_auth_command_with_secrets(
         }
         AuthCommand::List => {
             println!("provider     config store env  active");
-            let active_provider = store.config.provider;
-            for provider in PROVIDER_LIST {
+            for provider in ProviderKind::ALL {
                 let slot = provider_slot(provider);
                 let file = provider_config_set(store, provider);
-                let keyring = (provider == active_provider && !file)
-                    .then(|| provider_keyring_set(secrets, provider));
+                let keyring = (!file).then(|| provider_keyring_set(secrets, provider));
                 let env = provider_env_set(provider);
                 let active = if file {
                     "config"
@@ -1081,7 +1411,7 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
     let mut migrated: Vec<(ProviderKind, &'static str)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    for provider in PROVIDER_LIST {
+    for provider in ProviderKind::ALL {
         let slot = provider_slot(provider);
         let from_provider_block = store
             .config
@@ -1184,11 +1514,24 @@ fn run_config_command(store: &mut ConfigStore, command: ConfigCommand) -> Result
     }
 }
 
-fn run_model_command(command: ModelCommand) -> Result<()> {
+fn model_command_provider_hint(
+    command_provider: Option<ProviderArg>,
+    top_level_provider: Option<ProviderKind>,
+) -> Option<ProviderKind> {
+    command_provider
+        .map(ProviderKind::from)
+        .or(top_level_provider)
+}
+
+fn run_model_command(
+    store: &mut ConfigStore,
+    command: ModelCommand,
+    top_level_provider: Option<ProviderKind>,
+) -> Result<()> {
     let registry = ModelRegistry::default();
     match command {
         ModelCommand::List { provider } => {
-            let filter = provider.map(ProviderKind::from);
+            let filter = model_command_provider_hint(provider, top_level_provider);
             for model in registry.list().into_iter().filter(|m| match filter {
                 Some(p) => m.provider == p,
                 None => true,
@@ -1198,11 +1541,27 @@ fn run_model_command(command: ModelCommand) -> Result<()> {
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
-            let resolved = registry.resolve(model.as_deref(), provider.map(ProviderKind::from));
+            let provider = model_command_provider_hint(provider, top_level_provider);
+            let resolved = registry.resolve(model.as_deref(), provider);
             println!("requested: {}", resolved.requested.unwrap_or_default());
             println!("resolved: {}", resolved.resolved.id);
             println!("provider: {}", resolved.resolved.provider.as_str());
             println!("used_fallback: {}", resolved.used_fallback);
+            Ok(())
+        }
+        ModelCommand::Set { model } => {
+            let trimmed = model.trim();
+            if trimmed.is_empty() {
+                bail!("Model name cannot be empty");
+            }
+            let canonical = match trimmed.to_ascii_lowercase().as_str() {
+                "pro" | "deepseek-v4pro" => "deepseek-v4-pro",
+                "flash" | "deepseek-v4flash" => "deepseek-v4-flash",
+                _ => trimmed,
+            };
+            store.config.default_text_model = Some(canonical.to_string());
+            store.save()?;
+            println!("Default model set to '{canonical}'");
             Ok(())
         }
     }
@@ -1284,6 +1643,8 @@ fn run_sandbox_command(command: SandboxCommand) -> Result<()> {
             let decision = engine.check(ExecPolicyContext {
                 command: &command,
                 cwd: &cwd.display().to_string(),
+                tool: Some("exec_shell"),
+                path: None,
                 ask_for_approval: ask.into(),
                 sandbox_mode: Some("workspace-write"),
             })?;
@@ -1293,7 +1654,21 @@ fn run_sandbox_command(command: SandboxCommand) -> Result<()> {
     }
 }
 
-fn run_app_server_command(args: AppServerArgs) -> Result<()> {
+fn run_app_server_command(
+    cli: &Cli,
+    resolved_runtime: &ResolvedRuntimeOptions,
+    args: AppServerArgs,
+) -> Result<()> {
+    // The full runtime API lives in the TUI crate behind `serve --http`/`--mobile`.
+    // Rather than duplicate ~6.5k lines or add a CLI→TUI crate dependency, the
+    // canonical `app-server --http`/`--mobile` entrypoint reuses that mature server
+    // by delegating to the sibling TUI binary (the same mechanism `serve` uses).
+    if args.http || args.mobile {
+        // Delegated runtime API listener — supervise it so the child does not
+        // outlive the dispatcher (#3259).
+        return delegate_server_to_tui(cli, resolved_runtime, app_server_serve_passthrough(&args));
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1301,14 +1676,14 @@ fn run_app_server_command(args: AppServerArgs) -> Result<()> {
     if args.stdio {
         return runtime.block_on(run_app_server_stdio(args.config));
     }
-    let listen: SocketAddr = format!("{}:{}", args.host, args.port)
+    // Legacy in-process app-server HTTP transport (`/healthz`, `/thread`, `/app`,
+    // `/prompt`, `/tool`, `/jobs`). Kept for backward compatibility; defaults to
+    // 127.0.0.1:8787 to avoid colliding with the runtime API default of :7878.
+    let host = args.host.as_deref().unwrap_or("127.0.0.1");
+    let port = args.port.unwrap_or(8787);
+    let listen: SocketAddr = format!("{host}:{port}")
         .parse()
-        .with_context(|| {
-            format!(
-                "invalid app-server listen address {}:{}",
-                args.host, args.port
-            )
-        })?;
+        .with_context(|| format!("invalid app-server listen address {host}:{port}"))?;
     runtime.block_on(run_app_server(AppServerOptions {
         listen,
         config_path: args.config,
@@ -1316,6 +1691,45 @@ fn run_app_server_command(args: AppServerArgs) -> Result<()> {
         insecure_no_auth: args.insecure_no_auth,
         cors_origins: args.cors_origin,
     }))
+}
+
+/// Build the `serve` argv forwarded to the TUI binary for
+/// `codewhale app-server --http`/`--mobile`. Maps app-server flags onto the
+/// matching `serve` flags (note `--insecure-no-auth` → `--insecure`). The
+/// subcommand-level `--config` is bridged through the global `--config` in the
+/// dispatcher, so it is intentionally not part of this passthrough. An auth
+/// token from the environment is deliberately *not* forwarded into child argv;
+/// the runtime API reads CODEWHALE_RUNTIME_TOKEN/DEEPSEEK_RUNTIME_TOKEN itself.
+fn app_server_serve_passthrough(args: &AppServerArgs) -> Vec<String> {
+    let mut forwarded = vec!["serve".to_string()];
+    forwarded.push(if args.mobile { "--mobile" } else { "--http" }.to_string());
+    if let Some(host) = args.host.as_ref() {
+        forwarded.push("--host".to_string());
+        forwarded.push(host.clone());
+    }
+    if let Some(port) = args.port {
+        forwarded.push("--port".to_string());
+        forwarded.push(port.to_string());
+    }
+    if let Some(workers) = args.workers {
+        forwarded.push("--workers".to_string());
+        forwarded.push(workers.to_string());
+    }
+    for origin in &args.cors_origin {
+        forwarded.push("--cors-origin".to_string());
+        forwarded.push(origin.clone());
+    }
+    if let Some(token) = args.auth_token.as_ref() {
+        forwarded.push("--auth-token".to_string());
+        forwarded.push(token.clone());
+    }
+    if args.insecure_no_auth {
+        forwarded.push("--insecure".to_string());
+    }
+    if args.qr {
+        forwarded.push("--qr".to_string());
+    }
+    forwarded
 }
 
 fn app_server_token_from_env() -> Option<String> {
@@ -1383,6 +1797,289 @@ fn delegate_to_tui(
     exit_with_tui_status(status)
 }
 
+/// Delegate a long-running server command (`serve --http`/`--mobile`,
+/// `app-server --http`/`--mobile`) to the sibling TUI binary, supervising the
+/// child so its listener does not outlive the dispatcher (#3259).
+///
+/// Plain [`delegate_to_tui`] blocks on `Command::status()`, which reaps the
+/// child only on the child's own exit. If the dispatcher is terminated while
+/// the delegated server is still running, the child can be reparented and keep
+/// its listener bound. Here the child runs under a Tokio supervisor that
+/// forwards termination (Ctrl+C / SIGTERM / SIGHUP) by killing and reaping the
+/// child before the dispatcher exits, and `kill_on_drop` tears the child down
+/// if the dispatcher unwinds.
+///
+/// For an *uncatchable* dispatcher death (SIGKILL, a hard crash) the Tokio
+/// supervisor above can't run, so two OS-level safety nets are installed as
+/// well (#3259): on Linux the child sets `PR_SET_PDEATHSIG` so the kernel
+/// signals it when the dispatcher dies; on Windows the child is placed in a
+/// kill-on-job-close Job Object so closing the dispatcher's handle (which the
+/// OS does on process death) terminates it. macOS has no equivalent primitive,
+/// so an uncatchable dispatcher death there can still orphan the child.
+fn delegate_server_to_tui(
+    cli: &Cli,
+    resolved_runtime: &ResolvedRuntimeOptions,
+    passthrough: Vec<String>,
+) -> Result<()> {
+    let mut std_cmd = build_tui_command(cli, resolved_runtime, passthrough)?;
+    install_server_parent_death_signal(&mut std_cmd);
+    let tui = PathBuf::from(std_cmd.get_program());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create server-teardown runtime")?;
+    runtime.block_on(async move {
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| anyhow!("{}", tui_spawn_error(&tui, &err)))?;
+        // Windows: hold a kill-on-job-close Job Object for the dispatcher's
+        // lifetime so an uncatchable dispatcher death tears the child down.
+        // Bound for the whole `block_on` scope; never dropped early because the
+        // match arms below `std::process::exit`.
+        #[cfg(windows)]
+        let _child_job = attach_server_child_job(&child);
+        match supervise_server_child(&mut child, server_shutdown_signal()).await? {
+            ServerTeardown::Exited(status) => exit_with_tui_status(status),
+            // The child has been killed and reaped; exit with the conventional
+            // 128 + signal code for the signal that initiated the shutdown.
+            ServerTeardown::Signaled(code) => std::process::exit(code),
+        }
+    })
+}
+
+/// On Linux, ask the kernel to terminate the delegated server if the dispatcher
+/// dies before it can run the graceful shutdown supervisor. This covers the
+/// hard parent-death edge of #3259 for `SIGKILL`, OOM, or abrupt process exit.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn install_server_parent_death_signal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
+    // only calls `libc::prctl` with constant arguments and does not touch heap
+    // memory or parent-held locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            let result = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            if result == -1 {
+                // Best effort: the child only loses this OS-level safety net.
+                let _ = std::io::Error::last_os_error();
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+fn install_server_parent_death_signal(_cmd: &mut Command) {}
+
+/// Outcome of supervising a delegated server child.
+#[derive(Debug)]
+enum ServerTeardown {
+    /// The child exited on its own; its status is carried for propagation.
+    Exited(std::process::ExitStatus),
+    /// A shutdown signal fired; the child was killed and reaped. Carries the
+    /// conventional `128 + signal` exit code to propagate.
+    Signaled(i32),
+}
+
+/// Wait for the server `child` to exit, or for `shutdown` to fire first. On
+/// shutdown, kill the child and reap it so no listener is left reparented.
+async fn supervise_server_child<F>(
+    child: &mut tokio::process::Child,
+    shutdown: F,
+) -> io::Result<ServerTeardown>
+where
+    F: std::future::Future<Output = i32>,
+{
+    tokio::select! {
+        status = child.wait() => Ok(ServerTeardown::Exited(status?)),
+        code = shutdown => {
+            // Send the kill, then wait so the PID is reaped before the
+            // dispatcher returns and exits.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Ok(ServerTeardown::Signaled(code))
+        }
+    }
+}
+
+/// Resolve when the dispatcher should tear down a delegated server child, and
+/// the conventional `128 + signal` exit code to propagate: Ctrl+C on every
+/// platform (130), plus SIGTERM (143) and SIGHUP (129) on Unix.
+#[cfg(unix)]
+async fn server_shutdown_signal() -> i32 {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).ok();
+    let mut hangup = signal(SignalKind::hangup()).ok();
+    let term = async {
+        match terminate.as_mut() {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let hup = async {
+        match hangup.as_mut() {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => 130,
+        _ = term => 143,
+        _ = hup => 129,
+    }
+}
+
+#[cfg(not(unix))]
+async fn server_shutdown_signal() -> i32 {
+    let _ = tokio::signal::ctrl_c().await;
+    130
+}
+
+/// Assign the delegated server `child` to a kill-on-job-close Job Object so the
+/// OS terminates it when the dispatcher's handle to the job closes — which it
+/// does on any dispatcher exit, including an uncatchable kill (#3259). The
+/// returned guard must be held for the dispatcher's lifetime. Best-effort:
+/// returns `None` if the job cannot be created or assigned. Mirrors the Job
+/// Object idiom in `crates/tui/src/tools/shell.rs`.
+#[cfg(windows)]
+fn attach_server_child_job(child: &tokio::process::Child) -> Option<ServerChildJob> {
+    let Some(child_handle) = child.raw_handle() else {
+        tracing::warn!("delegated server child exited before a job object could be attached");
+        return None;
+    };
+
+    match ServerChildJob::attach(child_handle) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            tracing::warn!("failed to place delegated server child in a job object: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ServerChildJob {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the wrapped value is a process-wide kernel handle; moving it across
+// threads does not invalidate it, and it is only ever closed once, on drop.
+#[cfg(windows)]
+unsafe impl Send for ServerChildJob {}
+
+#[cfg(windows)]
+impl ServerChildJob {
+    fn attach(child_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows::core::PCWSTR;
+
+        // SAFETY: FFI calls with valid arguments; results are checked via the
+        // `windows` Result wrappers and the handle is stored for close-on-drop.
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(win_io_error)?;
+        let job = Self { handle };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(win_io_error)?;
+            AssignProcessToJobObject(job.handle, HANDLE(child_handle)).map_err(win_io_error)?;
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ServerChildJob {
+    fn drop(&mut self) {
+        // Closing the last handle triggers KILL_ON_JOB_CLOSE. On a normal return
+        // the child has already been reaped, so this is a no-op cleanup; an
+        // uncatchable dispatcher death closes the handle via the OS instead.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_io_error(err: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(err)
+}
+
+#[cfg(all(test, unix))]
+mod server_teardown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn supervisor_propagates_child_exit_when_no_shutdown() {
+        // `true` exits immediately with success; a never-firing shutdown must
+        // let the child's own exit win.
+        let mut child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn true");
+        let outcome = supervise_server_child(&mut child, std::future::pending::<i32>())
+            .await
+            .expect("supervise");
+        match outcome {
+            ServerTeardown::Exited(status) => assert!(status.success()),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_kills_and_reaps_long_running_child() {
+        // A long-lived child stands in for the delegated server listener; the
+        // regression is that it outlives dispatcher teardown (#3259).
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        assert!(
+            child.id().is_some(),
+            "child should be running before shutdown"
+        );
+        // A ready future models an immediate shutdown signal carrying the
+        // SIGTERM exit code (143).
+        let outcome = supervise_server_child(&mut child, async { 143 })
+            .await
+            .expect("supervise");
+        assert!(matches!(outcome, ServerTeardown::Signaled(143)));
+        // Once supervise returns the child has been killed AND reaped, so tokio
+        // drops the recorded pid — no listener is left reparented.
+        assert!(
+            child.id().is_none(),
+            "delegated child must be reaped after dispatcher teardown"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn parent_death_signal_hook_does_not_break_spawn() {
+        let mut cmd = Command::new("true");
+        install_server_parent_death_signal(&mut cmd);
+        let status = cmd.status().expect("spawn true with parent-death hook");
+        assert!(status.success());
+    }
+}
+
 fn run_resume_command(
     cli: &Cli,
     resolved_runtime: &ResolvedRuntimeOptions,
@@ -1440,6 +2137,14 @@ fn build_tui_command(
     passthrough: Vec<String>,
 ) -> Result<Command> {
     let tui = locate_sibling_tui_binary()?;
+    let mut verbosity = resolved_runtime.verbosity.clone();
+    if verbosity.is_none()
+        && passthrough
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "exec" | "eval"))
+    {
+        verbosity = Some("concise".to_string());
+    }
 
     let mut cmd = Command::new(&tui);
     if let Some(config) = cli.config.as_ref() {
@@ -1465,41 +2170,21 @@ fn build_tui_command(
     }
     cmd.args(passthrough);
 
-    if !matches!(
-        resolved_runtime.provider,
-        ProviderKind::Deepseek
-            | ProviderKind::NvidiaNim
-            | ProviderKind::Openai
-            | ProviderKind::Atlascloud
-            | ProviderKind::WanjieArk
-            | ProviderKind::Openrouter
-            | ProviderKind::Novita
-            | ProviderKind::Fireworks
-            | ProviderKind::Moonshot
-            | ProviderKind::Sglang
-            | ProviderKind::Vllm
-            | ProviderKind::Ollama
-    ) {
-        bail!(
-            "The interactive TUI supports DeepSeek, NVIDIA NIM, OpenAI-compatible, AtlasCloud, Wanjie Ark, OpenRouter, Novita, Fireworks, Moonshot/Kimi, SGLang, vLLM, and Ollama providers. Remove --provider {} or use `codewhale model ...` for provider registry inspection.",
-            resolved_runtime.provider.as_str()
-        );
-    }
+    let keyring_bridge_provider = resolved_runtime.provider;
+    let keyring_bridge_api_key = resolved_runtime.api_key.as_ref();
+    let keyring_bridge_source = resolved_runtime.api_key_source;
 
-    if let Some(provider) = cli.provider {
-        let provider: ProviderKind = provider.into();
+    if let Some(provider) = cli.provider.map(ProviderKind::from) {
         cmd.env("DEEPSEEK_PROVIDER", provider.as_str());
     }
-    if matches!(
-        resolved_runtime.api_key_source,
-        Some(RuntimeApiKeySource::Keyring)
-    ) && let Some(api_key) = resolved_runtime.api_key.as_ref()
+    if matches!(keyring_bridge_source, Some(RuntimeApiKeySource::Keyring))
+        && let Some(api_key) = keyring_bridge_api_key
     {
         // TUI reloads auth_mode from config/profile, but it does not re-query the
         // platform keyring on normal startup. Bridge only the recovered secret;
         // replaying auth_mode here would turn it back into a profile override.
         cmd.env("DEEPSEEK_API_KEY", api_key);
-        for var in provider_env_vars(resolved_runtime.provider) {
+        for var in provider_env_vars(keyring_bridge_provider) {
             if *var != "DEEPSEEK_API_KEY" {
                 cmd.env(var, api_key);
             }
@@ -1515,6 +2200,10 @@ fn build_tui_command(
     }
     if let Some(output_mode) = cli.output_mode.as_ref() {
         cmd.env("DEEPSEEK_OUTPUT_MODE", output_mode);
+    }
+    if let Some(v) = verbosity.as_ref() {
+        cmd.env("CODEWHALE_VERBOSITY", v);
+        cmd.env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
         cmd.env("DEEPSEEK_LOG_LEVEL", log_level);
@@ -1533,14 +2222,10 @@ fn build_tui_command(
     }
     if let Some(api_key) = cli.api_key.as_ref() {
         cmd.env("DEEPSEEK_API_KEY", api_key);
-        if resolved_runtime.provider == ProviderKind::Openai {
-            cmd.env("OPENAI_API_KEY", api_key);
-        }
-        if resolved_runtime.provider == ProviderKind::Atlascloud {
-            cmd.env("ATLASCLOUD_API_KEY", api_key);
-        }
-        if resolved_runtime.provider == ProviderKind::WanjieArk {
-            cmd.env("WANJIE_ARK_API_KEY", api_key);
+        for var in provider_env_vars(resolved_runtime.provider) {
+            if *var != "DEEPSEEK_API_KEY" {
+                cmd.env(var, api_key);
+            }
         }
         cmd.env("DEEPSEEK_API_KEY_SOURCE", "cli");
     }
@@ -1683,6 +2368,7 @@ fn read_api_key_from_stdin() -> Result<String> {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    use codewhale_config::ProviderSource;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
@@ -1739,6 +2425,41 @@ mod tests {
                     std::env::remove_var(self.name);
                 }
             }
+        }
+    }
+
+    fn install_fake_tui_binary() -> (tempfile::TempDir, ScopedEnvVar) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+        (dir, bin)
+    }
+
+    fn resolved_runtime_for_test(
+        provider: ProviderKind,
+        provider_source: ProviderSource,
+    ) -> ResolvedRuntimeOptions {
+        ResolvedRuntimeOptions {
+            provider,
+            provider_source,
+            model: "test-model".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "http://localhost:8000/v1".to_string(),
+            auth_mode: None,
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1817,14 +2538,40 @@ mod tests {
         let cli = parse_ok(&["codewhale", "update"]);
         assert!(matches!(
             cli.command,
-            Some(Commands::Update(UpdateArgs { beta: false }))
+            Some(Commands::Update(UpdateArgs {
+                beta: false,
+                check: false,
+                proxy: None
+            }))
         ));
 
         let cli = parse_ok(&["codewhale", "update", "--beta"]);
         assert!(matches!(
             cli.command,
-            Some(Commands::Update(UpdateArgs { beta: true }))
+            Some(Commands::Update(UpdateArgs {
+                beta: true,
+                check: false,
+                proxy: None
+            }))
         ));
+
+        let cli = parse_ok(&["codewhale", "update", "--check"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Update(UpdateArgs {
+                beta: false,
+                check: true,
+                proxy: None
+            }))
+        ));
+
+        let cli = parse_ok(&["codewhale", "update", "--proxy", "socks5://127.0.0.1:1080"]);
+        let Some(Commands::Update(args)) = cli.command else {
+            panic!("expected update command");
+        };
+        assert!(!args.beta);
+        assert!(!args.check);
+        assert_eq!(args.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
     }
 
     #[test]
@@ -1874,6 +2621,36 @@ mod tests {
                     provider: Some(ProviderArg::Deepseek)
                 }
             })) if model == "deepseek-v4-pro"
+        ));
+
+        let cli = parse_ok(&["deepseek", "model", "set", "pro"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Model(ModelArgs {
+                command: ModelCommand::Set { ref model }
+            })) if model == "pro"
+        ));
+    }
+
+    #[test]
+    fn model_command_provider_hint_uses_subcommand_then_top_level_provider() {
+        assert_eq!(
+            model_command_provider_hint(None, Some(ProviderKind::Zai)),
+            Some(ProviderKind::Zai)
+        );
+        assert_eq!(
+            model_command_provider_hint(Some(ProviderArg::Minimax), Some(ProviderKind::Zai)),
+            Some(ProviderKind::Minimax)
+        );
+        assert_eq!(model_command_provider_hint(None, None), None);
+
+        let cli = parse_ok(&["codewhale", "--provider", "zai", "model", "list"]);
+        assert_eq!(cli.provider, Some(ProviderArg::Zai));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Model(ModelArgs {
+                command: ModelCommand::List { provider: None }
+            }))
         ));
     }
 
@@ -1981,9 +2758,11 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::AppServer(AppServerArgs {
-                ref host,
-                port: 9999,
+                host: Some(ref host),
+                port: Some(9999),
                 stdio: false,
+                http: false,
+                mobile: false,
                 ..
             })) if host == "0.0.0.0"
         ));
@@ -1999,6 +2778,124 @@ mod tests {
             cli.command,
             Some(Commands::Completion { shell: Shell::Bash })
         ));
+    }
+
+    #[test]
+    fn app_server_transports_are_mutually_exclusive() {
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--http"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                http: true,
+                mobile: false,
+                stdio: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--mobile"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                mobile: true,
+                http: false,
+                stdio: false,
+                ..
+            }))
+        ));
+
+        for argv in [
+            ["deepseek", "app-server", "--http", "--mobile"].as_slice(),
+            ["deepseek", "app-server", "--http", "--stdio"].as_slice(),
+            ["deepseek", "app-server", "--mobile", "--stdio"].as_slice(),
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("conflicting transports must fail");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "argv={argv:?}");
+        }
+    }
+
+    #[test]
+    fn app_server_qr_requires_mobile() {
+        let err = Cli::try_parse_from(["deepseek", "app-server", "--qr"])
+            .expect_err("--qr without --mobile must fail");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(matches!(
+            parse_ok(&["deepseek", "app-server", "--mobile", "--qr"]).command,
+            Some(Commands::AppServer(AppServerArgs {
+                mobile: true,
+                qr: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn app_server_serve_passthrough_maps_flags_to_serve() {
+        let args = AppServerArgs {
+            http: true,
+            mobile: false,
+            stdio: false,
+            qr: false,
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9000),
+            workers: Some(4),
+            config: None,
+            auth_token: Some("tok".to_string()),
+            insecure_no_auth: true,
+            cors_origin: vec!["http://localhost:5173".to_string()],
+        };
+        let argv = app_server_serve_passthrough(&args);
+        let as_str: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // app-server's --insecure-no-auth maps onto serve's --insecure.
+        assert_eq!(
+            as_str,
+            vec![
+                "serve",
+                "--http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9000",
+                "--workers",
+                "4",
+                "--cors-origin",
+                "http://localhost:5173",
+                "--auth-token",
+                "tok",
+                "--insecure",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_serve_passthrough_mobile_defaults_are_minimal() {
+        let args = AppServerArgs {
+            http: false,
+            mobile: true,
+            stdio: false,
+            qr: true,
+            host: None,
+            port: None,
+            workers: None,
+            config: None,
+            auth_token: None,
+            insecure_no_auth: false,
+            cors_origin: vec![],
+        };
+        let argv = app_server_serve_passthrough(&args);
+        let as_str: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // No host/port forwarded → serve applies its own --mobile 0.0.0.0 default.
+        // No auth token is injected from the environment into child argv.
+        assert_eq!(as_str, vec!["serve", "--mobile", "--qr"]);
+    }
+
+    #[test]
+    fn serve_help_documents_forwarded_runtime_modes() {
+        let help = help_for(&["codewhale", "serve", "--help"]);
+        for flag in ["--http", "--mobile", "--mcp", "--acp"] {
+            assert!(
+                help.contains(flag),
+                "serve help should document forwarded flag {flag}; help was:\n{help}"
+            );
+        }
+        assert!(help.contains("compatibility"));
     }
 
     #[test]
@@ -2027,6 +2924,103 @@ mod tests {
             Some(Commands::Setup(TuiPassthroughArgs { ref args }))
                 if args == &["--skills", "--local"]
         ));
+
+        let cli = parse_ok(&["codewhale", "fleet", "init"]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args })) if args == &["init"]
+        ));
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "fleet",
+            "run",
+            "tasks.json",
+            "--max-workers",
+            "2",
+        ]);
+        assert!(cli.prompt.is_empty());
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fleet(TuiPassthroughArgs { ref args }))
+                if args == &["run", "tasks.json", "--max-workers", "2"]
+        ));
+    }
+
+    #[test]
+    fn exec_keeps_global_looking_flags_as_passthrough_args() {
+        let cli = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--provider",
+            "definitely-not-a-provider",
+            "Reply OK",
+        ]);
+
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(
+            args.args,
+            vec![
+                "--provider".to_string(),
+                "definitely-not-a-provider".to_string(),
+                "Reply OK".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_rejects_provider_after_subcommand() {
+        let args = vec![
+            "--provider".to_string(),
+            "definitely-not-a-provider".to_string(),
+            "Reply OK".to_string(),
+        ];
+
+        let err = reject_exec_global_flags(&args).expect_err("provider after exec should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--provider must be placed before `exec`")
+        );
+    }
+
+    #[test]
+    fn exec_rejects_equals_form_provider_after_subcommand() {
+        let args = vec!["--provider=openmodel".to_string(), "Reply OK".to_string()];
+
+        let err = reject_exec_global_flags(&args).expect_err("provider after exec should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--provider must be placed before `exec`")
+        );
+    }
+
+    #[test]
+    fn exec_allows_documented_forwarded_flags() {
+        let args = vec![
+            "--auto".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "fix tests".to_string(),
+        ];
+
+        reject_exec_global_flags(&args).expect("documented exec flags should pass");
+    }
+
+    #[test]
+    fn exec_allows_literal_prompt_flags_after_separator() {
+        let args = vec![
+            "--".to_string(),
+            "--provider".to_string(),
+            "is literal prompt text".to_string(),
+        ];
+
+        reject_exec_global_flags(&args).expect("separator should stop global flag validation");
     }
 
     #[test]
@@ -2150,6 +3144,30 @@ mod tests {
             }))
         ));
 
+        let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "siliconflow"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Set {
+                    provider: ProviderArg::Siliconflow,
+                    api_key: None,
+                    api_key_stdin: false,
+                }
+            }))
+        ));
+
+        let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "arcee"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Set {
+                    provider: ProviderArg::Arcee,
+                    api_key: None,
+                    api_key_stdin: false,
+                }
+            }))
+        ));
+
         let cli = parse_ok(&["deepseek", "auth", "set", "--provider", "moonshot"]);
         assert!(matches!(
             cli.command,
@@ -2205,6 +3223,49 @@ mod tests {
                 }
             }))
         ));
+
+        let cli = parse_ok(&["deepseek", "auth", "status", "--provider", "openai-codex"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth(AuthArgs {
+                command: AuthCommand::Status {
+                    provider: Some(ProviderArg::OpenaiCodex)
+                }
+            }))
+        ));
+
+        for (provider, expected) in [
+            ("anthropic", ProviderArg::Anthropic),
+            ("openmodel", ProviderArg::Openmodel),
+            ("open-model", ProviderArg::Openmodel),
+            ("zai", ProviderArg::Zai),
+            ("stepfun", ProviderArg::Stepfun),
+            ("minimax", ProviderArg::Minimax),
+            ("deepinfra", ProviderArg::Deepinfra),
+            ("deep-infra", ProviderArg::Deepinfra),
+            ("siliconflow-cn", ProviderArg::SiliconflowCn),
+            ("siliconflow-CN", ProviderArg::SiliconflowCn),
+            ("siliconflow_china", ProviderArg::SiliconflowCn),
+        ] {
+            let cli = parse_ok(&[
+                "deepseek",
+                "auth",
+                "set",
+                "--provider",
+                provider,
+                "--api-key-stdin",
+            ]);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Auth(AuthArgs {
+                    command: AuthCommand::Set {
+                        provider,
+                        api_key: None,
+                        api_key_stdin: true,
+                    }
+                })) if provider == expected
+            ));
+        }
 
         let cli = parse_ok(&["deepseek", "auth", "list"]);
         assert!(matches!(
@@ -2272,6 +3333,44 @@ mod tests {
     }
 
     #[test]
+    fn auth_set_provider_key_does_not_switch_active_provider() {
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "deepseek-cli-auth-set-preserve-provider-test-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
+        let secrets = no_keyring_secrets();
+
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Set {
+                provider: ProviderArg::Arcee,
+                api_key: Some("arcee-key".to_string()),
+                api_key_stdin: false,
+            },
+            &secrets,
+        )
+        .expect("set should succeed");
+
+        assert_eq!(store.config.provider, ProviderKind::Deepseek);
+        assert_eq!(
+            store.config.providers.arcee.api_key.as_deref(),
+            Some("arcee-key")
+        );
+
+        let reloaded = ConfigStore::load(Some(path.clone())).expect("store should reload");
+        assert_eq!(reloaded.config.provider, ProviderKind::Deepseek);
+        assert_eq!(
+            reloaded.config.providers.arcee.api_key.as_deref(),
+            Some("arcee-key")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn auth_set_ollama_accepts_empty_key_and_records_base_url() {
         let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
@@ -2279,6 +3378,7 @@ mod tests {
             std::process::id()
         ));
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
         let secrets = no_keyring_secrets();
 
         run_auth_command_with_secrets(
@@ -2292,7 +3392,7 @@ mod tests {
         )
         .expect("ollama auth set should not require a key");
 
-        assert_eq!(store.config.provider, ProviderKind::Ollama);
+        assert_eq!(store.config.provider, ProviderKind::Deepseek);
         assert_eq!(
             store.config.providers.ollama.base_url.as_deref(),
             Some("http://localhost:11434/v1")
@@ -2338,7 +3438,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_status_and_list_only_probe_active_provider_keyring() {
+    fn auth_status_scoped_probe_and_list_all_provider_keyrings() {
         use codewhale_secrets::{KeyringStore, SecretsError};
         use std::sync::{Arc, Mutex};
 
@@ -2376,14 +3476,29 @@ mod tests {
         let inner = Arc::new(RecordingStore::default());
         let secrets = Secrets::new(inner.clone());
 
-        run_auth_command_with_secrets(&mut store, AuthCommand::Status, &secrets)
-            .expect("status should succeed");
+        run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Status {
+                provider: Some(ProviderArg::Deepseek),
+            },
+            &secrets,
+        )
+        .expect("status should succeed");
         run_auth_command_with_secrets(&mut store, AuthCommand::List, &secrets)
             .expect("list should succeed");
 
-        assert_eq!(
-            inner.gets.lock().unwrap().as_slice(),
-            ["deepseek", "deepseek"]
+        let probed = inner.gets.lock().unwrap();
+        // Scoped status probes only the requested provider.
+        assert_eq!(probed[0], "deepseek");
+        // List now probes all providers (not just active) to fix the
+        // stale keyring-only-for-active-provider bug.
+        assert!(probed.len() > 1, "list should probe all providers");
+        assert!(
+            ProviderKind::ALL
+                .iter()
+                .all(|p| probed.contains(&provider_slot(*p).to_string())),
+            "every known provider should be probed by auth list: {:?}",
+            *probed
         );
 
         let _ = std::fs::remove_file(path);
@@ -2411,7 +3526,8 @@ mod tests {
         inner.set("deepseek", "sk-keyring-2222").unwrap();
         let secrets = Secrets::new(inner);
 
-        let output = auth_status_lines(&store, &secrets).join("\n");
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::Deepseek).join("\n");
 
         assert!(output.contains("provider: deepseek"));
         assert!(output.contains("active source: config (last4: ...3333)"));
@@ -2423,6 +3539,109 @@ mod tests {
         assert!(!output.contains("sk-config-3333"));
         assert!(!output.contains("sk-keyring-2222"));
         assert!(!output.contains("sk-env-1111"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_status_all_providers_lists_every_known_provider() {
+        use codewhale_secrets::{InMemoryKeyringStore, KeyringStore};
+        use std::sync::Arc;
+
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "deepseek-cli-auth-all-status-test-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
+        store.config.providers.arcee.api_key = Some("sk-arcee-test1234".to_string());
+
+        let inner = Arc::new(InMemoryKeyringStore::new());
+        inner.set("openrouter", "sk-or-test5678").unwrap();
+        let secrets = Secrets::new(inner);
+
+        let output = auth_status_all_providers(&store, &secrets).join("\n");
+
+        // Should list all known providers
+        assert!(output.contains("deepseek"));
+        assert!(output.contains("arcee"));
+        assert!(output.contains("openrouter"));
+        assert!(output.contains("huggingface"));
+        assert!(output.contains("ollama"));
+
+        // Active provider should be marked
+        assert!(output.contains("deepseek") && output.contains("*"));
+
+        // Arcee should show config source
+        assert!(output.contains("config"));
+
+        // Should NOT leak raw keys
+        assert!(!output.contains("sk-arcee-test1234"));
+        assert!(!output.contains("sk-or-test5678"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_status_openai_codex_reports_codex_oauth_file() {
+        use codewhale_secrets::InMemoryKeyringStore;
+        use std::sync::Arc;
+
+        let _lock = env_lock();
+        let _access_token = ScopedEnvVar::set("OPENAI_CODEX_ACCESS_TOKEN", "");
+        let _codex_token = ScopedEnvVar::set("CODEX_ACCESS_TOKEN", "");
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"tokens":{"access_token":"secret-token"}}"#)
+            .expect("write auth file");
+        let auth_path_str = auth_path.to_string_lossy().into_owned();
+        let _auth_file = ScopedEnvVar::set("OPENAI_CODEX_AUTH_FILE", &auth_path_str);
+
+        let mut store = ConfigStore::load(Some(config_path)).expect("store should load");
+        store.config.provider = ProviderKind::OpenaiCodex;
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+
+        assert!(output.contains("provider: openai-codex"));
+        assert!(output.contains("auth mode: codex_oauth"));
+        assert!(output.contains("active source: Codex OAuth file"));
+        assert!(output.contains("lookup order: env -> Codex OAuth file"));
+        assert!(output.contains(&format!(
+            "Codex OAuth file: {} (present)",
+            auth_path.display()
+        )));
+        assert!(!output.contains("secret-token"));
+    }
+
+    #[test]
+    fn auth_status_scoped_provider_shows_detailed_info() {
+        use codewhale_secrets::InMemoryKeyringStore;
+        use std::sync::Arc;
+
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "deepseek-cli-auth-scoped-test-{}-{nanos}.toml",
+            std::process::id()
+        ));
+        let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
+        store.config.provider = ProviderKind::Deepseek;
+        store.config.providers.arcee.api_key = Some("sk-arcee-9999".to_string());
+
+        let secrets = Secrets::new(Arc::new(InMemoryKeyringStore::new()));
+
+        let output =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::Arcee).join("\n");
+
+        assert!(output.contains("provider: arcee"));
+        assert!(output.contains("active source: config (last4: ...9999)"));
+        assert!(output.contains("route:"));
+        assert!(output.contains("model:"));
+        assert!(!output.contains("sk-arcee-9999"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -2588,6 +3807,8 @@ mod tests {
             "deepseek-v4-pro",
             "--output-mode",
             "json",
+            "--verbosity",
+            "concise",
             "--log-level",
             "debug",
             "--telemetry",
@@ -2615,6 +3836,7 @@ mod tests {
         assert_eq!(cli.profile.as_deref(), Some("work"));
         assert_eq!(cli.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(cli.output_mode.as_deref(), Some("json"));
+        assert_eq!(cli.verbosity.as_deref(), Some("concise"));
         assert_eq!(cli.log_level.as_deref(), Some("debug"));
         assert_eq!(cli.telemetry, Some(true));
         assert_eq!(cli.approval_policy.as_deref(), Some("on-request"));
@@ -2629,6 +3851,27 @@ mod tests {
         assert!(cli.no_mouse_capture);
         assert!(!cli.mouse_capture);
         assert!(cli.skip_onboarding);
+    }
+
+    #[test]
+    fn cli_provider_helpers_follow_config_metadata() {
+        let registry_kinds: Vec<ProviderKind> = codewhale_config::provider::all_providers()
+            .iter()
+            .map(|provider| provider.kind())
+            .collect();
+        assert_eq!(registry_kinds, ProviderKind::ALL);
+
+        for provider in ProviderKind::ALL {
+            assert_eq!(provider_env_vars(provider), provider.provider().env_vars());
+            if provider == ProviderKind::SiliconflowCN {
+                assert_eq!(
+                    provider_slot(provider),
+                    provider_slot(ProviderKind::Siliconflow)
+                );
+            } else {
+                assert_eq!(provider_slot(provider), provider.provider().id());
+            }
+        }
     }
 
     #[test]
@@ -2651,17 +3894,20 @@ mod tests {
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Openai,
+            provider_source: ProviderSource::Cli,
             model: "glm-5".to_string(),
             api_key: Some("resolved-openai-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::Keyring),
             base_url: "https://openai-compatible.example/v4".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -2695,6 +3941,146 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_allows_openai_codex_from_resolved_runtime() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::OpenaiCodex,
+            provider_source: ProviderSource::Config,
+            model: "gpt-5.5".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "https://chatgpt.com/backend-api".to_string(),
+            auth_mode: Some("oauth".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("openai-codex should be accepted by the facade");
+        assert_eq!(command_env(&cmd, "DEEPSEEK_PROVIDER"), None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["doctor"]);
+    }
+
+    #[test]
+    fn build_tui_command_forwards_explicit_openai_codex_provider() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&["codewhale", "--provider", "openai-codex", "doctor"]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::OpenaiCodex,
+            provider_source: ProviderSource::Cli,
+            model: "gpt-5.5".to_string(),
+            api_key: None,
+            api_key_source: None,
+            base_url: "https://chatgpt.com/backend-api".to_string(),
+            auth_mode: Some("oauth".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("openai-codex should be accepted by the facade");
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("openai-codex")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_allows_anthropic_cli_provider() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "--provider", "anthropic", "doctor"]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Anthropic, ProviderSource::Cli);
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("anthropic should be accepted by the facade");
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_allows_anthropic_env_provider() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let resolved = resolved_runtime_for_test(
+            ProviderKind::Anthropic,
+            ProviderSource::Env("DEEPSEEK_PROVIDER"),
+        );
+
+        build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("anthropic from provider env should be accepted by the facade");
+    }
+
+    #[test]
+    fn build_tui_command_bridges_anthropic_keyring_secret() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale", "doctor"]);
+        let mut resolved =
+            resolved_runtime_for_test(ProviderKind::Anthropic, ProviderSource::Config);
+        resolved.api_key = Some("anthropic-keyring-secret".to_string());
+        resolved.api_key_source = Some(RuntimeApiKeySource::Keyring);
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["doctor".to_string()])
+            .expect("config-sourced anthropic provider should be accepted");
+
+        assert_eq!(command_env(&cmd, "DEEPSEEK_PROVIDER"), None);
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
+            Some("anthropic-keyring-secret")
+        );
+        assert_eq!(
+            command_env(&cmd, "ANTHROPIC_API_KEY").as_deref(),
+            Some("anthropic-keyring-secret")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_API_KEY_SOURCE").as_deref(),
+            Some("keyring")
+        );
+    }
+
+    #[test]
     fn build_tui_command_does_not_export_default_runtime_overrides_for_profiles() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -2710,17 +4096,20 @@ mod tests {
         resolved_headers.insert("X-From-Base".to_string(), "base".to_string());
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Deepseek,
+            provider_source: ProviderSource::Config,
             model: "deepseek-v4-pro".to_string(),
             api_key: Some("config-file-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::ConfigFile),
             base_url: "https://api.deepseek.com/beta".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: resolved_headers,
         };
 
@@ -2744,6 +4133,53 @@ mod tests {
     }
 
     #[test]
+    fn build_tui_command_defaults_noninteractive_to_concise_verbosity() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let resolved = resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+
+        let cmd = build_tui_command(
+            &cli,
+            &resolved,
+            vec!["exec".to_string(), "summarize".to_string()],
+        )
+        .expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("concise")
+        );
+    }
+
+    #[test]
+    fn build_tui_command_respects_resolved_verbosity_override() {
+        let _lock = env_lock();
+        let (_dir, _bin) = install_fake_tui_binary();
+
+        let cli = parse_ok(&["codewhale"]);
+        let mut resolved =
+            resolved_runtime_for_test(ProviderKind::Deepseek, ProviderSource::Config);
+        resolved.verbosity = Some("normal".to_string());
+
+        let cmd = build_tui_command(&cli, &resolved, vec!["exec".to_string()]).expect("command");
+
+        assert_eq!(
+            command_env(&cmd, "CODEWHALE_VERBOSITY").as_deref(),
+            Some("normal")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_VERBOSITY").as_deref(),
+            Some("normal")
+        );
+    }
+
+    #[test]
     fn build_tui_command_allows_moonshot_and_forwards_kimi_key() {
         let _lock = env_lock();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -2759,23 +4195,26 @@ mod tests {
             "--provider",
             "moonshot",
             "--model",
-            "kimi-k2.6",
+            "kimi-k2.7-code",
             "--workspace",
             "/tmp/codewhale-workspace",
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Moonshot,
-            model: "kimi-k2.6".to_string(),
+            provider_source: ProviderSource::Cli,
+            model: "kimi-k2.7-code".to_string(),
             api_key: Some("resolved-kimi-key".to_string()),
             api_key_source: Some(RuntimeApiKeySource::Keyring),
             base_url: "https://api.moonshot.ai/v1".to_string(),
             auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -2786,7 +4225,7 @@ mod tests {
         );
         assert_eq!(
             command_env(&cmd, "DEEPSEEK_MODEL").as_deref(),
-            Some("kimi-k2.6")
+            Some("kimi-k2.7-code")
         );
         assert_eq!(
             command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
@@ -2805,6 +4244,72 @@ mod tests {
             Some("keyring")
         );
         assert_eq!(command_env(&cmd, "DEEPSEEK_AUTH_MODE"), None);
+    }
+
+    #[test]
+    fn build_tui_command_allows_volcengine_and_forwards_ark_keys() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let custom = dir
+            .path()
+            .join(format!("custom-tui{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&custom, b"").unwrap();
+        let custom_str = custom.to_string_lossy().into_owned();
+        let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "--provider",
+            "volcengine",
+            "--model",
+            "DeepSeek-V4-Pro",
+            "--workspace",
+            "/tmp/codewhale-workspace",
+        ]);
+        let resolved = ResolvedRuntimeOptions {
+            provider: ProviderKind::Volcengine,
+            provider_source: ProviderSource::Cli,
+            model: "DeepSeek-V4-Pro".to_string(),
+            api_key: Some("resolved-ark-key".to_string()),
+            api_key_source: Some(RuntimeApiKeySource::Keyring),
+            base_url: "https://ark.cn-beijing.volces.com/api/coding/v3".to_string(),
+            auth_mode: Some("api_key".to_string()),
+            insecure_skip_tls_verify: false,
+            output_mode: None,
+            log_level: None,
+            telemetry: false,
+            approval_policy: None,
+            sandbox_mode: None,
+            yolo: None,
+            verbosity: None,
+            http_headers: std::collections::BTreeMap::new(),
+        };
+
+        let cmd = build_tui_command(&cli, &resolved, Vec::new()).expect("command");
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_PROVIDER").as_deref(),
+            Some("volcengine")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_MODEL").as_deref(),
+            Some("DeepSeek-V4-Pro")
+        );
+        assert_eq!(
+            command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "VOLCENGINE_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "VOLCENGINE_ARK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
+        assert_eq!(
+            command_env(&cmd, "ARK_API_KEY").as_deref(),
+            Some("resolved-ark-key")
+        );
     }
 
     #[test]
@@ -2831,17 +4336,20 @@ mod tests {
         ]);
         let resolved = ResolvedRuntimeOptions {
             provider: ProviderKind::Openai,
+            provider_source: ProviderSource::Cli,
             model: "glm-5".to_string(),
             api_key: None,
             api_key_source: None,
             base_url: "https://openai-compatible.example/v4".to_string(),
             auth_mode: None,
+            insecure_skip_tls_verify: false,
             output_mode: None,
             log_level: None,
             telemetry: false,
             approval_policy: None,
             sandbox_mode: None,
             yolo: None,
+            verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
         };
 
@@ -2872,97 +4380,72 @@ mod tests {
         let custom_str = custom.to_string_lossy().into_owned();
         let _bin = ScopedEnvVar::set("DEEPSEEK_TUI_BIN", &custom_str);
 
-        // (provider, cli flag, extra env vars that must be forwarded besides DEEPSEEK_API_KEY)
-        let cases: &[(ProviderKind, &str, &[&str])] = &[
-            (
-                ProviderKind::Openrouter,
-                "openrouter",
-                &["OPENROUTER_API_KEY"],
-            ),
-            (ProviderKind::Novita, "novita", &["NOVITA_API_KEY"]),
-            (
-                ProviderKind::NvidiaNim,
-                "nvidia-nim",
-                &["NVIDIA_API_KEY", "NVIDIA_NIM_API_KEY"],
-            ),
-            (ProviderKind::Fireworks, "fireworks", &["FIREWORKS_API_KEY"]),
-            (ProviderKind::Sglang, "sglang", &["SGLANG_API_KEY"]),
-            (ProviderKind::Vllm, "vllm", &["VLLM_API_KEY"]),
-            (ProviderKind::Ollama, "ollama", &["OLLAMA_API_KEY"]),
-            (
-                ProviderKind::Atlascloud,
-                "atlascloud",
-                &["ATLASCLOUD_API_KEY"],
-            ),
-            (
-                ProviderKind::WanjieArk,
-                "wanjie-ark",
-                &[
-                    "WANJIE_ARK_API_KEY",
-                    "WANJIE_API_KEY",
-                    "WANJIE_MAAS_API_KEY",
-                ],
-            ),
-        ];
-
-        for &(provider, flag, expected_vars) in cases {
-            let cli = parse_ok(&[
-                "codewhale",
-                "--provider",
-                flag,
-                "--workspace",
-                "/tmp/codewhale-workspace",
-            ]);
+        for provider in ProviderKind::ALL {
+            let cli = parse_ok(&["codewhale", "--workspace", "/tmp/codewhale-workspace"]);
             let resolved = ResolvedRuntimeOptions {
                 provider,
+                provider_source: ProviderSource::Config,
                 model: "test-model".to_string(),
                 api_key: Some("test-key".to_string()),
                 api_key_source: Some(RuntimeApiKeySource::Keyring),
                 base_url: "http://localhost:8000/v1".to_string(),
                 auth_mode: Some("api_key".to_string()),
+                insecure_skip_tls_verify: false,
                 output_mode: None,
                 log_level: None,
                 telemetry: false,
                 approval_policy: None,
                 sandbox_mode: None,
                 yolo: None,
+                verbosity: None,
                 http_headers: std::collections::BTreeMap::new(),
             };
 
             let cmd = build_tui_command(&cli, &resolved, Vec::new())
-                .unwrap_or_else(|e| panic!("{flag}: {e}"));
+                .unwrap_or_else(|e| panic!("{}: {e}", provider.as_str()));
 
             assert_eq!(
                 command_env(&cmd, "DEEPSEEK_API_KEY").as_deref(),
                 Some("test-key"),
-                "{flag}: DEEPSEEK_API_KEY not forwarded"
+                "{}: DEEPSEEK_API_KEY not forwarded",
+                provider.as_str()
             );
-            for var in expected_vars {
+            for var in provider_env_vars(provider)
+                .iter()
+                .filter(|var| **var != "DEEPSEEK_API_KEY")
+            {
                 assert_eq!(
                     command_env(&cmd, var).as_deref(),
                     Some("test-key"),
-                    "{flag}: {var} not forwarded"
+                    "{}: {var} not forwarded",
+                    provider.as_str()
                 );
             }
             assert_eq!(
                 command_env(&cmd, "DEEPSEEK_API_KEY_SOURCE").as_deref(),
                 Some("keyring"),
-                "{flag}: expected keyring source bridge"
+                "{}: expected keyring source bridge",
+                provider.as_str()
             );
             assert_eq!(
                 command_env(&cmd, "DEEPSEEK_AUTH_MODE"),
                 None,
-                "{flag}: auth mode should come from config/profile, not env handoff"
+                "{}: auth mode should come from config/profile, not env handoff",
+                provider.as_str()
             );
         }
     }
 
     #[test]
-    fn parses_top_level_prompt_flag_for_canonical_one_shot() {
+    fn parses_top_level_prompt_flag_for_interactive_startup_prompt() {
         let cli = parse_ok(&["deepseek", "-p", "Reply with exactly OK."]);
 
         assert_eq!(cli.prompt_flag.as_deref(), Some("Reply with exactly OK."));
         assert!(cli.prompt.is_empty());
+        assert_eq!(
+            root_tui_passthrough(&cli).unwrap(),
+            vec!["--prompt".to_string(), "Reply with exactly OK.".to_string()]
+        );
     }
 
     #[test]
@@ -2976,7 +4459,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_continue_rejects_one_shot_prompt() {
+    fn top_level_continue_rejects_startup_prompt() {
         let cli = parse_ok(&["codewhale", "--continue", "-p", "follow up"]);
 
         let err = root_tui_passthrough(&cli).expect_err("prompted continue should be rejected");
@@ -2992,6 +4475,10 @@ mod tests {
 
         assert_eq!(cli.prompt, vec!["hello", "world"]);
         assert!(cli.command.is_none());
+        assert_eq!(
+            root_tui_passthrough(&cli).unwrap(),
+            vec!["--prompt".to_string(), "hello world".to_string()]
+        );
     }
 
     #[test]
@@ -3000,6 +4487,10 @@ mod tests {
 
         assert_eq!(cli.prompt_flag.as_deref(), Some("hello"));
         assert_eq!(cli.prompt, vec!["world"]);
+        assert_eq!(
+            root_tui_passthrough(&cli).unwrap(),
+            vec!["--prompt".to_string(), "hello world".to_string()]
+        );
     }
 
     #[test]

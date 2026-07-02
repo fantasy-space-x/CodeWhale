@@ -5,15 +5,16 @@ const CHECKSUM_MANIFEST = "codewhale-artifacts-sha256.txt";
 
 const ASSET_MATRIX = {
   linux: {
-    x64: ["codewhale-linux-x64", "codewhale-tui-linux-x64"],
-    arm64: ["codewhale-linux-arm64", "codewhale-tui-linux-arm64"],
+    x64: ["codewhale-linux-x64", "codewhale-tui-linux-x64", "codew-linux-x64"],
+    arm64: ["codewhale-linux-arm64", "codewhale-tui-linux-arm64", "codew-linux-arm64"],
+    riscv64: ["codewhale-linux-riscv64", "codewhale-tui-linux-riscv64", "codew-linux-riscv64"],
   },
   darwin: {
-    x64: ["codewhale-macos-x64", "codewhale-tui-macos-x64"],
-    arm64: ["codewhale-macos-arm64", "codewhale-tui-macos-arm64"],
+    x64: ["codewhale-macos-x64", "codewhale-tui-macos-x64", "codew-macos-x64"],
+    arm64: ["codewhale-macos-arm64", "codewhale-tui-macos-arm64", "codew-macos-arm64"],
   },
   win32: {
-    x64: ["codewhale-windows-x64.exe", "codewhale-tui-windows-x64.exe"],
+    x64: ["codewhale-windows-x64.exe", "codewhale-tui-windows-x64.exe", "codew-windows-x64.exe", "codewhale.bat"],
   },
 };
 
@@ -49,6 +50,7 @@ function detectBinaryNames() {
     arch,
     codewhale: pair[0],
     tui: pair[1],
+    codew: pair[2],
   };
 }
 
@@ -58,7 +60,7 @@ function unsupportedBuildHint() {
     "You can still run codewhale by building from source with Cargo:",
     "",
     "  # Requires Rust 1.88+ (https://rustup.rs)",
-    "  cargo install codewhale-cli --locked   # provides `codewhale`",
+    "  cargo install codewhale-cli --locked   # provides `codewhale` and `codew`",
     "  cargo install codewhale-tui --locked   # provides `codewhale-tui`",
     "",
     "Or build from a checkout:",
@@ -111,8 +113,8 @@ function releaseBinaryDirectory() {
 function allAssetNames() {
   const names = [];
   for (const platformAssets of Object.values(ASSET_MATRIX)) {
-    for (const pair of Object.values(platformAssets)) {
-      names.push(pair[0], pair[1]);
+    for (const assets of Object.values(platformAssets)) {
+      names.push(...assets);
     }
   }
   return Array.from(new Set(names));

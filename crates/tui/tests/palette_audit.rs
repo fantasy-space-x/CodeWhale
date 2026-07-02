@@ -1,20 +1,14 @@
 //! Palette audit tests to prevent color drift.
 //!
-//! These tests ensure that deprecated colors (like DEEPSEEK_AQUA) are not used
-//! directly in user-visible code. Backward-compatible DeepSeek aliases should
-//! point at the current CodeWhale semantic tokens instead of stale brand RGBs.
-
-use std::fs;
-use std::path::Path;
+//! These tests ensure that deprecated colors are not used directly in
+//! user-visible code. Backward-compatible DeepSeek aliases should point
+//! at the current CodeWhale semantic tokens instead of stale brand RGBs.
 
 use ratatui::style::Color;
 
 #[path = "../src/palette.rs"]
 #[allow(dead_code)]
 mod palette;
-
-const DEPRECATED_DIRECT_COLORS: &[&str] = &["DEEPSEEK_AQUA"];
-const ALLOWED_PATTERNS: &[&str] = &["pub const DEEPSEEK_AQUA", "DEEPSEEK_AQUA_RGB"];
 
 fn color_to_rgb(color: Color) -> (u8, u8, u8) {
     match color {
@@ -71,66 +65,8 @@ fn assert_min_contrast(label: &str, foreground: Color, background: Color, min_ra
     );
 }
 
-fn audit_file(path: &Path, violations: &mut Vec<String>) {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    for (line_num, line) in content.lines().enumerate() {
-        for deprecated in DEPRECATED_DIRECT_COLORS {
-            let pattern = format!("palette::{deprecated}");
-            if line.contains(&pattern) {
-                let is_allowed = ALLOWED_PATTERNS.iter().any(|p| line.contains(p));
-                if !is_allowed {
-                    violations.push(format!(
-                        "{}:{}: direct use of {} (use semantic alias instead)",
-                        path.display(),
-                        line_num + 1,
-                        deprecated
-                    ));
-                }
-            }
-        }
-    }
-}
-
-fn audit_directory(dir: &Path, violations: &mut Vec<String>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            audit_directory(&path, violations);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            if path.file_name().is_some_and(|n| n == "palette.rs") {
-                continue;
-            }
-            audit_file(&path, violations);
-        }
-    }
-}
-
-#[test]
-fn audit_no_direct_aqua_usage() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let src_dir = Path::new(manifest_dir).join("src");
-    let mut violations = Vec::new();
-
-    audit_directory(&src_dir, &mut violations);
-
-    if !violations.is_empty() {
-        let report = violations.join("\n");
-        panic!(
-            "Palette audit failed! Found {} direct uses of deprecated colors:\n{}",
-            violations.len(),
-            report
-        );
-    }
-}
+// NOTE: The deprecated color audit (DEEPSEEK_AQUA) was removed because
+// the deprecated constant no longer exists in the palette.
 
 #[test]
 fn verify_status_success_uses_success_token() {
@@ -145,21 +81,27 @@ fn verify_status_success_uses_success_token() {
     );
     assert_ne!(
         palette::STATUS_SUCCESS,
-        palette::DEEPSEEK_AQUA,
-        "STATUS_SUCCESS should not regress to deprecated aqua"
+        palette::WHALE_ACCENT_PRIMARY,
+        "STATUS_SUCCESS should not regress to the primary accent"
     );
 }
 
 #[test]
+#[allow(deprecated)]
 fn verify_brand_aliases_follow_whale_tokens() {
     assert_eq!(palette::WHALE_ACCENT_PRIMARY_RGB, (246, 196, 83));
     assert_eq!(palette::WHALE_INFO_RGB, (106, 174, 242));
     assert_eq!(palette::WHALE_ERROR_RGB, (255, 92, 122));
+    assert_eq!(
+        color_to_rgb(palette::WHALE_ACCENT_PRIMARY),
+        palette::WHALE_ACCENT_PRIMARY_RGB
+    );
 
     assert_eq!(
         palette::DEEPSEEK_BLUE_RGB,
         palette::WHALE_ACCENT_PRIMARY_RGB
     );
+    assert_eq!(palette::DEEPSEEK_BLUE, palette::WHALE_ACCENT_PRIMARY);
     assert_eq!(palette::DEEPSEEK_SKY_RGB, palette::WHALE_INFO_RGB);
     assert_eq!(palette::DEEPSEEK_RED_RGB, palette::WHALE_ERROR_RGB);
 }
@@ -196,6 +138,36 @@ fn contrast_guardrails_for_key_ui_pairs() {
         "STATUS_ERROR on DEEPSEEK_INK",
         palette::STATUS_ERROR,
         palette::DEEPSEEK_INK,
+        min_readable,
+    );
+    assert_min_contrast(
+        "SELECTION_TEXT on SELECTION_BG",
+        palette::SELECTION_TEXT,
+        palette::SELECTION_BG,
+        min_readable,
+    );
+    assert_min_contrast(
+        "TEXT_PRIMARY on SURFACE_ELEVATED",
+        palette::TEXT_PRIMARY,
+        palette::SURFACE_ELEVATED,
+        min_readable,
+    );
+    assert_min_contrast(
+        "LIGHT_TEXT_BODY on LIGHT_SURFACE",
+        palette::LIGHT_TEXT_BODY,
+        palette::LIGHT_SURFACE,
+        min_readable,
+    );
+    assert_min_contrast(
+        "LIGHT_TEXT_MUTED on LIGHT_SURFACE",
+        palette::LIGHT_TEXT_MUTED,
+        palette::LIGHT_SURFACE,
+        min_readable,
+    );
+    assert_min_contrast(
+        "LIGHT_TEXT_BODY on LIGHT_SELECTION_BG",
+        palette::LIGHT_TEXT_BODY,
+        palette::LIGHT_SELECTION_BG,
         min_readable,
     );
 }

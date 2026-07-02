@@ -223,6 +223,7 @@ impl StreamAccumulator {
                     ContentBlockStart::Thinking { thinking } => {
                         self.content[idx] = ContentBlock::Thinking {
                             thinking: thinking.clone(),
+                            signature: None,
                         };
                     }
                     ContentBlockStart::ToolUse {
@@ -264,7 +265,7 @@ impl StreamAccumulator {
                     }
                     Delta::ThinkingDelta { thinking } => {
                         if let ContentBlock::Thinking {
-                            thinking: existing,
+                            thinking: existing, ..
                         } = &mut self.content[idx]
                         {
                             existing.push_str(thinking);
@@ -275,6 +276,15 @@ impl StreamAccumulator {
                             .entry(*index)
                             .or_default()
                             .push_str(partial_json);
+                    }
+                    Delta::SignatureDelta { signature } => {
+                        if let ContentBlock::Thinking {
+                            signature: existing, ..
+                        } = &mut self.content[idx]
+                        {
+                            let sig = existing.get_or_insert_with(String::new);
+                            sig.push_str(signature);
+                        }
                     }
                 }
             }
@@ -288,6 +298,7 @@ impl StreamAccumulator {
             }
             StreamEvent::ContentBlockStop { .. }
             | StreamEvent::MessageStop
+            | StreamEvent::Error { .. }
             | StreamEvent::Ping => {}
         }
     }

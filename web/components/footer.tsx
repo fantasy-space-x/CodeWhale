@@ -7,10 +7,10 @@ const EN_COLS = [
     title: "Product",
     cn: "产品",
     items: [
-      { label: "Install", href: "/install" },
-      { label: "Documentation", href: "/docs" },
-      { label: "Roadmap", href: "/roadmap" },
-      { label: "FAQ", href: "/faq" },
+      { label: "Install", href: "/en/install" },
+      { label: "Documentation", href: "/en/docs" },
+      { label: "Roadmap", href: "/en/roadmap" },
+      { label: "FAQ", href: "/en/faq" },
       { label: "Releases", href: "https://github.com/Hmbown/CodeWhale/releases" },
     ],
   },
@@ -21,7 +21,7 @@ const EN_COLS = [
       { label: "Issues", href: "https://github.com/Hmbown/CodeWhale/issues" },
       { label: "Pull Requests", href: "https://github.com/Hmbown/CodeWhale/pulls" },
       { label: "Discussions", href: "https://github.com/Hmbown/CodeWhale/discussions" },
-      { label: "Contribute", href: "/contribute" },
+      { label: "Contribute", href: "/en/contribute" },
       { label: "Sponsor CodeWhale", href: "https://github.com/sponsors/Hmbown" },
     ],
   },
@@ -29,7 +29,9 @@ const EN_COLS = [
     title: "Resources",
     cn: "资源",
     items: [
-      { label: "Activity Feed", href: "/feed" },
+      { label: "Activity Feed", href: "/en/feed" },
+      { label: "npm package", href: "https://www.npmjs.com/package/codewhale" },
+      { label: "crates.io (codewhale-cli)", href: "https://crates.io/crates/codewhale-cli" },
       { label: "Code of Conduct", href: "https://github.com/Hmbown/CodeWhale/blob/main/CODE_OF_CONDUCT.md" },
       { label: "Security", href: "https://github.com/Hmbown/CodeWhale/blob/main/SECURITY.md" },
       { label: "License (MIT)", href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE" },
@@ -62,6 +64,8 @@ const ZH_COLS = [
     title: "资源",
     items: [
       { label: "活动动态", href: "/zh/feed" },
+      { label: "npm 包", href: "https://www.npmjs.com/package/codewhale" },
+      { label: "crates.io（codewhale-cli）", href: "https://crates.io/crates/codewhale-cli" },
       { label: "行为准则", href: "https://github.com/Hmbown/CodeWhale/blob/main/CODE_OF_CONDUCT.md" },
       { label: "安全策略", href: "https://github.com/Hmbown/CodeWhale/blob/main/SECURITY.md" },
       { label: "MIT 许可证", href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE" },
@@ -82,7 +86,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
             <div>
               <div className="font-display text-xl font-semibold">CodeWhale</div>
               <div className="font-cjk text-[0.7rem] text-ink-mute tracking-widest">
-                {isZh ? "开源模型 · 终端智能体" : "open models · terminal agent"}
+                {isZh ? "任何模型 · 开源模型优先" : "any model, open models first"}
               </div>
             </div>
           </div>
@@ -94,18 +98,26 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
           <div className="font-mono text-[0.7rem] text-ink-mute uppercase tracking-widest">
             {isZh ? "用心制作 · Made with care" : "Made with care · 用心制作"}
           </div>
-          {/* Mirror sources — prominent on zh */}
-          {isZh && (
-            <div className="pt-2 border-t border-paper-line/20">
-              <div className="eyebrow mb-2 text-ink-mute">镜像源 / Mirror</div>
-              <div className="flex flex-wrap gap-3 text-xs">
-                {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/deepseek-tui" className="text-indigo hover:underline" target="_blank" rel="noopener">Gitee 镜像</a>}
-                <a href="https://cnb.cool/codewhale.net/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">CNB 镜像</a>
-                <a href="https://npmmirror.com/package/codewhale" className="text-indigo hover:underline" target="_blank" rel="noopener">npmmirror</a>
-                <a href="https://mirrors.tuna.tsinghua.edu.cn/help/crates.io-index.html" className="text-indigo hover:underline" target="_blank" rel="noopener">Tuna crates.io</a>
-              </div>
+          {/* Provenance / source-of-truth — shown on both locales */}
+          <div className="pt-2 border-t border-paper-line/20">
+            <div className="eyebrow mb-2 text-ink-mute">
+              {isZh ? "来源证明 · Provenance" : "Provenance · 来源证明"}
             </div>
-          )}
+            <p className="text-xs text-ink-soft leading-relaxed mb-2">
+              {isZh
+                ? "GitHub (github.com/Hmbown/CodeWhale) 为唯一官方源码与发布源。下方镜像仅为中国大陆网络加速，内容经自动同步校验，SHA256 清单一致。"
+                : "GitHub (github.com/Hmbown/CodeWhale) is the sole canonical source for code and releases. Mirrors below are China-network accelerators only — content is auto-synced and verified via SHA256 manifests."}
+            </p>
+            <div className="flex flex-wrap gap-3 text-xs">
+              <a href="https://github.com/Hmbown/CodeWhale" className="text-indigo hover:underline font-semibold" target="_blank" rel="noopener">
+                {isZh ? "★ 官方 GitHub" : "★ Official GitHub"}
+              </a>
+              {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/CodeWhale" className="text-ink-soft hover:underline" target="_blank" rel="noopener">{isZh ? "Gitee 镜像" : "Gitee mirror"}</a>}
+              <a href="https://cnb.cool/codewhale.net/codewhale" className="text-ink-soft hover:underline" target="_blank" rel="noopener">{isZh ? "CNB 镜像" : "CNB mirror"}</a>
+              <a href="https://npmmirror.com/package/codewhale" className="text-ink-soft hover:underline" target="_blank" rel="noopener">npmmirror</a>
+              <a href="https://mirrors.tuna.tsinghua.edu.cn/help/crates.io-index.html" className="text-ink-soft hover:underline" target="_blank" rel="noopener">Tuna crates.io</a>
+            </div>
+          </div>
         </div>
 
         {cols.map((c) => (
@@ -131,12 +143,13 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
         <div className="mx-auto max-w-[1400px] px-6 py-4 flex flex-col gap-2 text-[0.78rem] text-ink-soft">
           <div>
             {isZh ? "安全报告、负责任披露、漏洞协调 — " : "For security reports, responsible disclosure, or vulnerability coordination — "}
-            <a href="mailto:security@codewhale.net" className="font-mono text-ink hover:text-indigo">security@codewhale.net</a>
+            <a href="mailto:hmbown@gmail.com" className="font-mono text-ink hover:text-indigo">hmbown@gmail.com</a>
           </div>
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 font-mono text-[0.7rem] text-ink-mute uppercase tracking-widest">
             <span>© {new Date().getFullYear()} · CodeWhale · Hmbown</span>
+            <span>codewhale.net — {isZh ? "唯一官方站点" : "the only official site"}</span>
             <span className="font-cjk normal-case tracking-normal">
-              {isZh ? "本网站由 DeepSeek V4-Flash 协助维护" : "本网站由 DeepSeek V4-Flash 协同维护"}
+              {isZh ? "本网站由 DeepSeek V4-Flash 协助维护" : "Maintained with DeepSeek V4-Flash"}
             </span>
           </div>
         </div>

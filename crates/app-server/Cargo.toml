@@ -4,27 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Codex-style app-server transport for DeepSeek workspace architecture"
+description = "App-server transport for CodeWhale runtime integrations"
+# `codewhale app-server` is owned by codewhale-cli; this crate is library-only.
+autobins = false
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.46" }
-codewhale-config = { path = "../config", version = "0.8.46" }
-codewhale-core = { path = "../core", version = "0.8.46" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.46" }
-codewhale-hooks = { path = "../hooks", version = "0.8.46" }
-codewhale-mcp = { path = "../mcp", version = "0.8.46" }
-codewhale-protocol = { path = "../protocol", version = "0.8.46" }
-codewhale-state = { path = "../state", version = "0.8.46" }
-codewhale-tools = { path = "../tools", version = "0.8.46" }
+codewhale-agent = { path = "../agent", version = "0.8.66" }
+codewhale-config = { path = "../config", version = "0.8.66" }
+codewhale-core = { path = "../core", version = "0.8.66" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.66" }
+codewhale-hooks = { path = "../hooks", version = "0.8.66" }
+codewhale-mcp = { path = "../mcp", version = "0.8.66" }
+codewhale-protocol = { path = "../protocol", version = "0.8.66" }
+codewhale-state = { path = "../state", version = "0.8.66" }
+codewhale-tools = { path = "../tools", version = "0.8.66" }
 serde.workspace = true
 serde_json.workspace = true
+rustls.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
+tracing.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile = "3.16"
+tempfile.workspace = true
 tower = "0.5"

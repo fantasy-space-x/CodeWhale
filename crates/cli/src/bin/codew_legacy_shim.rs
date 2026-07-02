@@ -4,6 +4,7 @@
 //! permanent short-form alias — six fewer keystrokes, same binary.
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -26,29 +27,48 @@ fn main() {
 }
 
 fn spawn_codewhale(args: &[String]) -> std::io::Result<std::process::ExitStatus> {
-    // Try PATH first.
+    // Prefer the dispatcher installed next to this shim. Falling back to PATH
+    // first can silently run an older global `codewhale` after a fresh install.
+    if let Ok(exe_path) = env::current_exe()
+        && let Some(sibling) = sibling_codewhale_path(&exe_path)
+        && sibling.is_file()
+    {
+        return Command::new(sibling).args(args).status();
+    }
+
+    // Fall back to PATH for unusual installs that ship only the shim.
     match Command::new("codewhale").args(args).status() {
         Ok(s) => return Ok(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
 
-    // On Windows, after an update the sibling `codewhale.exe` may be in the
-    // same directory as this shim but not on PATH (#2006).
-    #[cfg(windows)]
-    {
-        if let Ok(exe_path) = env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
-                let sibling = dir.join("codewhale.exe");
-                if sibling.is_file() {
-                    return Command::new(sibling).args(args).status();
-                }
-            }
-        }
-    }
-
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "codewhale not found on PATH or in sibling directory",
     ))
+}
+
+fn sibling_codewhale_path(exe_path: &Path) -> Option<PathBuf> {
+    exe_path
+        .parent()
+        .map(|dir| dir.join(format!("codewhale{}", std::env::consts::EXE_SUFFIX)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sibling_codewhale_path;
+    use std::path::Path;
+
+    #[test]
+    fn sibling_dispatcher_uses_platform_executable_suffix() {
+        let path = Path::new("/tmp/codewhale-bin/codew");
+        let sibling = sibling_codewhale_path(path).expect("sibling");
+
+        assert_eq!(
+            sibling,
+            Path::new("/tmp/codewhale-bin")
+                .join(format!("codewhale{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
 }

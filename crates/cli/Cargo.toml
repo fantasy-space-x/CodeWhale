@@ -15,32 +15,38 @@ path = "src/main.rs"
 name = "codew"
 path = "src/bin/codew_legacy_shim.rs"
 
-# Legacy alias — forwards to `codewhale` and prints a deprecation notice.
-# Will be removed in v0.9.0.
-[[bin]]
-name = "deepseek"
-path = "src/bin/deepseek_legacy_shim.rs"
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-codewhale-agent = { path = "../agent", version = "0.8.46" }
-codewhale-app-server = { path = "../app-server", version = "0.8.46" }
-codewhale-config = { path = "../config", version = "0.8.46" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.8.46" }
-codewhale-mcp = { path = "../mcp", version = "0.8.46" }
-codewhale-secrets = { path = "../secrets", version = "0.8.46" }
-codewhale-state = { path = "../state", version = "0.8.46" }
+codewhale-agent = { path = "../agent", version = "0.8.66" }
+codewhale-app-server = { path = "../app-server", version = "0.8.66" }
+codewhale-config = { path = "../config", version = "0.8.66" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.8.66" }
+codewhale-mcp = { path = "../mcp", version = "0.8.66" }
+codewhale-release = { path = "../release", version = "0.8.66" }
+codewhale-secrets = { path = "../secrets", version = "0.8.66" }
+codewhale-state = { path = "../state", version = "0.8.66" }
 chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
 semver.workspace = true
 tokio.workspace = true
 sha2.workspace = true
-tempfile = "3.16"
+tempfile.workspace = true
 tracing.workspace = true
+
+# Parent-death cleanup for delegated server children (#3259): on Linux the
+# dispatcher sets PR_SET_PDEATHSIG so the child is signalled if the dispatcher
+# dies uncatchably; on Windows it assigns the child to a kill-on-job-close Job
+# Object.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]

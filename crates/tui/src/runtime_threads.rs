@@ -603,6 +603,162 @@ impl RuntimeThreadStore {
         let state = self.state.lock().await;
         state.next_seq.saturating_sub(1)
     }
+
+    // ── Async wrappers (delegate to spawn_blocking) ──────────────────
+
+    async fn save_item_async(&self, item: &TurnItemRecord) -> Result<()> {
+        let store = self.clone();
+        let item = item.clone();
+        tokio::task::spawn_blocking(move || store.save_item(&item))
+            .await
+            .context("save_item_async: task join failed")?
+    }
+
+    async fn load_item_async(&self, item_id: &str) -> Result<TurnItemRecord> {
+        let store = self.clone();
+        let id = item_id.to_string();
+        tokio::task::spawn_blocking(move || store.load_item(&id))
+            .await
+            .context("load_item_async: task join failed")?
+    }
+
+    async fn save_turn_async(&self, turn: &TurnRecord) -> Result<()> {
+        let store = self.clone();
+        let turn = turn.clone();
+        tokio::task::spawn_blocking(move || store.save_turn(&turn))
+            .await
+            .context("save_turn_async: task join failed")?
+    }
+
+    async fn load_turn_async(&self, turn_id: &str) -> Result<TurnRecord> {
+        let store = self.clone();
+        let id = turn_id.to_string();
+        tokio::task::spawn_blocking(move || store.load_turn(&id))
+            .await
+            .context("load_turn_async: task join failed")?
+    }
+
+    async fn save_thread_async(&self, thread: &ThreadRecord) -> Result<()> {
+        let store = self.clone();
+        let thread = thread.clone();
+        tokio::task::spawn_blocking(move || store.save_thread(&thread))
+            .await
+            .context("save_thread_async: task join failed")?
+    }
+
+    #[allow(dead_code)]
+    async fn load_thread_async(&self, thread_id: &str) -> Result<ThreadRecord> {
+        let store = self.clone();
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || store.load_thread(&id))
+            .await
+            .context("load_thread_async: task join failed")?
+    }
+
+    #[allow(dead_code)]
+    async fn list_turns_for_thread_async(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
+        let store = self.clone();
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_turns_for_thread(&id))
+            .await
+            .context("list_turns_for_thread_async: task join failed")?
+    }
+
+    #[allow(dead_code)]
+    async fn list_items_for_turn_async(&self, turn_id: &str) -> Result<Vec<TurnItemRecord>> {
+        let store = self.clone();
+        let id = turn_id.to_string();
+        tokio::task::spawn_blocking(move || store.list_items_for_turn(&id))
+            .await
+            .context("list_items_for_turn_async: task join failed")?
+    }
+
+    async fn append_event_async(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        event: impl Into<String>,
+        payload: Value,
+    ) -> Result<RuntimeEventRecord> {
+        validated_record_id(thread_id, "thread id")?;
+        if let Some(turn_id) = turn_id {
+            validated_record_id(turn_id, "turn id")?;
+        }
+        if let Some(item_id) = item_id {
+            validated_record_id(item_id, "item id")?;
+        }
+        let path = self.events_path(thread_id)?;
+        reject_symlinked_store_dir(&self.events_dir)?;
+        reject_symlinked_store_file(&path)?;
+
+        let mut state = self.state.lock().await;
+        let seq = state.next_seq;
+        state.next_seq = state.next_seq.saturating_add(1);
+        let state_snapshot = (*state).clone();
+        let state_path = self.state_path.clone();
+
+        let record = RuntimeEventRecord {
+            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+            seq,
+            timestamp: Utc::now(),
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.map(ToString::to_string),
+            item_id: item_id.map(ToString::to_string),
+            event: event.into(),
+            payload,
+        };
+
+        let record_clone = record.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            write_json_atomic(&state_path, &state_snapshot)?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Failed to open {}", path.display()))?;
+            let line = serde_json::to_string(&record_clone)?;
+            writeln!(file, "{line}")
+                .with_context(|| format!("Failed to append {}", path.display()))?;
+            file.flush()
+                .with_context(|| format!("Failed to flush {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to fsync {}", path.display()))?;
+            Ok(())
+        })
+        .await
+        .context("append_event_async: task join failed")??;
+
+        drop(state);
+
+        Ok(record)
+    }
+
+    pub fn delete_thread_data(&self, thread_id: &str) -> Result<()> {
+        validated_record_id(thread_id, "thread id")?;
+
+        let turns = self.list_turns_for_thread(thread_id).unwrap_or_default();
+        for turn in &turns {
+            let items = self.list_items_for_turn(&turn.id).unwrap_or_default();
+            for item in &items {
+                let _ = fs::remove_file(self.item_path(&item.id)?);
+            }
+            let _ = fs::remove_file(self.turn_path(&turn.id)?);
+        }
+
+        let _ = fs::remove_file(self.thread_path(thread_id)?);
+        let _ = fs::remove_file(self.events_path(thread_id)?);
+
+        Ok(())
+    }
+
+    async fn delete_thread_data_async(&self, thread_id: &str) -> Result<()> {
+        let store = self.clone();
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || store.delete_thread_data(&id))
+            .await
+            .context("delete_thread_data_async: task join failed")?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1211,6 +1367,27 @@ impl RuntimeThreadManager {
         Ok(record)
     }
 
+    async fn emit_event_async(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        event: impl Into<String>,
+        payload: Value,
+    ) -> Result<RuntimeEventRecord> {
+        let record = self
+            .store
+            .append_event_async(thread_id, turn_id, item_id, event, payload)
+            .await?;
+        if let Err(e) = self.event_tx.send(record.clone()) {
+            tracing::debug!(
+                "Runtime event broadcast failed (no receivers or channel full): {}",
+                e
+            );
+        }
+        Ok(record)
+    }
+
     pub async fn create_thread(&self, req: CreateThreadRequest) -> Result<ThreadRecord> {
         let now = Utc::now();
         let model = req
@@ -1365,6 +1542,22 @@ impl RuntimeThreadManager {
         self.store
             .load_thread(id)
             .with_context(|| format!("Thread not found: {id}"))
+    }
+
+    pub async fn delete_thread(&self, id: &str) -> Result<()> {
+        let mut active = self.active.lock().await;
+        if let Some(state) = active.engines.get(id) {
+            if state.active_turn.is_some() {
+                bail!("Cannot delete thread {id}: a turn is still active");
+            }
+        }
+        if let Some(state) = active.engines.remove(id) {
+            let _ = state.engine.send(Op::Shutdown).await;
+        }
+        active.lru.retain(|t| t != id);
+        drop(active);
+
+        self.store.delete_thread_data_async(id).await
     }
 
     pub async fn update_thread(&self, id: &str, req: UpdateThreadRequest) -> Result<ThreadRecord> {
@@ -2890,7 +3083,7 @@ impl RuntimeThreadManager {
 
             match event {
                 EngineEvent::TurnStarted { .. } => {
-                    self.emit_event(
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -2914,9 +3107,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -2929,7 +3122,7 @@ impl RuntimeThreadManager {
                 EngineEvent::MessageDelta { content, .. } => {
                     if let Some((item_id, text)) = current_message_item.as_mut() {
                         text.push_str(&content);
-                        self.emit_event(
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(item_id),
@@ -2941,13 +3134,13 @@ impl RuntimeThreadManager {
                 }
                 EngineEvent::MessageComplete { .. } => {
                     if let Some((item_id, text)) = current_message_item.take() {
-                        let mut item = self.store.load_item(&item_id)?;
+                        let mut item = self.store.load_item_async(&item_id).await?;
                         item.status = TurnItemLifecycleStatus::Completed;
                         item.summary = summarize_text(&text, SUMMARY_LIMIT);
                         item.detail = Some(text);
                         item.ended_at = Some(Utc::now());
-                        self.store.save_item(&item)?;
-                        self.emit_event(
+                        self.store.save_item_async(&item).await?;
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -2972,9 +3165,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -2987,7 +3180,7 @@ impl RuntimeThreadManager {
                 EngineEvent::ThinkingDelta { content, .. } => {
                     if let Some((item_id, text)) = current_reasoning_item.as_mut() {
                         text.push_str(&content);
-                        self.emit_event(
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(item_id),
@@ -2999,13 +3192,13 @@ impl RuntimeThreadManager {
                 }
                 EngineEvent::ThinkingComplete { .. } => {
                     if let Some((item_id, text)) = current_reasoning_item.take() {
-                        let mut item = self.store.load_item(&item_id)?;
+                        let mut item = self.store.load_item_async(&item_id).await?;
                         item.status = TurnItemLifecycleStatus::Completed;
                         item.summary = summarize_text(&text, SUMMARY_LIMIT);
                         item.detail = Some(text);
                         item.ended_at = Some(Utc::now());
-                        self.store.save_item(&item)?;
-                        self.emit_event(
+                        self.store.save_item_async(&item).await?;
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3033,9 +3226,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3046,7 +3239,7 @@ impl RuntimeThreadManager {
                 }
                 EngineEvent::ToolCallComplete { id, name, result } => {
                     if let Some(item_id) = tool_items.remove(&id) {
-                        let mut item = self.store.load_item(&item_id)?;
+                        let mut item = self.store.load_item_async(&item_id).await?;
                         let now = Utc::now();
                         item.ended_at = Some(now);
                         match result {
@@ -3070,8 +3263,8 @@ impl RuntimeThreadManager {
                                 item.detail = Some(err.to_string());
                             }
                         }
-                        self.store.save_item(&item)?;
-                        self.emit_event(
+                        self.store.save_item_async(&item).await?;
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3101,9 +3294,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3120,13 +3313,13 @@ impl RuntimeThreadManager {
                     messages_after,
                 } => {
                     if let Some(item_id) = compaction_items.remove(&id) {
-                        let mut item = self.store.load_item(&item_id)?;
+                        let mut item = self.store.load_item_async(&item_id).await?;
                         item.status = TurnItemLifecycleStatus::Completed;
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
                         item.ended_at = Some(Utc::now());
-                        self.store.save_item(&item)?;
-                        self.emit_event(
+                        self.store.save_item_async(&item).await?;
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3143,13 +3336,13 @@ impl RuntimeThreadManager {
                 }
                 EngineEvent::CompactionFailed { id, auto, message } => {
                     if let Some(item_id) = compaction_items.remove(&id) {
-                        let mut item = self.store.load_item(&item_id)?;
+                        let mut item = self.store.load_item_async(&item_id).await?;
                         item.status = TurnItemLifecycleStatus::Failed;
                         item.summary = summarize_text(&message, SUMMARY_LIMIT);
                         item.detail = Some(message);
                         item.ended_at = Some(Utc::now());
-                        self.store.save_item(&item)?;
-                        self.emit_event(
+                        self.store.save_item_async(&item).await?;
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3177,9 +3370,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3203,9 +3396,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3232,9 +3425,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3273,9 +3466,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3291,7 +3484,7 @@ impl RuntimeThreadManager {
                     intent_summary,
                     ..
                 } => {
-                    self.emit_event(
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3326,7 +3519,7 @@ impl RuntimeThreadManager {
                         // can clear any pending approval UI.  Without this
                         // event the GUI would show a frozen approval dialog
                         // that never receives approval.decided.
-                        self.emit_event(
+                        self.emit_event_async(
                             &thread_id,
                             Some(&turn_id),
                             None,
@@ -3355,7 +3548,7 @@ impl RuntimeThreadManager {
                             if remember {
                                 self.remember_thread_auto_approve(&thread_id).await;
                             }
-                            self.emit_event(
+                            self.emit_event_async(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3371,7 +3564,7 @@ impl RuntimeThreadManager {
                             let _ = engine.approve_tool_call(id).await;
                         }
                         Ok(Ok(ExternalApprovalDecision::Deny { remember })) => {
-                            self.emit_event(
+                            self.emit_event_async(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3392,7 +3585,7 @@ impl RuntimeThreadManager {
                         }
                         Err(_timeout) => {
                             self.cancel_pending_approval(&id);
-                            self.emit_event(
+                            self.emit_event_async(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3404,7 +3597,7 @@ impl RuntimeThreadManager {
                             )
                             .await
                             .ok();
-                            self.emit_event(
+                            self.emit_event_async(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3428,7 +3621,7 @@ impl RuntimeThreadManager {
                     denial_reason,
                     ..
                 } => {
-                    self.emit_event(
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3460,7 +3653,7 @@ impl RuntimeThreadManager {
                     }
                 }
                 EngineEvent::UserInputRequired { id, request } => {
-                    self.emit_event(
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3486,9 +3679,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3514,9 +3707,9 @@ impl RuntimeThreadManager {
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    self.store.save_item_async(&item).await?;
+                    self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+                    self.emit_event_async(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3554,8 +3747,21 @@ impl RuntimeThreadManager {
             turn_status = RuntimeTurnStatus::Interrupted;
         }
 
+        {
+            let mut active = self.active.lock().await;
+            if let Some(state) = active.engines.get_mut(&thread_id)
+                && state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|t| t.turn_id == turn_id)
+            {
+                state.active_turn = None;
+            }
+            touch_lru(&mut active.lru, &thread_id);
+        }
+
         if let Some((item_id, text)) = current_message_item.take() {
-            let mut item = self.store.load_item(&item_id)?;
+            let mut item = self.store.load_item_async(&item_id).await?;
             if turn_status == RuntimeTurnStatus::Interrupted {
                 item.status = TurnItemLifecycleStatus::Interrupted;
             } else {
@@ -3564,8 +3770,8 @@ impl RuntimeThreadManager {
             item.summary = summarize_text(&text, SUMMARY_LIMIT);
             item.detail = Some(text);
             item.ended_at = Some(Utc::now());
-            self.store.save_item(&item)?;
-            self.emit_event(
+            self.store.save_item_async(&item).await?;
+            self.emit_event_async(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item_id),
@@ -3580,7 +3786,7 @@ impl RuntimeThreadManager {
         }
 
         if let Some((item_id, text)) = current_reasoning_item.take() {
-            let mut item = self.store.load_item(&item_id)?;
+            let mut item = self.store.load_item_async(&item_id).await?;
             if turn_status == RuntimeTurnStatus::Interrupted {
                 item.status = TurnItemLifecycleStatus::Interrupted;
             } else {
@@ -3589,8 +3795,8 @@ impl RuntimeThreadManager {
             item.summary = summarize_text(&text, SUMMARY_LIMIT);
             item.detail = Some(text);
             item.ended_at = Some(Utc::now());
-            self.store.save_item(&item)?;
-            self.emit_event(
+            self.store.save_item_async(&item).await?;
+            self.emit_event_async(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item_id),
@@ -3620,9 +3826,9 @@ impl RuntimeThreadManager {
                 started_at: Some(Utc::now()),
                 ended_at: Some(Utc::now()),
             };
-            self.store.save_item(&item)?;
-            self.attach_item_to_turn(&turn_id, &item.id)?;
-            self.emit_event(
+            self.store.save_item_async(&item).await?;
+            self.attach_item_to_turn_async(&turn_id, &item.id).await?;
+            self.emit_event_async(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item.id),
@@ -3633,20 +3839,14 @@ impl RuntimeThreadManager {
         }
 
         let ended_at = Utc::now();
-        let mut turn = self.store.load_turn(&turn_id)?;
+        let mut turn = self.store.load_turn_async(&turn_id).await?;
         turn.status = turn_status;
         turn.ended_at = Some(ended_at);
         turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
         turn.usage = turn_usage;
         turn.error = turn_error;
-        self.store.save_turn(&turn)?;
 
-        let mut thread = self.get_thread(&thread_id).await?;
-        thread.latest_turn_id = Some(turn_id.clone());
-        thread.updated_at = Utc::now();
-        self.store.save_thread(&thread)?;
-
-        self.emit_event(
+        self.emit_event_async(
             &thread_id,
             Some(&turn_id),
             None,
@@ -3655,27 +3855,21 @@ impl RuntimeThreadManager {
         )
         .await?;
 
-        {
-            let mut active = self.active.lock().await;
-            if let Some(state) = active.engines.get_mut(&thread_id)
-                && state
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|t| t.turn_id == turn_id)
-            {
-                state.active_turn = None;
-            }
-            touch_lru(&mut active.lru, &thread_id);
-        }
+        self.store.save_turn_async(&turn).await?;
+
+        let mut thread = self.get_thread(&thread_id).await?;
+        thread.latest_turn_id = Some(turn_id.clone());
+        thread.updated_at = Utc::now();
+        self.store.save_thread_async(&thread).await?;
 
         Ok(())
     }
 
-    fn attach_item_to_turn(&self, turn_id: &str, item_id: &str) -> Result<()> {
-        let mut turn = self.store.load_turn(turn_id)?;
+    async fn attach_item_to_turn_async(&self, turn_id: &str, item_id: &str) -> Result<()> {
+        let mut turn = self.store.load_turn_async(turn_id).await?;
         if !turn.item_ids.iter().any(|id| id == item_id) {
             turn.item_ids.push(item_id.to_string());
-            self.store.save_turn(&turn)?;
+            self.store.save_turn_async(&turn).await?;
         }
         Ok(())
     }

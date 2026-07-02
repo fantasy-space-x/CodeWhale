@@ -27,7 +27,7 @@ use codewhale_protocol::runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -550,7 +550,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/stream", post(stream_turn))
         .route("/v1/threads", get(list_threads).post(create_thread))
         .route("/v1/threads/summary", get(list_threads_summary))
-        .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}", get(get_thread).patch(update_thread).delete(delete_thread))
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
@@ -1597,6 +1597,18 @@ async fn update_thread(
     Ok(Json(thread))
 }
 
+async fn delete_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .runtime_threads
+        .delete_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn resume_thread(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -2008,19 +2020,24 @@ async fn stream_thread_events(
             yield Ok(sse_json(&event_name, runtime_event_payload(event)));
         }
         loop {
-            let incoming = live.recv().await;
-            let Ok(event) = incoming else {
-                break;
-            };
-            if event.thread_id != thread_id {
-                continue;
+            match live.recv().await {
+                Ok(event) => {
+                    if event.thread_id != thread_id {
+                        continue;
+                    }
+                    if event.seq <= last_seq {
+                        continue;
+                    }
+                    last_seq = event.seq;
+                    let event_name = event.event.clone();
+                    yield Ok(sse_json(&event_name, runtime_event_payload(event)));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("SSE thread-events subscriber lagged {n} events, continuing");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            if event.seq <= last_seq {
-                continue;
-            }
-            last_seq = event.seq;
-            let event_name = event.event.clone();
-            yield Ok(sse_json(&event_name, runtime_event_payload(event)));
         }
     };
 
@@ -2099,6 +2116,8 @@ async fn stream_turn(
     let mut live = state.runtime_threads.subscribe_events();
     let thread_id = thread.id.clone();
     let turn_id = turn.id.clone();
+    let cleanup_mgr = state.runtime_threads.clone();
+    let cleanup_thread_id = thread.id.clone();
 
     let stream = stream! {
         yield Ok(sse_json("turn.started", json!({
@@ -2123,23 +2142,36 @@ async fn stream_turn(
         }
 
         loop {
-            let incoming = live.recv().await;
-            let Ok(event) = incoming else {
-                yield Ok(sse_json("error", json!({ "message": "event channel closed" })));
-                break;
-            };
-            if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
-                continue;
-            }
-            if let Some(mapped) = map_compat_stream_event(&event) {
-                yield Ok(mapped);
-            }
-            if event.event == "turn.completed" {
-                break;
+            match live.recv().await {
+                Ok(event) => {
+                    if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
+                        continue;
+                    }
+                    if let Some(mapped) = map_compat_stream_event(&event) {
+                        yield Ok(mapped);
+                    }
+                    if event.event == "turn.completed" {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("SSE stream-turn subscriber lagged {n} events, continuing");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    yield Ok(sse_json("error", json!({ "message": "event channel closed" })));
+                    break;
+                }
             }
         }
 
         yield Ok(sse_json("done", json!({})));
+
+        tokio::spawn(async move {
+            if let Err(e) = cleanup_mgr.delete_thread(&cleanup_thread_id).await {
+                tracing::debug!("stream_turn cleanup failed for {}: {e}", cleanup_thread_id);
+            }
+        });
     };
 
     Ok(Sse::new(stream).keep_alive(

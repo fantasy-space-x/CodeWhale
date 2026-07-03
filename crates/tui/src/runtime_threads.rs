@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -262,7 +263,7 @@ pub struct RuntimeThreadStore {
     items_dir: PathBuf,
     events_dir: PathBuf,
     state_path: PathBuf,
-    state: Arc<Mutex<RuntimeStoreState>>,
+    next_seq: Arc<AtomicU64>,
 }
 
 impl RuntimeThreadStore {
@@ -295,7 +296,7 @@ impl RuntimeThreadStore {
             items_dir,
             events_dir,
             state_path,
-            state: Arc::new(Mutex::new(state)),
+            next_seq: Arc::new(AtomicU64::new(state.next_seq)),
         })
     }
 
@@ -537,11 +538,7 @@ impl RuntimeThreadStore {
         reject_symlinked_store_dir(&self.events_dir)?;
         reject_symlinked_store_file(&path)?;
 
-        let mut state = self.state.lock().await;
-        let seq = state.next_seq;
-        state.next_seq = state.next_seq.saturating_add(1);
-        write_json_atomic(&self.state_path, &*state)?;
-        drop(state);
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
         let record = RuntimeEventRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -563,8 +560,6 @@ impl RuntimeThreadStore {
         writeln!(file, "{line}").with_context(|| format!("Failed to append {}", path.display()))?;
         file.flush()
             .with_context(|| format!("Failed to flush {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to fsync {}", path.display()))?;
         Ok(record)
     }
 
@@ -600,9 +595,16 @@ impl RuntimeThreadStore {
         Ok(out)
     }
 
-    pub async fn current_seq(&self) -> u64 {
-        let state = self.state.lock().await;
-        state.next_seq.saturating_sub(1)
+    pub fn current_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst).saturating_sub(1)
+    }
+
+    pub fn persist_state(&self) -> Result<()> {
+        let state = RuntimeStoreState {
+            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+            next_seq: self.next_seq.load(Ordering::SeqCst),
+        };
+        write_json_atomic(&self.state_path, &state)
     }
 
     // ── Async wrappers (delegate to spawn_blocking) ──────────────────
@@ -703,11 +705,7 @@ impl RuntimeThreadStore {
         reject_symlinked_store_dir(&self.events_dir)?;
         reject_symlinked_store_file(&path)?;
 
-        let mut state = self.state.lock().await;
-        let seq = state.next_seq;
-        state.next_seq = state.next_seq.saturating_add(1);
-        let state_snapshot = (*state).clone();
-        let state_path = self.state_path.clone();
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
         let record = RuntimeEventRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -722,7 +720,6 @@ impl RuntimeThreadStore {
 
         let record_clone = record.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            write_json_atomic(&state_path, &state_snapshot)?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -733,14 +730,10 @@ impl RuntimeThreadStore {
                 .with_context(|| format!("Failed to append {}", path.display()))?;
             file.flush()
                 .with_context(|| format!("Failed to flush {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("Failed to fsync {}", path.display()))?;
             Ok(())
         })
         .await
         .context("append_event_async: task join failed")??;
-
-        drop(state);
 
         Ok(record)
     }
@@ -966,16 +959,11 @@ pub type SharedRuntimeThreadManager = Arc<RuntimeThreadManager>;
 ///
 /// # Lock ordering invariant
 ///
-/// Two `Mutex`es exist across this module:
-/// - `RuntimeThreadStore::state` — protects the monotonic event sequence counter.
-/// - `RuntimeThreadManager::active` — protects the set of loaded engine handles.
+/// The monotonic event sequence counter is an `AtomicU64` in
+/// `RuntimeThreadStore::next_seq` — lock-free and contention-free.
 ///
-/// **No code path holds both locks simultaneously.** The `state` lock is only
-/// acquired inside `RuntimeThreadStore::append_event` (where it is explicitly
-/// dropped before any I/O) and `current_seq`. All `emit_event` calls (which
-/// call `append_event`) happen *after* `active` has been released. If you add
-/// new code that touches both, always acquire `state` before `active` to
-/// preserve a consistent ordering.
+/// The only `Mutex` in the hot path is `RuntimeThreadManager::active`,
+/// which protects the set of loaded engine handles.
 #[derive(Clone)]
 pub struct RuntimeThreadManager {
     config: Arc<parking_lot::RwLock<Config>>,
@@ -1186,6 +1174,9 @@ impl RuntimeThreadManager {
     #[allow(dead_code)] // Public API for external callers (runtime API, task manager)
     pub fn shutdown(&self) {
         self.cancel_token.cancel();
+        if let Err(e) = self.store.persist_state() {
+            tracing::warn!("Failed to persist event sequence state on shutdown: {e}");
+        }
         if let Ok(mut map) = self.pending_approvals.lock() {
             map.clear();
         }
@@ -1742,7 +1733,7 @@ impl RuntimeThreadManager {
                 items.append(&mut turn_items);
             }
         }
-        let latest_seq = self.store.current_seq().await;
+        let latest_seq = self.store.current_seq();
         Ok(ThreadDetail {
             thread,
             turns,
@@ -2864,43 +2855,49 @@ impl RuntimeThreadManager {
         // When the thread has an associated session, load the full message history
         // (including thinking/tool blocks) from the session file. This preserves
         // process information that `reconstruct_messages_from_turns` would lose.
-        let session_messages = if let Some(ref sid) = thread.session_id {
-            match crate::session_manager::default_sessions_dir() {
-                Ok(sessions_dir) => {
-                    match crate::session_manager::SessionManager::new(sessions_dir) {
-                        Ok(manager) => match manager.load_session(sid) {
-                            Ok(session) => session.messages,
+        let mgr = self.clone();
+        let thread_clone = thread.clone();
+        let session_messages = tokio::task::spawn_blocking(move || -> Result<Vec<Message>> {
+            if let Some(ref sid) = thread_clone.session_id {
+                match crate::session_manager::default_sessions_dir() {
+                    Ok(sessions_dir) => {
+                        match crate::session_manager::SessionManager::new(sessions_dir) {
+                            Ok(manager) => match manager.load_session(sid) {
+                                Ok(session) => Ok(session.messages),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load session {} for thread {}: {e}; falling back to turn reconstruction",
+                                        sid,
+                                        thread_clone.id
+                                    );
+                                    let turns = mgr.store.list_turns_for_thread(&thread_clone.id)?;
+                                    mgr.reconstruct_messages_from_turns(&turns)
+                                }
+                            },
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to load session {} for thread {}: {e}; falling back to turn reconstruction",
-                                    sid,
-                                    thread.id
+                                    "Failed to open sessions dir: {e}; falling back to turn reconstruction"
                                 );
-                                let turns = self.store.list_turns_for_thread(&thread.id)?;
-                                self.reconstruct_messages_from_turns(&turns)?
+                                let turns = mgr.store.list_turns_for_thread(&thread_clone.id)?;
+                                mgr.reconstruct_messages_from_turns(&turns)
                             }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to open sessions dir: {e}; falling back to turn reconstruction"
-                            );
-                            let turns = self.store.list_turns_for_thread(&thread.id)?;
-                            self.reconstruct_messages_from_turns(&turns)?
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
+                        );
+                        let turns = mgr.store.list_turns_for_thread(&thread_clone.id)?;
+                        mgr.reconstruct_messages_from_turns(&turns)
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
-                    );
-                    let turns = self.store.list_turns_for_thread(&thread.id)?;
-                    self.reconstruct_messages_from_turns(&turns)?
-                }
+            } else {
+                let turns = mgr.store.list_turns_for_thread(&thread_clone.id)?;
+                mgr.reconstruct_messages_from_turns(&turns)
             }
-        } else {
-            let turns = self.store.list_turns_for_thread(&thread.id)?;
-            self.reconstruct_messages_from_turns(&turns)?
-        };
+        })
+        .await
+        .context("ensure_engine_loaded: session load task join failed")??;
         let sys_prompt = thread
             .system_prompt
             .as_ref()
@@ -3895,6 +3892,9 @@ impl RuntimeThreadManager {
         thread.latest_turn_id = Some(turn_id.clone());
         thread.updated_at = Utc::now();
         self.store.save_thread_async(&thread).await?;
+
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || store.persist_state()).await;
 
         Ok(())
     }

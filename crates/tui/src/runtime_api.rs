@@ -2000,7 +2000,8 @@ async fn stream_thread_events(
 
     let mut backlog = state
         .runtime_threads
-        .events_since(&id, query.since_seq)
+        .events_since_async(&id, query.since_seq)
+        .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if let Some(limit) = query.replay_limit
         && backlog.len() > limit
@@ -2111,7 +2112,8 @@ async fn stream_turn(
 
     let backlog = state
         .runtime_threads
-        .events_since(&thread.id, None)
+        .events_since_async(&thread.id, None)
+        .await
         .map_err(|e| ApiError::internal(format!("Failed to load stream backlog: {e}")))?;
     let mut live = state.runtime_threads.subscribe_events();
     let thread_id = thread.id.clone();

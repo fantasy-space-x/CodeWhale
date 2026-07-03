@@ -517,6 +517,7 @@ impl RuntimeThreadStore {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub async fn append_event(
         &self,
         thread_id: &str,
@@ -646,7 +647,6 @@ impl RuntimeThreadStore {
             .context("save_thread_async: task join failed")?
     }
 
-    #[allow(dead_code)]
     async fn load_thread_async(&self, thread_id: &str) -> Result<ThreadRecord> {
         let store = self.clone();
         let id = thread_id.to_string();
@@ -655,7 +655,6 @@ impl RuntimeThreadStore {
             .context("load_thread_async: task join failed")?
     }
 
-    #[allow(dead_code)]
     async fn list_turns_for_thread_async(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
         let store = self.clone();
         let id = thread_id.to_string();
@@ -671,6 +670,18 @@ impl RuntimeThreadStore {
         tokio::task::spawn_blocking(move || store.list_items_for_turn(&id))
             .await
             .context("list_items_for_turn_async: task join failed")?
+    }
+
+    async fn events_since_async(
+        &self,
+        thread_id: &str,
+        since_seq: Option<u64>,
+    ) -> Result<Vec<RuntimeEventRecord>> {
+        let store = self.clone();
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || store.events_since(&id, since_seq))
+            .await
+            .context("events_since_async: task join failed")?
     }
 
     async fn append_event_async(
@@ -1356,27 +1367,6 @@ impl RuntimeThreadManager {
     ) -> Result<RuntimeEventRecord> {
         let record = self
             .store
-            .append_event(thread_id, turn_id, item_id, event, payload)
-            .await?;
-        if let Err(e) = self.event_tx.send(record.clone()) {
-            tracing::debug!(
-                "Runtime event broadcast failed (no receivers or channel full): {}",
-                e
-            );
-        }
-        Ok(record)
-    }
-
-    async fn emit_event_async(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-        item_id: Option<&str>,
-        event: impl Into<String>,
-        payload: Value,
-    ) -> Result<RuntimeEventRecord> {
-        let record = self
-            .store
             .append_event_async(thread_id, turn_id, item_id, event, payload)
             .await?;
         if let Err(e) = self.event_tx.send(record.clone()) {
@@ -1425,7 +1415,7 @@ impl RuntimeThreadManager {
             title: None,
             session_id: None,
         };
-        self.store.save_thread(&thread)?;
+        self.store.save_thread_async(&thread).await?;
         self.emit_event(
             &thread.id,
             None,
@@ -1442,7 +1432,10 @@ impl RuntimeThreadManager {
         filter: ThreadListFilter,
         limit: Option<usize>,
     ) -> Result<Vec<ThreadRecord>> {
-        let mut threads = self.store.list_threads()?;
+        let store = self.store.clone();
+        let mut threads = tokio::task::spawn_blocking(move || store.list_threads())
+            .await
+            .context("list_threads: task join failed")??;
         match filter {
             ThreadListFilter::ActiveOnly => threads.retain(|t| !t.archived),
             ThreadListFilter::ArchivedOnly => threads.retain(|t| t.archived),
@@ -1540,7 +1533,8 @@ impl RuntimeThreadManager {
 
     pub async fn get_thread(&self, id: &str) -> Result<ThreadRecord> {
         self.store
-            .load_thread(id)
+            .load_thread_async(id)
+            .await
             .with_context(|| format!("Thread not found: {id}"))
     }
 
@@ -1666,7 +1660,7 @@ impl RuntimeThreadManager {
             }
 
             thread.updated_at = Utc::now();
-            self.store.save_thread(&thread)?;
+            self.store.save_thread_async(&thread).await?;
             if workspace_changed {
                 self.evict_cached_engine(&thread.id).await;
             }
@@ -1696,7 +1690,7 @@ impl RuntimeThreadManager {
         }
         thread.session_id = Some(session_id.to_string());
         thread.updated_at = Utc::now();
-        self.store.save_thread(&thread)?;
+        self.store.save_thread_async(&thread).await?;
         self.emit_event(
             thread_id,
             None,
@@ -1734,9 +1728,14 @@ impl RuntimeThreadManager {
 
     pub async fn get_thread_detail(&self, id: &str) -> Result<ThreadDetail> {
         let thread = self.get_thread(id).await?;
-        let turns = self.store.list_turns_for_thread(id)?;
+        let turns = self.store.list_turns_for_thread_async(id).await?;
         let turn_ids: Vec<String> = turns.iter().map(|turn| turn.id.clone()).collect();
-        let mut items_by_turn = self.store.list_items_for_turns_map(&turn_ids)?;
+        let store = self.store.clone();
+        let mut items_by_turn = tokio::task::spawn_blocking(move || {
+            store.list_items_for_turns_map(&turn_ids)
+        })
+        .await
+        .context("get_thread_detail: task join failed")??;
         let mut items = Vec::new();
         for turn in &turns {
             if let Some(mut turn_items) = items_by_turn.remove(&turn.id) {
@@ -1770,7 +1769,7 @@ impl RuntimeThreadManager {
         id: &str,
     ) -> Result<(ThreadRecord, Vec<AgentRebindHint>)> {
         let thread = self.resume_thread(id).await?;
-        let events = self.store.events_since(&thread.id, None)?;
+        let events = self.store.events_since_async(&thread.id, None).await?;
         let hints = collect_agent_rebind_hints(&events);
         Ok((thread, hints))
     }
@@ -1784,29 +1783,38 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
-        self.store.save_thread(&forked)?;
 
-        let source_turns = self.store.list_turns_for_thread(&source.id)?;
-        for source_turn in source_turns {
-            let mut cloned_turn = source_turn.clone();
-            cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
-            cloned_turn.thread_id = forked.id.clone();
-            cloned_turn.item_ids.clear();
-            self.store.save_turn(&cloned_turn)?;
+        let store = self.store.clone();
+        let source_id = source.id.clone();
+        let forked_result = forked.clone();
+        let forked = tokio::task::spawn_blocking(move || -> Result<ThreadRecord> {
+            let mut forked = forked_result;
+            store.save_thread(&forked)?;
+            let source_turns = store.list_turns_for_thread(&source_id)?;
+            for source_turn in source_turns {
+                let mut cloned_turn = source_turn.clone();
+                cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
+                cloned_turn.thread_id = forked.id.clone();
+                cloned_turn.item_ids.clear();
+                store.save_turn(&cloned_turn)?;
 
-            let items = self.store.list_items_for_turn(&source_turn.id)?;
-            for item in items {
-                let mut cloned_item = item.clone();
-                cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
-                cloned_item.turn_id = cloned_turn.id.clone();
-                self.store.save_item(&cloned_item)?;
-                cloned_turn.item_ids.push(cloned_item.id.clone());
+                let items = store.list_items_for_turn(&source_turn.id)?;
+                for item in items {
+                    let mut cloned_item = item.clone();
+                    cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
+                    cloned_item.turn_id = cloned_turn.id.clone();
+                    store.save_item(&cloned_item)?;
+                    cloned_turn.item_ids.push(cloned_item.id.clone());
+                }
+                store.save_turn(&cloned_turn)?;
+                forked.latest_turn_id = Some(cloned_turn.id.clone());
+                forked.updated_at = now;
+                store.save_thread(&forked)?;
             }
-            self.store.save_turn(&cloned_turn)?;
-            forked.latest_turn_id = Some(cloned_turn.id.clone());
-            forked.updated_at = now;
-            self.store.save_thread(&forked)?;
-        }
+            Ok(forked)
+        })
+        .await
+        .context("fork_thread: task join failed")??;
 
         self.emit_event(
             &forked.id,
@@ -1856,74 +1864,74 @@ impl RuntimeThreadManager {
         depth_from_tail: usize,
     ) -> Result<(ThreadRecord, Option<String>)> {
         let source = self.get_thread(id).await?;
-        let source_turns = self.store.list_turns_for_thread(&source.id)?;
 
-        // Walk turns from newest to oldest. For each turn, ask: does it
-        // contain a UserMessage item? If yes, it counts toward the depth.
-        let mut user_turn_indices: Vec<usize> = Vec::new();
-        for (idx, turn) in source_turns.iter().enumerate().rev() {
-            let items = self.store.list_items_for_turn(&turn.id)?;
-            if items
-                .iter()
-                .any(|item| item.kind == TurnItemKind::UserMessage)
-            {
-                user_turn_indices.push(idx);
-            }
-        }
-        if depth_from_tail >= user_turn_indices.len() {
-            bail!(
-                "fork_at_user_message: depth {} exceeds {} user turn(s)",
-                depth_from_tail,
-                user_turn_indices.len()
-            );
-        }
-        // `user_turn_indices` is newest-first because we iterated in
-        // reverse, so the Nth element is exactly the Nth-from-tail user
-        // turn in the original chronological list.
-        let target_turn_idx = user_turn_indices[depth_from_tail];
-        let target_turn_id = source_turns[target_turn_idx].id.clone();
+        let store = self.store.clone();
+        let source_id = source.id.clone();
+        let source_clone = source.clone();
+        let (forked, original_user_text, target_turn_id) = tokio::task::spawn_blocking(
+            move || -> Result<(ThreadRecord, Option<String>, String)> {
+                let source_turns = store.list_turns_for_thread(&source_id)?;
 
-        // Pull the original user-message text out of the dropped turn so
-        // the caller can drop it back into the composer.
-        let target_items = self.store.list_items_for_turn(&target_turn_id)?;
-        let original_user_text = target_items
-            .iter()
-            .find(|item| item.kind == TurnItemKind::UserMessage)
-            .and_then(|item| item.detail.clone());
+                let mut user_turn_indices: Vec<usize> = Vec::new();
+                for (idx, turn) in source_turns.iter().enumerate().rev() {
+                    let items = store.list_items_for_turn(&turn.id)?;
+                    if items
+                        .iter()
+                        .any(|item| item.kind == TurnItemKind::UserMessage)
+                    {
+                        user_turn_indices.push(idx);
+                    }
+                }
+                if depth_from_tail >= user_turn_indices.len() {
+                    bail!(
+                        "fork_at_user_message: depth {} exceeds {} user turn(s)",
+                        depth_from_tail,
+                        user_turn_indices.len()
+                    );
+                }
+                let target_turn_idx = user_turn_indices[depth_from_tail];
+                let target_turn_id = source_turns[target_turn_idx].id.clone();
 
-        // Copy turns strictly before `target_turn_idx` into a new thread.
-        // Mirrors `fork_thread` but stops at the cutoff instead of copying
-        // every turn. Kept structurally close so future parity reviews
-        // can spot drift between the two paths.
-        let mut forked = source.clone();
-        let now = Utc::now();
-        forked.id = format!("thr_{}", &Uuid::new_v4().to_string()[..8]);
-        forked.created_at = now;
-        forked.updated_at = now;
-        forked.latest_turn_id = None;
-        forked.archived = false;
-        self.store.save_thread(&forked)?;
+                let target_items = store.list_items_for_turn(&target_turn_id)?;
+                let original_user_text = target_items
+                    .iter()
+                    .find(|item| item.kind == TurnItemKind::UserMessage)
+                    .and_then(|item| item.detail.clone());
 
-        for source_turn in source_turns.iter().take(target_turn_idx) {
-            let mut cloned_turn = source_turn.clone();
-            cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
-            cloned_turn.thread_id = forked.id.clone();
-            cloned_turn.item_ids.clear();
-            self.store.save_turn(&cloned_turn)?;
+                let mut forked = source_clone;
+                let now = Utc::now();
+                forked.id = format!("thr_{}", &Uuid::new_v4().to_string()[..8]);
+                forked.created_at = now;
+                forked.updated_at = now;
+                forked.latest_turn_id = None;
+                forked.archived = false;
+                store.save_thread(&forked)?;
 
-            let items = self.store.list_items_for_turn(&source_turn.id)?;
-            for item in items {
-                let mut cloned_item = item.clone();
-                cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
-                cloned_item.turn_id = cloned_turn.id.clone();
-                self.store.save_item(&cloned_item)?;
-                cloned_turn.item_ids.push(cloned_item.id.clone());
-            }
-            self.store.save_turn(&cloned_turn)?;
-            forked.latest_turn_id = Some(cloned_turn.id.clone());
-            forked.updated_at = now;
-            self.store.save_thread(&forked)?;
-        }
+                for source_turn in source_turns.iter().take(target_turn_idx) {
+                    let mut cloned_turn = source_turn.clone();
+                    cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
+                    cloned_turn.thread_id = forked.id.clone();
+                    cloned_turn.item_ids.clear();
+                    store.save_turn(&cloned_turn)?;
+
+                    let items = store.list_items_for_turn(&source_turn.id)?;
+                    for item in items {
+                        let mut cloned_item = item.clone();
+                        cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
+                        cloned_item.turn_id = cloned_turn.id.clone();
+                        store.save_item(&cloned_item)?;
+                        cloned_turn.item_ids.push(cloned_item.id.clone());
+                    }
+                    store.save_turn(&cloned_turn)?;
+                    forked.latest_turn_id = Some(cloned_turn.id.clone());
+                    forked.updated_at = now;
+                    store.save_thread(&forked)?;
+                }
+                Ok((forked, original_user_text, target_turn_id))
+            },
+        )
+        .await
+        .context("fork_at_user_message: task join failed")??;
 
         self.emit_event(
             &forked.id,
@@ -2070,176 +2078,194 @@ impl RuntimeThreadManager {
             turns.push(t);
         }
 
-        for turn_seed in turns {
-            let turn_id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
-            let summary =
-                crate::utils::truncate_with_ellipsis(&turn_seed.user_text, SUMMARY_LIMIT, "...");
-            let mut item_ids = Vec::new();
+        let store = self.store.clone();
+        let tid = thread_id.to_string();
+        let thread = tokio::task::spawn_blocking(move || -> Result<ThreadRecord> {
+            for turn_seed in turns {
+                let turn_id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
+                let summary = crate::utils::truncate_with_ellipsis(
+                    &turn_seed.user_text,
+                    SUMMARY_LIMIT,
+                    "...",
+                );
+                let mut item_ids = Vec::new();
 
-            // Save user message item.
-            if !turn_seed.user_text.is_empty() {
-                let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
-                self.store.save_item(&TurnItemRecord {
-                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                    id: item_id.clone(),
-                    turn_id: turn_id.clone(),
-                    kind: TurnItemKind::UserMessage,
-                    status: TurnItemLifecycleStatus::Completed,
-                    summary: summary.clone(),
-                    detail: Some(turn_seed.user_text.clone()),
-                    metadata: None,
-                    artifact_refs: Vec::new(),
-                    started_at: Some(now),
-                    ended_at: Some(now),
-                })?;
-                item_ids.push(item_id);
-            }
-
-            // Save assistant content items in order.
-            for seed_item in &turn_seed.items {
-                let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
-                match seed_item {
-                    SeedItem::Text(text) => {
-                        let asst_summary = if text.len() > SUMMARY_LIMIT {
-                            crate::utils::truncate_with_ellipsis(text, SUMMARY_LIMIT, "...")
-                        } else {
-                            text.clone()
-                        };
-                        self.store.save_item(&TurnItemRecord {
-                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                            id: item_id.clone(),
-                            turn_id: turn_id.clone(),
-                            kind: TurnItemKind::AgentMessage,
-                            status: TurnItemLifecycleStatus::Completed,
-                            summary: asst_summary,
-                            detail: Some(text.clone()),
-                            metadata: None,
-                            artifact_refs: Vec::new(),
-                            started_at: Some(now),
-                            ended_at: Some(now),
-                        })?;
-                    }
-                    SeedItem::Thinking(thinking) => {
-                        let thinking_summary = if thinking.len() > SUMMARY_LIMIT {
-                            crate::utils::truncate_with_ellipsis(thinking, SUMMARY_LIMIT, "...")
-                        } else {
-                            thinking.clone()
-                        };
-                        self.store.save_item(&TurnItemRecord {
-                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                            id: item_id.clone(),
-                            turn_id: turn_id.clone(),
-                            kind: TurnItemKind::AgentReasoning,
-                            status: TurnItemLifecycleStatus::Completed,
-                            summary: thinking_summary,
-                            detail: Some(thinking.clone()),
-                            metadata: None,
-                            artifact_refs: Vec::new(),
-                            started_at: Some(now),
-                            ended_at: Some(now),
-                        })?;
-                    }
-                    SeedItem::ToolUse {
-                        id: tool_id,
-                        name,
-                        input,
-                    } => {
-                        let input_str =
-                            serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
-                        let tool_summary = format!("{name}({})", {
-                            let s = &input_str;
-                            if s.len() > 80 {
-                                crate::utils::truncate_with_ellipsis(s, 80, "...")
-                            } else {
-                                s.clone()
-                            }
-                        });
-                        self.store.save_item(&TurnItemRecord {
-                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                            id: item_id.clone(),
-                            turn_id: turn_id.clone(),
-                            kind: TurnItemKind::ToolCall,
-                            status: TurnItemLifecycleStatus::Completed,
-                            summary: tool_summary,
-                            detail: Some(input_str),
-                            metadata: Some(serde_json::Value::Object(
-                                serde_json::json!({
-                                    "tool_use_id": tool_id,
-                                    "tool_name": name,
-                                })
-                                .as_object()
-                                .unwrap()
-                                .clone(),
-                            )),
-                            artifact_refs: Vec::new(),
-                            started_at: Some(now),
-                            ended_at: Some(now),
-                        })?;
-                    }
-                    SeedItem::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                        content_blocks,
-                    } => {
-                        let result_summary = if content.len() > SUMMARY_LIMIT {
-                            crate::utils::truncate_with_ellipsis(content, SUMMARY_LIMIT, "...")
-                        } else {
-                            content.clone()
-                        };
-                        let mut metadata = serde_json::Map::new();
-                        metadata.insert("tool_result_for".to_string(), json!(tool_use_id));
-                        metadata.insert("is_error".to_string(), json!(is_error));
-                        if let Some(blocks) = content_blocks {
-                            metadata
-                                .insert("content_blocks".to_string(), Value::Array(blocks.clone()));
-                        }
-                        self.store.save_item(&TurnItemRecord {
-                            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                            id: item_id.clone(),
-                            turn_id: turn_id.clone(),
-                            kind: TurnItemKind::ToolCall,
-                            status: if *is_error {
-                                TurnItemLifecycleStatus::Failed
-                            } else {
-                                TurnItemLifecycleStatus::Completed
-                            },
-                            summary: result_summary,
-                            detail: Some(content.clone()),
-                            metadata: Some(Value::Object(metadata)),
-                            artifact_refs: Vec::new(),
-                            started_at: Some(now),
-                            ended_at: Some(now),
-                        })?;
-                    }
+                if !turn_seed.user_text.is_empty() {
+                    let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
+                    store.save_item(&TurnItemRecord {
+                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                        id: item_id.clone(),
+                        turn_id: turn_id.clone(),
+                        kind: TurnItemKind::UserMessage,
+                        status: TurnItemLifecycleStatus::Completed,
+                        summary: summary.clone(),
+                        detail: Some(turn_seed.user_text.clone()),
+                        metadata: None,
+                        artifact_refs: Vec::new(),
+                        started_at: Some(now),
+                        ended_at: Some(now),
+                    })?;
+                    item_ids.push(item_id);
                 }
-                item_ids.push(item_id);
+
+                for seed_item in &turn_seed.items {
+                    let item_id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
+                    match seed_item {
+                        SeedItem::Text(text) => {
+                            let asst_summary = if text.len() > SUMMARY_LIMIT {
+                                crate::utils::truncate_with_ellipsis(text, SUMMARY_LIMIT, "...")
+                            } else {
+                                text.clone()
+                            };
+                            store.save_item(&TurnItemRecord {
+                                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                                id: item_id.clone(),
+                                turn_id: turn_id.clone(),
+                                kind: TurnItemKind::AgentMessage,
+                                status: TurnItemLifecycleStatus::Completed,
+                                summary: asst_summary,
+                                detail: Some(text.clone()),
+                                metadata: None,
+                                artifact_refs: Vec::new(),
+                                started_at: Some(now),
+                                ended_at: Some(now),
+                            })?;
+                        }
+                        SeedItem::Thinking(thinking) => {
+                            let thinking_summary = if thinking.len() > SUMMARY_LIMIT {
+                                crate::utils::truncate_with_ellipsis(
+                                    thinking,
+                                    SUMMARY_LIMIT,
+                                    "...",
+                                )
+                            } else {
+                                thinking.clone()
+                            };
+                            store.save_item(&TurnItemRecord {
+                                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                                id: item_id.clone(),
+                                turn_id: turn_id.clone(),
+                                kind: TurnItemKind::AgentReasoning,
+                                status: TurnItemLifecycleStatus::Completed,
+                                summary: thinking_summary,
+                                detail: Some(thinking.clone()),
+                                metadata: None,
+                                artifact_refs: Vec::new(),
+                                started_at: Some(now),
+                                ended_at: Some(now),
+                            })?;
+                        }
+                        SeedItem::ToolUse {
+                            id: tool_id,
+                            name,
+                            input,
+                        } => {
+                            let input_str = serde_json::to_string(input)
+                                .unwrap_or_else(|_| input.to_string());
+                            let tool_summary = format!("{name}({})", {
+                                let s = &input_str;
+                                if s.len() > 80 {
+                                    crate::utils::truncate_with_ellipsis(s, 80, "...")
+                                } else {
+                                    s.clone()
+                                }
+                            });
+                            store.save_item(&TurnItemRecord {
+                                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                                id: item_id.clone(),
+                                turn_id: turn_id.clone(),
+                                kind: TurnItemKind::ToolCall,
+                                status: TurnItemLifecycleStatus::Completed,
+                                summary: tool_summary,
+                                detail: Some(input_str),
+                                metadata: Some(serde_json::Value::Object(
+                                    serde_json::json!({
+                                        "tool_use_id": tool_id,
+                                        "tool_name": name,
+                                    })
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                                )),
+                                artifact_refs: Vec::new(),
+                                started_at: Some(now),
+                                ended_at: Some(now),
+                            })?;
+                        }
+                        SeedItem::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            content_blocks,
+                        } => {
+                            let result_summary = if content.len() > SUMMARY_LIMIT {
+                                crate::utils::truncate_with_ellipsis(
+                                    content,
+                                    SUMMARY_LIMIT,
+                                    "...",
+                                )
+                            } else {
+                                content.clone()
+                            };
+                            let mut metadata = serde_json::Map::new();
+                            metadata
+                                .insert("tool_result_for".to_string(), json!(tool_use_id));
+                            metadata.insert("is_error".to_string(), json!(is_error));
+                            if let Some(blocks) = content_blocks {
+                                metadata.insert(
+                                    "content_blocks".to_string(),
+                                    Value::Array(blocks.clone()),
+                                );
+                            }
+                            store.save_item(&TurnItemRecord {
+                                schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                                id: item_id.clone(),
+                                turn_id: turn_id.clone(),
+                                kind: TurnItemKind::ToolCall,
+                                status: if *is_error {
+                                    TurnItemLifecycleStatus::Failed
+                                } else {
+                                    TurnItemLifecycleStatus::Completed
+                                },
+                                summary: result_summary,
+                                detail: Some(content.clone()),
+                                metadata: Some(Value::Object(metadata)),
+                                artifact_refs: Vec::new(),
+                                started_at: Some(now),
+                                ended_at: Some(now),
+                            })?;
+                        }
+                    }
+                    item_ids.push(item_id);
+                }
+
+                if !item_ids.is_empty() {
+                    store.save_turn(&TurnRecord {
+                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+                        id: turn_id.clone(),
+                        thread_id: tid.clone(),
+                        status: RuntimeTurnStatus::Completed,
+                        input_summary: summary,
+                        created_at: now,
+                        started_at: Some(now),
+                        ended_at: Some(now),
+                        duration_ms: Some(0),
+                        usage: None,
+                        error: None,
+                        item_ids,
+                        steer_count: 0,
+                    })?;
+
+                    thread.latest_turn_id = Some(turn_id);
+                    thread.updated_at = now;
+                }
             }
 
-            // Only create a turn if there's content.
-            if !item_ids.is_empty() {
-                self.store.save_turn(&TurnRecord {
-                    schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                    id: turn_id.clone(),
-                    thread_id: thread_id.to_string(),
-                    status: RuntimeTurnStatus::Completed,
-                    input_summary: summary,
-                    created_at: now,
-                    started_at: Some(now),
-                    ended_at: Some(now),
-                    duration_ms: Some(0),
-                    usage: None,
-                    error: None,
-                    item_ids,
-                    steer_count: 0,
-                })?;
-
-                thread.latest_turn_id = Some(turn_id);
-                thread.updated_at = now;
-            }
-        }
-
-        self.store.save_thread(&thread)?;
+            store.save_thread(&thread)?;
+            Ok(thread)
+        })
+        .await
+        .context("seed_thread_from_messages: task join failed")??;
         self.emit_event(
             thread_id,
             None,
@@ -2305,12 +2331,12 @@ impl RuntimeThreadManager {
         };
 
         turn.item_ids.push(user_item_id.clone());
-        self.store.save_item(&user_item)?;
-        self.store.save_turn(&turn)?;
+        self.store.save_item_async(&user_item).await?;
+        self.store.save_turn_async(&turn).await?;
 
         thread.latest_turn_id = Some(turn_id.clone());
         thread.updated_at = now;
-        self.store.save_thread(&thread)?;
+        self.store.save_thread_async(&thread).await?;
 
         self.emit_event(
             thread_id,
@@ -2491,7 +2517,7 @@ impl RuntimeThreadManager {
         )
         .await?;
 
-        self.store.load_turn(turn_id)
+        self.store.load_turn_async(turn_id).await
     }
 
     pub async fn steer_turn(
@@ -2529,9 +2555,9 @@ impl RuntimeThreadManager {
             .map_err(|e| anyhow!("Failed to steer turn: {e}"))?;
 
         let now = Utc::now();
-        let mut turn = self.store.load_turn(turn_id)?;
+        let mut turn = self.store.load_turn_async(turn_id).await?;
         turn.steer_count = turn.steer_count.saturating_add(1);
-        self.store.save_turn(&turn)?;
+        self.store.save_turn_async(&turn).await?;
 
         let item = TurnItemRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -2547,8 +2573,8 @@ impl RuntimeThreadManager {
             ended_at: Some(now),
         };
         turn.item_ids.push(item.id.clone());
-        self.store.save_item(&item)?;
-        self.store.save_turn(&turn)?;
+        self.store.save_item_async(&item).await?;
+        self.store.save_turn_async(&turn).await?;
 
         self.emit_event(
             thread_id,
@@ -2612,11 +2638,11 @@ impl RuntimeThreadManager {
             item_ids: Vec::new(),
             steer_count: 0,
         };
-        self.store.save_turn(&turn)?;
+        self.store.save_turn_async(&turn).await?;
 
         thread.latest_turn_id = Some(turn_id.clone());
         thread.updated_at = now;
-        self.store.save_thread(&thread)?;
+        self.store.save_thread_async(&thread).await?;
 
         {
             let mut active = self.active.lock().await;
@@ -2691,6 +2717,14 @@ impl RuntimeThreadManager {
         since_seq: Option<u64>,
     ) -> Result<Vec<RuntimeEventRecord>> {
         self.store.events_since(thread_id, since_seq)
+    }
+
+    pub async fn events_since_async(
+        &self,
+        thread_id: &str,
+        since_seq: Option<u64>,
+    ) -> Result<Vec<RuntimeEventRecord>> {
+        self.store.events_since_async(thread_id, since_seq).await
     }
 
     async fn ensure_engine_loaded(&self, thread: &ThreadRecord) -> Result<EngineHandle> {
@@ -3083,7 +3117,7 @@ impl RuntimeThreadManager {
 
             match event {
                 EngineEvent::TurnStarted { .. } => {
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3109,7 +3143,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3122,7 +3156,7 @@ impl RuntimeThreadManager {
                 EngineEvent::MessageDelta { content, .. } => {
                     if let Some((item_id, text)) = current_message_item.as_mut() {
                         text.push_str(&content);
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(item_id),
@@ -3140,7 +3174,7 @@ impl RuntimeThreadManager {
                         item.detail = Some(text);
                         item.ended_at = Some(Utc::now());
                         self.store.save_item_async(&item).await?;
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3167,7 +3201,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3180,7 +3214,7 @@ impl RuntimeThreadManager {
                 EngineEvent::ThinkingDelta { content, .. } => {
                     if let Some((item_id, text)) = current_reasoning_item.as_mut() {
                         text.push_str(&content);
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(item_id),
@@ -3198,7 +3232,7 @@ impl RuntimeThreadManager {
                         item.detail = Some(text);
                         item.ended_at = Some(Utc::now());
                         self.store.save_item_async(&item).await?;
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3228,7 +3262,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3264,7 +3298,7 @@ impl RuntimeThreadManager {
                             }
                         }
                         self.store.save_item_async(&item).await?;
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3296,7 +3330,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item_id),
@@ -3319,7 +3353,7 @@ impl RuntimeThreadManager {
                         item.detail = Some(message);
                         item.ended_at = Some(Utc::now());
                         self.store.save_item_async(&item).await?;
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3342,7 +3376,7 @@ impl RuntimeThreadManager {
                         item.detail = Some(message);
                         item.ended_at = Some(Utc::now());
                         self.store.save_item_async(&item).await?;
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             Some(&item_id),
@@ -3372,7 +3406,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3398,7 +3432,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3427,7 +3461,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3468,7 +3502,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3484,7 +3518,7 @@ impl RuntimeThreadManager {
                     intent_summary,
                     ..
                 } => {
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3519,7 +3553,7 @@ impl RuntimeThreadManager {
                         // can clear any pending approval UI.  Without this
                         // event the GUI would show a frozen approval dialog
                         // that never receives approval.decided.
-                        self.emit_event_async(
+                        self.emit_event(
                             &thread_id,
                             Some(&turn_id),
                             None,
@@ -3548,7 +3582,7 @@ impl RuntimeThreadManager {
                             if remember {
                                 self.remember_thread_auto_approve(&thread_id).await;
                             }
-                            self.emit_event_async(
+                            self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3564,7 +3598,7 @@ impl RuntimeThreadManager {
                             let _ = engine.approve_tool_call(id).await;
                         }
                         Ok(Ok(ExternalApprovalDecision::Deny { remember })) => {
-                            self.emit_event_async(
+                            self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3585,7 +3619,7 @@ impl RuntimeThreadManager {
                         }
                         Err(_timeout) => {
                             self.cancel_pending_approval(&id);
-                            self.emit_event_async(
+                            self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3597,7 +3631,7 @@ impl RuntimeThreadManager {
                             )
                             .await
                             .ok();
-                            self.emit_event_async(
+                            self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
                                 None,
@@ -3621,7 +3655,7 @@ impl RuntimeThreadManager {
                     denial_reason,
                     ..
                 } => {
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3653,7 +3687,7 @@ impl RuntimeThreadManager {
                     }
                 }
                 EngineEvent::UserInputRequired { id, request } => {
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         None,
@@ -3681,7 +3715,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3709,7 +3743,7 @@ impl RuntimeThreadManager {
                     };
                     self.store.save_item_async(&item).await?;
                     self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-                    self.emit_event_async(
+                    self.emit_event(
                         &thread_id,
                         Some(&turn_id),
                         Some(&item.id),
@@ -3771,7 +3805,7 @@ impl RuntimeThreadManager {
             item.detail = Some(text);
             item.ended_at = Some(Utc::now());
             self.store.save_item_async(&item).await?;
-            self.emit_event_async(
+            self.emit_event(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item_id),
@@ -3796,7 +3830,7 @@ impl RuntimeThreadManager {
             item.detail = Some(text);
             item.ended_at = Some(Utc::now());
             self.store.save_item_async(&item).await?;
-            self.emit_event_async(
+            self.emit_event(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item_id),
@@ -3828,7 +3862,7 @@ impl RuntimeThreadManager {
             };
             self.store.save_item_async(&item).await?;
             self.attach_item_to_turn_async(&turn_id, &item.id).await?;
-            self.emit_event_async(
+            self.emit_event(
                 &thread_id,
                 Some(&turn_id),
                 Some(&item.id),
@@ -3846,7 +3880,7 @@ impl RuntimeThreadManager {
         turn.usage = turn_usage;
         turn.error = turn_error;
 
-        self.emit_event_async(
+        self.emit_event(
             &thread_id,
             Some(&turn_id),
             None,
